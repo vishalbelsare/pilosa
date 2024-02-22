@@ -4,10 +4,12 @@ package ctl
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 
 	pilosa "github.com/featurebasedb/featurebase/v3"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/featurebasedb/featurebase/v3/server"
 	"github.com/pkg/errors"
 )
@@ -25,15 +27,20 @@ type ExportCommand struct {
 	Path string
 
 	// Standard input/output
-	*pilosa.CmdIO
+	logDest logger.Logger
 
 	TLS server.TLSConfig
 }
 
+// Logger returns the command's associated Logger to maintain CommandWithTLSSupport interface compatibility
+func (cmd *ExportCommand) Logger() logger.Logger {
+	return cmd.logDest
+}
+
 // NewExportCommand returns a new instance of ExportCommand.
-func NewExportCommand(stdin io.Reader, stdout, stderr io.Writer) *ExportCommand {
+func NewExportCommand(logdest logger.Logger) *ExportCommand {
 	return &ExportCommand{
-		CmdIO: pilosa.NewCmdIO(stdin, stdout, stderr),
+		logDest: logdest,
 	}
 }
 
@@ -43,14 +50,14 @@ func (cmd *ExportCommand) Run(ctx context.Context) error {
 
 	// Validate arguments.
 	if cmd.Index == "" {
-		return pilosa.ErrIndexRequired
+		return fmt.Errorf("%w: %v", ErrUsage, pilosa.ErrIndexRequired)
 	} else if cmd.Field == "" {
-		return pilosa.ErrFieldRequired
+		return fmt.Errorf("%w: %v", ErrUsage, pilosa.ErrFieldRequired)
 	}
 
 	// Use output file, if specified.
 	// Otherwise use STDOUT.
-	var w io.Writer = cmd.Stdout
+	var w io.Writer = os.Stdout
 	if cmd.Path != "" {
 		f, err := os.Create(cmd.Path)
 		if err != nil {
@@ -78,13 +85,6 @@ func (cmd *ExportCommand) Run(ctx context.Context) error {
 		logger.Printf("exporting shard: %d", shard)
 		if err := client.ExportCSV(ctx, cmd.Index, cmd.Field, shard, w); err != nil {
 			return errors.Wrap(err, "exporting")
-		}
-	}
-
-	// Close writer, if applicable.
-	if w, ok := w.(io.Closer); ok {
-		if err := w.Close(); err != nil {
-			return errors.Wrap(err, "closing")
 		}
 	}
 

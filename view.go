@@ -16,7 +16,6 @@ import (
 
 	"github.com/featurebasedb/featurebase/v3/pql"
 	"github.com/featurebasedb/featurebase/v3/roaring"
-	"github.com/featurebasedb/featurebase/v3/stats"
 	"github.com/featurebasedb/featurebase/v3/testhook"
 	"github.com/featurebasedb/featurebase/v3/vprint"
 	"github.com/pkg/errors"
@@ -25,9 +24,12 @@ import (
 
 // View layout modes.
 const (
+	// standard view holds regular set/mutex data
 	viewStandard = "standard"
-
+	// bsig_X view holds BSI data for X
 	viewBSIGroupPrefix = "bsig_"
+	// existence view holds existence bits for a specific field
+	viewExistence = "existence"
 )
 
 // view represents a container for field data.
@@ -51,7 +53,6 @@ type view struct {
 	fragments map[uint64]*fragment
 
 	broadcaster broadcaster
-	stats       stats.StatsClient
 
 	knownShards       *roaring.Bitmap
 	knownShardsCopied uint32
@@ -79,7 +80,6 @@ func newView(holder *Holder, path, index, field, name string, fieldOptions Field
 		fragments: make(map[uint64]*fragment),
 
 		broadcaster: NopBroadcaster,
-		stats:       stats.NopStatsClient,
 		knownShards: roaring.NewSliceBitmap(),
 
 		closing: make(chan struct{}),
@@ -137,7 +137,7 @@ func (v *view) openWithShardSet(ss *shardSet) error {
 
 	shards := ss.CloneMaybe()
 
-	var frags []*fragment
+	frags := make([]*fragment, 0, len(shards))
 	for shard := range shards {
 		frag := v.newFragment(shard)
 		frags = append(frags, frag)
@@ -213,8 +213,6 @@ func (v *view) openEmpty() error {
 			return errors.Wrap(err, "creating fragments directory")
 		}
 
-		v.holder.Logger.Debugf("open fragments for index/field/view: %s/%s/%s", v.index, v.field, v.name)
-
 		return nil
 	}(); err != nil {
 		v.close()
@@ -222,7 +220,6 @@ func (v *view) openEmpty() error {
 	}
 
 	_ = testhook.Opened(v.holder.Auditor, v, nil)
-	v.holder.Logger.Debugf("successfully opened index/field/view: %s/%s/%s", v.index, v.field, v.name)
 	return nil
 }
 
@@ -278,15 +275,6 @@ func (v *view) flushCaches() {
 			}
 		}
 	}
-}
-
-// flags returns a set of flags for the underlying fragments.
-func (v *view) flags() byte {
-	var flag byte
-	if v.fieldType == FieldTypeInt || v.fieldType == FieldTypeDecimal || v.fieldType == FieldTypeTimestamp {
-		flag |= roaringFlagBSIv2
-	}
-	return flag
 }
 
 // availableShards returns a bitmap of shards which contain data.
@@ -402,22 +390,9 @@ func (v *view) notifyIfNewShard(shard uint64) {
 }
 
 func (v *view) newFragment(shard uint64) *fragment {
-	fld := v.fld
-	spec := fragSpec{
-		index: v.idx,
-		field: fld,
-		view:  v,
-	}
-	if fld == nil {
-		// The backup plan.
-		// For tests that do incomplete setup, like making
-		// a view without a field.
-		spec.fieldstr = v.field
-	}
-	frag := newFragment(v.holder, spec, shard, v.flags())
+	frag := newFragment(v.holder, v.idx, v.fld, v, shard)
 	frag.CacheType = v.cacheType
 	frag.CacheSize = v.cacheSize
-	frag.stats = v.stats
 	if v.fieldType == FieldTypeMutex {
 		frag.mutexVector = newRowsVector(frag)
 	} else if v.fieldType == FieldTypeBool {
@@ -449,16 +424,14 @@ func (v *view) deleteFragment(shard uint64) error {
 }
 
 // row returns a row for a shard of the view.
-func (v *view) row(txOrig Tx, rowID uint64) (*Row, error) {
+func (v *view) row(qcx *Qcx, rowID uint64) (*Row, error) {
 	row := NewRow()
 	for _, frag := range v.allFragments() {
-
-		tx := txOrig
-		if NilInside(tx) {
-			tx = v.idx.holder.txf.NewTx(Txo{Write: !writable, Index: v.idx, Fragment: frag, Shard: frag.shard})
-			defer tx.Rollback()
+		tx, finisher, err := qcx.GetTx(Txo{Write: !writable, Index: v.idx, Fragment: frag, Shard: frag.shard})
+		if err != nil {
+			return nil, err
 		}
-
+		defer finisher(&err)
 		fr, err := frag.row(tx, rowID)
 		if err != nil {
 			return nil, err
@@ -527,110 +500,68 @@ func (v *view) mutexCheck(ctx context.Context, qcx *Qcx, details bool, limit int
 }
 
 // setBit sets a bit within the view.
-func (v *view) setBit(txOrig Tx, rowID, columnID uint64) (changed bool, err error) {
+func (v *view) setBit(qcx *Qcx, rowID, columnID uint64) (changed bool, err error) {
 	shard := columnID / ShardWidth
+	tx, finisher, err := qcx.GetTx(Txo{Write: true, Index: v.idx, Shard: shard})
+	defer finisher(&err)
 	var frag *fragment
 	frag, err = v.CreateFragmentIfNotExists(shard)
 	if err != nil {
 		return changed, err
 	}
 
-	tx := txOrig
-	if NilInside(tx) {
-		tx = v.idx.holder.txf.NewTx(Txo{Write: writable, Index: v.idx, Fragment: frag, Shard: shard})
-		defer func() {
-			if err == nil {
-				vprint.PanicOn(tx.Commit())
-			} else {
-				tx.Rollback()
-			}
-		}()
-	}
 	return frag.setBit(tx, rowID, columnID)
 }
 
 // clearBit clears a bit within the view.
-func (v *view) clearBit(txOrig Tx, rowID, columnID uint64) (changed bool, err error) {
+func (v *view) clearBit(qcx *Qcx, rowID, columnID uint64) (changed bool, err error) {
 	shard := columnID / ShardWidth
+	tx, finisher, err := qcx.GetTx(Txo{Write: true, Index: v.idx, Shard: shard})
+	defer finisher(&err)
 	frag := v.Fragment(shard)
 	if frag == nil {
 		return false, nil
-	}
-
-	tx := txOrig
-	if NilInside(tx) {
-		tx = v.idx.holder.txf.NewTx(Txo{Write: writable, Index: v.idx, Fragment: frag, Shard: shard})
-		defer func() {
-			if err == nil {
-				vprint.PanicOn(tx.Commit())
-			} else {
-				tx.Rollback()
-			}
-		}()
 	}
 
 	return frag.clearBit(tx, rowID, columnID)
 }
 
 // value uses a column of bits to read a multi-bit value.
-func (v *view) value(txOrig Tx, columnID uint64, bitDepth uint64) (value int64, exists bool, err error) {
+func (v *view) value(qcx *Qcx, columnID uint64, bitDepth uint64) (value int64, exists bool, err error) {
 	shard := columnID / ShardWidth
+	tx, finisher, err := qcx.GetTx(Txo{Write: false, Index: v.idx, Shard: shard})
+	defer finisher(&err)
 	frag, err := v.CreateFragmentIfNotExists(shard)
 	if err != nil {
 		return value, exists, err
-	}
-
-	tx := txOrig
-	if NilInside(tx) {
-		tx = frag.idx.holder.txf.NewTx(Txo{Write: !writable, Index: frag.idx, Fragment: frag, Shard: frag.shard})
-		defer tx.Rollback()
 	}
 
 	return frag.value(tx, columnID, bitDepth)
 }
 
 // setValue uses a column of bits to set a multi-bit value.
-func (v *view) setValue(txOrig Tx, columnID uint64, bitDepth uint64, value int64) (changed bool, err error) {
+func (v *view) setValue(qcx *Qcx, columnID uint64, bitDepth uint64, value int64) (changed bool, err error) {
 	shard := columnID / ShardWidth
+	tx, finisher, err := qcx.GetTx(Txo{Write: true, Index: v.idx, Shard: shard})
+	defer finisher(&err)
 	frag, err := v.CreateFragmentIfNotExists(shard)
 	if err != nil {
 		return changed, err
-	}
-
-	tx := txOrig
-	if NilInside(tx) {
-		tx = v.idx.holder.txf.NewTx(Txo{Write: writable, Index: v.idx, Fragment: frag, Shard: shard})
-		defer func() {
-			if err == nil {
-				vprint.PanicOn(tx.Commit())
-			} else {
-				tx.Rollback()
-			}
-		}()
 	}
 
 	return frag.setValue(tx, columnID, bitDepth, value)
 }
 
 // clearValue removes a specific value assigned to columnID
-func (v *view) clearValue(txOrig Tx, columnID uint64, bitDepth uint64, value int64) (changed bool, err error) {
+func (v *view) clearValue(qcx *Qcx, columnID uint64, bitDepth uint64, value int64) (changed bool, err error) {
 	shard := columnID / ShardWidth
+	tx, finisher, err := qcx.GetTx(Txo{Write: true, Index: v.idx, Shard: shard})
+	defer finisher(&err)
 	frag := v.Fragment(shard)
 	if frag == nil {
 		return false, nil
 	}
 
-	tx := txOrig
-	if NilInside(tx) {
-		tx = v.idx.holder.txf.NewTx(Txo{Write: writable, Index: v.idx, Fragment: frag, Shard: shard})
-		defer func() {
-			if err == nil {
-				vprint.PanicOn(tx.Commit())
-			} else {
-				tx.Rollback()
-			}
-		}()
-	}
 	return frag.clearValue(tx, columnID, bitDepth, value)
 }
 

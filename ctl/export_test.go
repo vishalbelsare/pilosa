@@ -3,31 +3,32 @@
 package ctl
 
 import (
-	"bytes"
 	"context"
+	"io"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
 	pilosa "github.com/featurebasedb/featurebase/v3"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/featurebasedb/featurebase/v3/test"
 )
 
 func TestExportCommand_Validation(t *testing.T) {
-	buf := bytes.Buffer{}
-	stdin, stdout, stderr := GetIO(buf)
+	cmLog := logger.NewStandardLogger(os.Stderr)
 
-	cm := NewExportCommand(stdin, stdout, stderr)
+	cm := NewExportCommand(cmLog)
 
 	err := cm.Run(context.Background())
-	if err != pilosa.ErrIndexRequired {
-		t.Fatalf("Command not working, expect: %s, actual: '%s'", pilosa.ErrIndexRequired, err)
+	if !errContains(err, pilosa.ErrIndexRequired) {
+		t.Fatalf("wrong error, expected %q, got: '%s'", pilosa.ErrIndexRequired, err)
 	}
 
 	cm.Index = "i"
 	err = cm.Run(context.Background())
-	if err != pilosa.ErrFieldRequired {
-		t.Fatalf("Command not working, expect: %s, actual: '%s'", pilosa.ErrFieldRequired, err)
+	if !errContains(err, pilosa.ErrFieldRequired) {
+		t.Fatalf("wrong error, expected %q, got: '%s'", pilosa.ErrFieldRequired, err)
 	}
 }
 
@@ -36,9 +37,8 @@ func TestExportCommand_Run(t *testing.T) {
 	defer cluster.Close()
 	cmd := cluster.GetNode(0)
 
-	buf := bytes.Buffer{}
-	stdin, stdout, stderr := GetIO(buf)
-	cm := NewExportCommand(stdin, stdout, stderr)
+	cmLog := logger.NewStandardLogger(io.Discard)
+	cm := NewExportCommand(cmLog)
 	hostport := cmd.API.Node().URI.HostPort()
 	cm.Host = hostport
 

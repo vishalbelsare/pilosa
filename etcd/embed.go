@@ -134,8 +134,9 @@ func (e *EmbeddedEtcd) Shutdown() {
 }
 
 func (e *EmbeddedEtcd) Peers() []*disco.Peer {
-	var peers []*disco.Peer
-	for _, member := range e.e.Server.Cluster().Members() {
+	members := e.e.Server.Cluster().Members()
+	peers := make([]*disco.Peer, 0, len(members))
+	for _, member := range members {
 		peers = append(peers, &disco.Peer{ID: member.ID.String(), URL: member.PickPeerURL()})
 	}
 	return peers
@@ -230,6 +231,9 @@ func NewEtcd(opt Options, logger logger.Logger, replicas int, version string) *E
 	if e.options.HeartbeatTTL == 0 {
 		e.options.HeartbeatTTL = 5 // seconds
 	}
+	// !! DEBUG
+	// e.options.HeartbeatTTL = 3600 // seconds
+	// !! DEBUG
 	return e
 }
 
@@ -295,10 +299,6 @@ func (e *Etcd) retryClient(fn func(cli *clientv3.Client) error) (err error) {
 		start := time.Now()
 		err = fn(cli)
 		switch err {
-		case etcdserver.ErrLeaderChanged:
-			cli = e.newClient(cli)
-		case nil:
-			return nil
 		default:
 			msg := err.Error()
 			// this shouldn't be necessary, but empirically, we sometimes
@@ -314,6 +314,7 @@ func (e *Etcd) retryClient(fn func(cli *clientv3.Client) error) (err error) {
 				return errors.Wrap(err, "non-retryable error")
 			}
 			fallthrough // treat this as being one of the ErrTimeout derivatives, possibly wrapped.
+
 		case etcdserver.ErrTimeout, etcdserver.ErrTimeoutDueToLeaderFail, etcdserver.ErrTimeoutDueToConnectionLost, etcdserver.ErrTimeoutLeaderTransfer:
 			// sporadic timeouts are concerning but not necessarily fatal
 			// and can usually be retried.
@@ -328,6 +329,12 @@ func (e *Etcd) retryClient(fn func(cli *clientv3.Client) error) (err error) {
 			// timeout to give us a reasonable backoff period and keep us
 			// from spamming these.
 			time.Sleep(100 * time.Millisecond)
+
+		case etcdserver.ErrLeaderChanged:
+			cli = e.newClient(cli)
+
+		case nil:
+			return nil
 		}
 	}
 	// if we got here, we got a total of three of some combination of
@@ -342,6 +349,7 @@ func (e *Etcd) parseOptions() (*embed.Config, error) {
 	cfg.Name = e.options.Name
 	cfg.Dir = e.options.Dir
 	cfg.InitialClusterToken = e.options.ClusterName
+	cfg.EnableGRPCGateway = false // TODO(twg) 2022/11/03 fixes tests but unsure ramifications
 	var err error
 	cfg.LCUrls, err = types.NewURLs([]string{e.options.LClientURL})
 	if err != nil {
@@ -371,7 +379,7 @@ func (e *Etcd) parseOptions() (*embed.Config, error) {
 	if e.options.InitCluster != "" {
 		// Checks if FB is running the single-node free version or the multi-node
 		// enterprise version. Sentry.io is enabled on single-node.
-		if AllowCluster() == false {
+		if !AllowCluster() {
 			// %% begin sonarcloud ignore %%
 
 			monitor.InitErrorMonitor(e.version)
@@ -490,8 +498,7 @@ func (e *Etcd) ClusterState(ctx context.Context) (out disco.ClusterState, err er
 		}
 	}
 	var (
-		heartbeats int = 0
-		starting   bool
+		heartbeats = 0
 	)
 	e.nodeMu.Lock()
 	nodes := e.populateNodeStates(ctx)
@@ -501,28 +508,16 @@ func (e *Etcd) ClusterState(ctx context.Context) (out disco.ClusterState, err er
 		return disco.ClusterStateUnknown, err
 	}
 	for _, node := range nodes {
-		switch node.State {
-		case disco.NodeStateStarting:
-			starting = true
-		case disco.NodeStateUnknown:
-			continue
+		if node.State == disco.NodeStateStarted {
+			heartbeats++
 		}
-
-		heartbeats++
 	}
-
-	if starting {
-		return disco.ClusterStateStarting, nil
-	}
-
 	if heartbeats < len(e.knownNodes) {
 		if len(e.knownNodes)-heartbeats >= e.replicas {
 			return disco.ClusterStateDown, nil
 		}
-
 		return disco.ClusterStateDegraded, nil
 	}
-
 	return disco.ClusterStateNormal, nil
 }
 
@@ -869,19 +864,20 @@ func (e *Etcd) Field(ctx context.Context, indexName string, name string) ([]byte
 	return e.getKeyBytes(ctx, key)
 }
 
-func (e *Etcd) CreateField(ctx context.Context, indexName string, name string, val []byte) error {
+func (e *Etcd) CreateField(ctx context.Context, indexName string, name string, fieldVal []byte) error {
 	key := schemaPrefix + indexName + "/" + name
 
 	// Set up Op to write field value as bytes.
 	op := clientv3.OpPut(key, "")
-	op.WithValueBytes(val)
+	op.WithValueBytes(fieldVal)
 
 	// Check for key existence, and execute Op within a transaction.
 	var resp *clientv3.TxnResponse
 
 	err := e.retryClient(func(cli *clientv3.Client) (err error) {
 		resp, err = cli.Txn(ctx).
-			If(clientv3util.KeyMissing(key)).
+			If(
+				clientv3util.KeyMissing(key)).
 			Then(op).
 			Commit()
 		return err
@@ -897,19 +893,20 @@ func (e *Etcd) CreateField(ctx context.Context, indexName string, name string, v
 	return nil
 }
 
-func (e *Etcd) UpdateField(ctx context.Context, indexName string, name string, val []byte) error {
+func (e *Etcd) UpdateField(ctx context.Context, indexName string, name string, fieldVal []byte) error {
 	key := schemaPrefix + indexName + "/" + name
 
 	// Set up Op to write field value as bytes.
 	op := clientv3.OpPut(key, "")
-	op.WithValueBytes(val)
+	op.WithValueBytes(fieldVal)
 
 	// Check for key existence, and execute Op within a transaction.
 	var resp *clientv3.TxnResponse
 
 	err := e.retryClient(func(cli *clientv3.Client) (err error) {
 		resp, err = cli.Txn(ctx).
-			If(clientv3util.KeyExists(key)).
+			If(
+				clientv3util.KeyExists(key)).
 			Then(op).
 			Commit()
 		return err
@@ -924,20 +921,31 @@ func (e *Etcd) UpdateField(ctx context.Context, indexName string, name string, v
 	return nil
 }
 
-func (e *Etcd) DeleteField(ctx context.Context, indexname string, name string) (err error) {
-	key := schemaPrefix + indexname + "/" + name
+func (e *Etcd) DeleteField(ctx context.Context, indexName string, name string) (err error) {
+	key := schemaPrefix + indexName + "/" + name
+
+	var resp *clientv3.TxnResponse
+
 	// Deleting field and views in one transaction.
 	err = e.retryClient(func(cli *clientv3.Client) (err error) {
-		_, err = cli.Txn(ctx).
-			If(clientv3.Compare(clientv3.Version(key), ">", -1)).
+		resp, err = cli.Txn(ctx).
+			If(
+				clientv3.Compare(clientv3.Version(key), ">", -1)).
 			Then(
 				clientv3.OpDelete(key+"/", clientv3.WithPrefix()), // deleting field views
 				clientv3.OpDelete(key),                            // deleting field
 			).Commit()
 		return err
 	})
+	if err != nil {
+		return errors.Wrap(err, "executing transaction")
+	}
 
-	return errors.Wrap(err, "DeleteField")
+	if !resp.Succeeded {
+		return errors.New("deleting field from etcd failed")
+	}
+
+	return nil
 }
 
 func (e *Etcd) View(ctx context.Context, indexName, fieldName, name string) (bool, error) {

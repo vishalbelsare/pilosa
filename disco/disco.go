@@ -55,7 +55,6 @@ const (
 	InitialClusterStateExisting InitialClusterState = "existing"
 
 	ClusterStateUnknown  ClusterState = "UNKNOWN"  // default cluster state. It is returned when we are not able to get the real actual state.
-	ClusterStateStarting ClusterState = "STARTING" // cluster is starting and some internal services are not ready yet.
 	ClusterStateDegraded ClusterState = "DEGRADED" // cluster is running but we've lost some # of hosts >0 but < replicaN. Only read queries are allowed.
 	ClusterStateNormal   ClusterState = "NORMAL"   // cluster is up and running.
 	ClusterStateDown     ClusterState = "DOWN"     // cluster is unable to serve queries.
@@ -101,8 +100,8 @@ type Schemator interface {
 	CreateIndex(ctx context.Context, name string, val []byte) error
 	DeleteIndex(ctx context.Context, name string) error
 	Field(ctx context.Context, index, field string) ([]byte, error)
-	CreateField(ctx context.Context, index, field string, val []byte) error
-	UpdateField(ctx context.Context, index, field string, val []byte) error
+	CreateField(ctx context.Context, index, field string, fieldVal []byte) error
+	UpdateField(ctx context.Context, index, field string, fieldVal []byte) error
 	DeleteField(ctx context.Context, index, field string) error
 	View(ctx context.Context, index, field, view string) (bool, error)
 	CreateView(ctx context.Context, index, field, view string) error
@@ -156,6 +155,57 @@ func (n *nopDisCo) DeleteNode(context.Context, string) error {
 	return nil
 }
 
+// Ensure type implements interface.
+var _ DisCo = &inMemDisCo{}
+
+func NewInMemDisCo(id string) *inMemDisCo {
+	return &inMemDisCo{
+		id: id,
+	}
+}
+
+// inMemDisCo represents a DisCo that is aware of itself.
+type inMemDisCo struct {
+	id string
+}
+
+// Close no-op.
+func (n *inMemDisCo) Close() error {
+	return nil
+}
+
+// Start is a no-op implementation of the DisCo Start method.
+func (n *inMemDisCo) Start(ctx context.Context) (InitialClusterState, error) {
+	return InitialClusterStateNew, nil
+}
+
+// ID is a no-op implementation of the DisCo ID method.
+func (n *inMemDisCo) ID() string {
+	return n.id
+}
+
+// IsLeader is a no-op implementation of the DisCo IsLeader method.
+func (n *inMemDisCo) IsLeader() bool {
+	return true
+}
+
+// Leader is a no-op implementation of the DisCo Leader method.
+func (n *inMemDisCo) Leader() *Peer {
+	return nil
+}
+
+// Peers is a no-op implementation of the DisCo Peers method.
+func (n *inMemDisCo) Peers() []*Peer {
+	return nil
+}
+
+// DeleteNode a no-op implementation of the DisCo DeleteNode method.
+func (n *inMemDisCo) DeleteNode(context.Context, string) error {
+	return nil
+}
+
+////////////////////////////////////////////////
+
 // NopSharder represents a Sharder that doesn't do anything.
 var NopSharder Sharder = &nopSharder{}
 
@@ -186,23 +236,27 @@ func (*nopSchemator) Index(ctx context.Context, name string) ([]byte, error) { r
 func (*nopSchemator) CreateIndex(ctx context.Context, name string, val []byte) error { return nil }
 
 // DeleteIndex is a no-op implementation of the Schemator DeleteIndex method.
-func (*nopSchemator) DeleteIndex(ctx context.Context, name string) error { return nil }
+func (*nopSchemator) DeleteIndex(ctx context.Context, name string) error {
+	return nil
+}
 
 // Field is a no-op implementation of the Schemator Field method.
 func (*nopSchemator) Field(ctx context.Context, index, field string) ([]byte, error) { return nil, nil }
 
 // CreateField is a no-op implementation of the Schemator CreateField method.
-func (*nopSchemator) CreateField(ctx context.Context, index, field string, val []byte) error {
+func (*nopSchemator) CreateField(ctx context.Context, index, field string, fieldVal []byte) error {
 	return nil
 }
 
 // UpdateField is a no-op implementation of the Schemator UpdateField method.
-func (*nopSchemator) UpdateField(ctx context.Context, index, field string, val []byte) error {
+func (*nopSchemator) UpdateField(ctx context.Context, index, field string, fieldVal []byte) error {
 	return nil
 }
 
 // DeleteField is a no-op implementation of the Schemator DeleteField method.
-func (*nopSchemator) DeleteField(ctx context.Context, index, field string) error { return nil }
+func (*nopSchemator) DeleteField(ctx context.Context, index, field string) error {
+	return nil
+}
 
 // View is a no-op implementation of the Schemator View method.
 func (*nopSchemator) View(ctx context.Context, index, field, view string) (bool, error) {
@@ -216,12 +270,6 @@ func (*nopSchemator) CreateView(ctx context.Context, index, field, view string) 
 
 // DeleteView is a no-op implementation of the Schemator DeleteView method.
 func (*nopSchemator) DeleteView(ctx context.Context, index, field, view string) error { return nil }
-
-// InMemSchemator represents a Schemator that manages the schema in memory. The
-// intention is that this would be used for testing.
-var InMemSchemator Schemator = &inMemSchemator{
-	schema: make(Schema),
-}
 
 type inMemSchemator struct {
 	mu     sync.RWMutex
@@ -296,7 +344,7 @@ func (s *inMemSchemator) Field(ctx context.Context, index, field string) ([]byte
 }
 
 // CreateField is an in-memory implementation of the Schemator CreateField method.
-func (s *inMemSchemator) CreateField(ctx context.Context, index, field string, val []byte) error {
+func (s *inMemSchemator) CreateField(ctx context.Context, index, field string, fieldVal []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	idx, ok := s.schema[index]
@@ -307,17 +355,17 @@ func (s *inMemSchemator) CreateField(ctx context.Context, index, field string, v
 		// The current logic in pilosa doesn't allow us to return ErrFieldExists
 		// here, so for now we just update the Data value if the field already
 		// exists.
-		fld.Data = val
+		fld.Data = fieldVal
 		return nil
 	}
 	idx.Fields[field] = &Field{
-		Data:  val,
+		Data:  fieldVal,
 		Views: make(map[string]struct{}),
 	}
 	return nil
 }
 
-func (s *inMemSchemator) UpdateField(ctx context.Context, index, field string, val []byte) error {
+func (s *inMemSchemator) UpdateField(ctx context.Context, index, field string, fieldVal []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	idx, ok := s.schema[index]
@@ -328,7 +376,7 @@ func (s *inMemSchemator) UpdateField(ctx context.Context, index, field string, v
 		// The current logic in pilosa doesn't allow us to return ErrFieldExists
 		// here, so for now we just update the Data value if the field already
 		// exists.
-		fld.Data = val
+		fld.Data = fieldVal
 		return nil
 	} else {
 		return ErrFieldDoesNotExist
@@ -397,8 +445,10 @@ func (s *inMemSchemator) DeleteView(ctx context.Context, index, field, view stri
 	return nil
 }
 
-var InMemSharder Sharder = &inMemSharder{
-	shards: make(map[string][]byte),
+func NewInMemSharder() *inMemSharder {
+	return &inMemSharder{
+		shards: make(map[string][]byte),
+	}
 }
 
 type inMemSharder struct {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	pilosa "github.com/featurebasedb/featurebase/v3"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/featurebasedb/featurebase/v3/server"
 	"golang.org/x/oauth2"
 )
@@ -32,13 +33,18 @@ type AuthTokenCommand struct { // nolint: maligned
 	client *pilosa.InternalClient
 
 	// Standard input/output.
-	*pilosa.CmdIO
+	logDest logger.Logger
+}
+
+// Logger returns the command's associated Logger to maintain CommandWithTLSSupport interface compatibility
+func (cmd *AuthTokenCommand) Logger() logger.Logger {
+	return cmd.logDest
 }
 
 // NewAuthTokenCommand returns a new instance of AuthTokenCommand.
-func NewAuthTokenCommand(stdin io.Reader, stdout, stderr io.Writer) *AuthTokenCommand {
+func NewAuthTokenCommand(logdest logger.Logger) *AuthTokenCommand {
 	return &AuthTokenCommand{
-		CmdIO: pilosa.NewCmdIO(stdin, stdout, stderr),
+		logDest: logdest,
 	}
 }
 
@@ -169,7 +175,7 @@ func (cmd *AuthTokenCommand) Run(ctx context.Context) (err error) {
 	}
 
 	// Prompt the user to visit verification_uri and enter code.
-	fmt.Printf(formatPromptBox(dar.VerificationURI, dar.UserCode))
+	fmt.Print(formatPromptBox(dar.VerificationURI, dar.UserCode))
 
 	// Request a token until success or error response, slowing down if requested.
 	interval := dar.Interval

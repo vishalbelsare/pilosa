@@ -1,12 +1,11 @@
-// Copyright 2022 Molecula Corp. (DBA FeatureBase).
-// SPDX-License-Identifier: Apache-2.0
+// Copyright 2021 Molecula Corp. All rights reserved.
 package clustertest
 
 import (
 	"context"
 	"fmt"
 	"hash/fnv"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -17,7 +16,6 @@ import (
 
 	pilosa "github.com/featurebasedb/featurebase/v3"
 	"github.com/featurebasedb/featurebase/v3/authn"
-	boltdb "github.com/featurebasedb/featurebase/v3/boltdb"
 	"github.com/featurebasedb/featurebase/v3/disco"
 	"github.com/featurebasedb/featurebase/v3/encoding/proto"
 	"github.com/featurebasedb/featurebase/v3/net"
@@ -102,7 +100,7 @@ func readIndexTranslateData(ctx context.Context, client *pilosa.InternalClient, 
 	if err != nil {
 		return err
 	}
-	buf, err := ioutil.ReadAll(r)
+	buf, err := io.ReadAll(r)
 	if err != nil {
 		return err
 	}
@@ -130,7 +128,7 @@ func readIndexTranslateData(ctx context.Context, client *pilosa.InternalClient, 
 }
 
 func openTranslateStores(dirPath, index string) (map[int]pilosa.TranslateStore, error) {
-	dirEntries, err := ioutil.ReadDir(dirPath)
+	dirEntries, err := os.ReadDir(dirPath)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +144,7 @@ func openTranslateStores(dirPath, index string) (map[int]pilosa.TranslateStore, 
 	// filter out non-file entries
 	filePaths := make([]string, 0, len(dirEntries))
 	for _, entry := range dirEntries {
-		if entry.Mode().IsDir() {
+		if entry.IsDir() {
 			continue
 		}
 		filePath := filepath.Join(dirPath, entry.Name())
@@ -162,7 +160,7 @@ func openTranslateStores(dirPath, index string) (map[int]pilosa.TranslateStore, 
 			return nil, err
 		}
 		// open bolt db
-		ts, err := boltdb.OpenTranslateStore(filePath, index, "", partition, disco.DefaultPartitionN, false)
+		ts, err := pilosa.OpenTranslateStore(filePath, index, "", partition, disco.DefaultPartitionN, false)
 		ts.SetReadOnly(true)
 		if err != nil {
 			return nil, err
@@ -187,7 +185,7 @@ func verifyNodeHasGivenKeys(ctx context.Context, node, index, dirPath string, ke
 
 	// create dir to store boltdbs for this node
 	nodeDirPath := filepath.Join(dirPath, node)
-	err = os.Mkdir(nodeDirPath, 0755)
+	err = os.Mkdir(nodeDirPath, 0o755)
 	if err != nil {
 		return err
 	}
@@ -300,11 +298,7 @@ func TestPauseReplica(t *testing.T) {
 	ctx := context.Background()
 	if auth {
 		token := GetAuthToken(t)
-		ctx = context.WithValue(
-			ctx,
-			authn.ContextValueAccessToken,
-			"Bearer "+token,
-		)
+		ctx = authn.WithAccessToken(ctx, "Bearer "+token)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -390,7 +384,7 @@ func TestPauseReplica(t *testing.T) {
 		t.Fatal(err)
 	}
 	dirPath = filepath.Join(dirPath, keysDirName)
-	err = os.Mkdir(dirPath, 0755)
+	err = os.Mkdir(dirPath, 0o755)
 	if err != nil {
 		t.Fatal(err)
 	}

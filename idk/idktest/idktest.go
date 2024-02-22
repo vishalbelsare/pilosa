@@ -3,7 +3,7 @@ package idktest
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -19,6 +19,7 @@ const (
 )
 
 type ExtractResponse struct {
+	Error   string `json:"error"`
 	Results []Result
 }
 
@@ -62,7 +63,7 @@ func DoExtractQuery(pql, index string) (ExtractResponse, error) {
 	}
 	defer resp.Body.Close()
 
-	s, err := ioutil.ReadAll(resp.Body)
+	s, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return eResp, errors.Errorf("reading response: %v", err)
 	}
@@ -70,6 +71,10 @@ func DoExtractQuery(pql, index string) (ExtractResponse, error) {
 	err = json.Unmarshal(s, &eResp)
 	if err != nil {
 		return eResp, errors.Errorf("unmarshaling response: %v", err)
+	}
+
+	if eResp.Error != "" {
+		return eResp, errors.New(eResp.Error)
 	}
 
 	return eResp, nil

@@ -13,13 +13,13 @@ import (
 	"github.com/pkg/errors"
 )
 
-//probably should just implement the container interface
+// probably should just implement the container interface
 // but for now i'll do it
 func (c *Cursor) Rows() ([]uint64, error) {
-	shardVsContainerExponent := uint(4) //needs constant exported from roaring package
+	shardVsContainerExponent := uint(4) // needs constant exported from roaring package
 	rows := make([]uint64, 0)
 	if err := c.First(); err != nil {
-		if err == io.EOF { //root leaf with no elements
+		if err == io.EOF { // root leaf with no elements
 			return rows, nil
 		}
 		return nil, errors.Wrap(err, "rows")
@@ -53,15 +53,15 @@ func (tx *Tx) FieldViews() []string {
 	records, _ := tx.RootRecords()
 	a := make([]string, 0, records.Len())
 	for itr := records.Iterator(); !itr.Done(); {
-		name, _ := itr.Next()
-		a = append(a, name.(string))
+		name, _, _ := itr.Next()
+		a = append(a, name)
 	}
 	return a
 }
 
 func (c *Cursor) DumpKeys() {
 	if err := c.First(); err != nil {
-		//ignoring errors for this debug function
+		// ignoring errors for this debug function
 		return
 	}
 	for {
@@ -78,6 +78,7 @@ func (c *Cursor) DumpKeys() {
 		fmt.Println("key", cell.Key)
 	}
 }
+
 func (c *Cursor) DumpStack() {
 	fmt.Println("STACK")
 	for i := c.stack.top; i >= 0; i-- {
@@ -85,6 +86,7 @@ func (c *Cursor) DumpStack() {
 	}
 	fmt.Println()
 }
+
 func (c *Cursor) Dump(name string) {
 	writer, _ := os.Create(name)
 	defer writer.Close()
@@ -194,9 +196,9 @@ func intoContainer(l leafCell, tx *Tx, replacing *roaring.Container, target []by
 
 // intoWritableContainer always uses the provided target for a copy of
 // the container's contents, so the container can be modified safely.
-func intoWritableContainer(l leafCell, tx *Tx, replacing *roaring.Container, target []byte) (c *roaring.Container) {
+func intoWritableContainer(l leafCell, tx *Tx, replacing *roaring.Container, target []byte) (c *roaring.Container, err error) {
 	if len(l.Data) == 0 {
-		return nil
+		return nil, nil
 	}
 	orig := l.Data
 	target = target[:len(orig)]
@@ -207,7 +209,10 @@ func intoWritableContainer(l leafCell, tx *Tx, replacing *roaring.Container, tar
 	case ContainerTypeBitmapPtr:
 		pgno := toPgno(target)
 		target = target[:PageSize] // reslice back to full size
-		_, bm, _ := tx.leafCellBitmapInto(pgno, target)
+		_, bm, err := tx.leafCellBitmapInto(pgno, target)
+		if err != nil {
+			return nil, fmt.Errorf("intoContainer: %s", err)
+		}
 		c = roaring.RemakeContainerBitmapN(replacing, bm, int32(l.BitN))
 	case ContainerTypeBitmap:
 		c = roaring.RemakeContainerBitmapN(replacing, toArray64(target), int32(l.BitN))
@@ -219,7 +224,7 @@ func intoWritableContainer(l leafCell, tx *Tx, replacing *roaring.Container, tar
 	// expensive.
 	c.CheckN()
 	c.SetMapped(false)
-	return c
+	return c, nil
 }
 
 func toContainer(l leafCell, tx *Tx) (c *roaring.Container) {

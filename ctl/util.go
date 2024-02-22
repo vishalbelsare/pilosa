@@ -8,10 +8,18 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/felixge/fgprof"
 	"github.com/featurebasedb/featurebase/v3/logger"
+	"github.com/felixge/fgprof"
 	"github.com/pkg/errors"
 )
+
+type ctlUsageError struct{}
+
+func (c ctlUsageError) Error() string {
+	return "usage error"
+}
+
+var ErrUsage ctlUsageError
 
 // startProfilingServer starts a server which handles /debug/pprof and
 // /debug/fgprof for use in utilities we might want to profile but

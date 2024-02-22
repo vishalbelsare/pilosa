@@ -3,24 +3,20 @@
 package cmd
 
 import (
-	"context"
-	"io"
-
 	"github.com/featurebasedb/featurebase/v3/ctl"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/spf13/cobra"
 )
 
-func newRestoreCommand(stdin io.Reader, stdout, stderr io.Writer) *cobra.Command {
-	cmd := ctl.NewRestoreCommand(stdin, stdout, stderr)
+func newRestoreCommand(logdest logger.Logger) *cobra.Command {
+	cmd := ctl.NewRestoreCommand(logdest)
 	restoreCmd := &cobra.Command{
 		Use:   "restore",
 		Short: "Restore from a backup",
 		Long: `
 The Restore command will take a backup archive and restore it to a new, clean cluster.
 `,
-		RunE: func(c *cobra.Command, args []string) error {
-			return cmd.Run(context.Background())
-		},
+		RunE: UsageErrorWrapper(cmd),
 	}
 	flags := restoreCmd.Flags()
 	flags.StringVarP(&cmd.Path, "source", "s", "", "backup file; specify '-' to restore from stdin tar stream")

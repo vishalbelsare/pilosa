@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt"
 	pilosa "github.com/featurebasedb/featurebase/v3"
 	"github.com/featurebasedb/featurebase/v3/authn"
 	"github.com/featurebasedb/featurebase/v3/authz"
@@ -27,7 +26,9 @@ import (
 	"github.com/featurebasedb/featurebase/v3/sql"
 	"github.com/featurebasedb/featurebase/v3/test"
 	"github.com/featurebasedb/featurebase/v3/vprint"
+	"github.com/golang-jwt/jwt"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -565,7 +566,7 @@ func TestQuerySQL(t *testing.T) {
 					{[]columnResponse{uint64(5), int64(16), []string{"blue"}, int64(60), int64(-2), "2014-01-02T12:32:00Z"}},
 					{[]columnResponse{uint64(6), int64(34), []string{"blue"}, int64(70), int64(100), "2010-05-02T12:32:00Z"}},
 					{[]columnResponse{uint64(7), int64(27), []string{"blue"}, int64(80), int64(0), "2016-08-02T12:32:00Z"}},
-					{[]columnResponse{uint64(8), int64(16), []string{}, int64(90), int64(-13), "2020-01-02T12:32:00Z"}},
+					{[]columnResponse{uint64(8), int64(16), []string(nil), int64(90), int64(-13), "2020-01-02T12:32:00Z"}},
 					{[]columnResponse{uint64(9), int64(16), []string{"red"}, int64(100), int64(80), "2000-03-02T12:32:00Z"}},
 					{[]columnResponse{uint64(10), int64(31), []string{"red"}, int64(110), int64(-2), "2018-01-02T12:32:00Z"}},
 				},
@@ -1183,23 +1184,11 @@ admin: "ac97c9e2-346b-42a2-b6da-18bcb61a32fe"`
 	}
 
 	user := makeUser([]authn.Group{{GroupID: "ac97c9e2-346b-42a2-b6da-18bcb61a32fe", GroupName: "adminGroup"}}, "admin")
-	adminCtx := context.WithValue(
-		ctx,
-		"userinfo",
-		user,
-	)
+	adminCtx := authn.WithUserInfo(ctx, user)
 	readuser := makeUser([]authn.Group{{GroupID: "dca35310-ecda-4f23-86cd-876aee55906b", GroupName: "readers"}}, "reader")
-	readCtx := context.WithValue(
-		ctx,
-		"userinfo",
-		readuser,
-	)
+	readCtx := authn.WithUserInfo(ctx, readuser)
 	writeuser := makeUser([]authn.Group{{GroupID: "dca35310-ecda-4f23-86cd-876aee55906f", GroupName: "writers"}}, "admin")
-	writeCtx := context.WithValue(
-		ctx,
-		"userinfo",
-		writeuser,
-	)
+	writeCtx := authn.WithUserInfo(ctx, writeuser)
 
 	sql := "select * from grouper"
 	t.Run("test-auth-with-admin-sqlUnary", func(t *testing.T) {
@@ -1536,11 +1525,11 @@ func TestCRUDIndexes(t *testing.T) {
 
 func TestLogQuery(t *testing.T) {
 	method := "test!"
-	uinfo := authn.UserInfo{
+	uinfo := &authn.UserInfo{
 		UserID:   "ID",
 		UserName: "name",
 	}
-	ctx := context.WithValue(context.Background(), "userinfo", &uinfo)
+	ctx := authn.WithUserInfo(context.Background(), uinfo)
 
 	cases := []struct {
 		name     string
@@ -1894,7 +1883,8 @@ func writeTestFile(t *testing.T, filename, content string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	io.WriteString(f, content)
+	_, err = io.WriteString(f, content)
+	assert.NoError(t, err)
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1919,11 +1909,7 @@ func Test_ChainUnaryInterceptor(t *testing.T) {
 	interceptors0 := []grpc.UnaryServerInterceptor{}
 	interceptors1 := []grpc.UnaryServerInterceptor{salt}
 	interceptors2 := []grpc.UnaryServerInterceptor{salt, pepper}
-	// interceptors5 := []grpc.UnaryServerInterceptor{interceptor, interceptor, interceptor, interceptor, interceptor}
 
-	type args struct {
-		interceptors []grpc.UnaryServerInterceptor
-	}
 	tests := []struct {
 		name         string
 		interceptors []grpc.UnaryServerInterceptor
@@ -1965,8 +1951,8 @@ type MockStream struct {
 	context context.Context
 }
 
-func (ms MockStream) SetHeader(md metadata.MD) error {
-	ms.context = context.WithValue(context.Background(), "metadata", md)
+func (ms *MockStream) SetHeader(md metadata.MD) error {
+	ms.context = contextWithMetadata(context.Background(), md)
 	return nil
 }
 
@@ -1979,7 +1965,7 @@ func (ms MockStream) SetTrailer(metadata.MD) {}
 func (ms MockStream) Context() context.Context {
 	if ms.context == nil {
 		md := metadata.New(map[string]string{})
-		ms.context = context.WithValue(context.Background(), "metadata", md)
+		ms.context = contextWithMetadata(context.Background(), md)
 	}
 	return ms.context
 }
@@ -1992,22 +1978,37 @@ func (ms MockStream) RecvMsg(m interface{}) error {
 	return nil
 }
 
-func fromIncomingContext(ctx context.Context) metadata.MD {
-	return ctx.Value("metadata").(metadata.MD)
+type contextKeyMetadata struct{}
+
+func contextWithMetadata(ctx context.Context, metadata metadata.MD) context.Context {
+	return context.WithValue(ctx, contextKeyMetadata{}, metadata)
+}
+
+func metadataFromContext(ctx context.Context) (meta metadata.MD, ok bool) {
+	meta, ok = ctx.Value(contextKeyMetadata{}).(metadata.MD)
+	return
 }
 
 func Test_ChainStreamInterceptor(t *testing.T) {
 
 	salt := func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		md := fromIncomingContext(ss.Context())
+		md, ok := metadataFromContext(ss.Context())
+		if !ok {
+			t.Fatal("metadata was not in context")
+		}
 		md.Append("ingredient", "with salt")
-		ss.SetHeader(md)
+		err := ss.SetHeader(md)
+		assert.NoError(t, err)
 		return handler(srv, ss)
 	}
 	pepper := func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		md := fromIncomingContext(ss.Context())
+		md, ok := metadataFromContext(ss.Context())
+		if !ok {
+			t.Fatal("metadata was not in context")
+		}
 		md.Append("ingredient", "and pepper")
-		ss.SetHeader(md)
+		err := ss.SetHeader(md)
+		assert.NoError(t, err)
 		return handler(srv, ss)
 	}
 
@@ -2015,9 +2016,6 @@ func Test_ChainStreamInterceptor(t *testing.T) {
 	interceptors1 := []grpc.StreamServerInterceptor{salt}
 	interceptors2 := []grpc.StreamServerInterceptor{salt, pepper}
 
-	type args struct {
-		interceptors []grpc.StreamServerInterceptor
-	}
 	tests := []struct {
 		name         string
 		interceptors []grpc.StreamServerInterceptor
@@ -2031,10 +2029,13 @@ func Test_ChainStreamInterceptor(t *testing.T) {
 		result := make([]string, 0)
 		srv := "asdf"
 		md := metadata.New(map[string]string{})
-		ss := MockStream{context: context.WithValue(context.Background(), "metadata", md)}
+		ss := &MockStream{context: contextWithMetadata(context.Background(), md)}
 		info := &grpc.StreamServerInfo{}
 		handler := func(srv interface{}, stream grpc.ServerStream) error {
-			md := fromIncomingContext(stream.Context())
+			md, ok := metadataFromContext(stream.Context())
+			if !ok {
+				t.Fatal("metadata was not in context")
+			}
 			vals := md.Get("ingredient")
 			result = append(result, "Soup")
 			result = append(result, vals...)
@@ -2042,7 +2043,8 @@ func Test_ChainStreamInterceptor(t *testing.T) {
 		}
 		t.Run(tt.name, func(t *testing.T) {
 			chained := server.ChainStreamInterceptors(tt.interceptors...)
-			chained(srv, ss, info, handler)
+			err := chained(srv, ss, info, handler)
+			assert.NoError(t, err)
 			if !reflect.DeepEqual(result, tt.want) {
 				t.Errorf("ChainStreamInterceptor() = %v, want %v", result, tt.want)
 			}

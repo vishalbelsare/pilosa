@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -26,11 +25,11 @@ var _ = txkey.ToString
 // view at the point-in-time they are started.
 type Tx struct {
 	mu          sync.RWMutex
-	db          *DB                  // parent db
-	meta        [PageSize]byte       // copy of current meta page
-	walID       int64                // max WAL ID at start of tx
-	walPageN    int                  // wal page count
-	rootRecords *immutable.SortedMap // read-only cache of root records
+	db          *DB                                  // parent db
+	meta        [PageSize]byte                       // copy of current meta page
+	walID       int64                                // max WAL ID at start of tx
+	walPageN    int                                  // wal page count
+	rootRecords *immutable.SortedMap[string, uint32] // read-only cache of root records
 
 	// pageMap holds WAL pages that have not yet been transferred
 	// into the database pages. So it can be empty, if the whole previous
@@ -251,7 +250,7 @@ func (tx *Tx) root(name string) (uint32, error) {
 	if !ok {
 		return 0, ErrBitmapNotFound
 	}
-	return pgno.(uint32), nil
+	return pgno, nil
 }
 
 // BitmapNames returns a list of all bitmap names.
@@ -271,8 +270,8 @@ func (tx *Tx) BitmapNames() ([]string, error) {
 
 	a := make([]string, 0, records.Len())
 	for itr := records.Iterator(); !itr.Done(); {
-		k, _ := itr.Next()
-		a = append(a, k.(string))
+		k, _, _ := itr.Next()
+		a = append(a, k)
 	}
 	return a, nil
 }
@@ -395,7 +394,7 @@ func (tx *Tx) DeleteBitmap(name string) error {
 	}
 
 	// Deallocate all pages in the tree.
-	if err := tx.deallocateTree(pgno.(uint32)); err != nil {
+	if err := tx.deallocateTree(pgno); err != nil {
 		return err
 	}
 
@@ -426,18 +425,18 @@ func (tx *Tx) DeleteBitmapsWithPrefix(prefix string) error {
 	}
 
 	for itr := records.Iterator(); !itr.Done(); {
-		name, pgno := itr.Next()
+		name, pgno, _ := itr.Next()
 
 		// Skip bitmaps without matching prefix.
-		if !strings.HasPrefix(name.(string), prefix) {
+		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
 		// Deallocate all pages in the tree.
-		if err := tx.deallocateTree(pgno.(uint32)); err != nil {
+		if err := tx.deallocateTree(pgno); err != nil {
 			return err
 		}
 
-		records = records.Delete(name.(string))
+		records = records.Delete(name)
 	}
 
 	// Rewrite record pages.
@@ -485,12 +484,12 @@ func (tx *Tx) RenameBitmap(oldname, newname string) error {
 }
 
 // RootRecords returns a list of root records.
-func (tx *Tx) RootRecords() (records *immutable.SortedMap, err error) {
+func (tx *Tx) RootRecords() (records *immutable.SortedMap[string, uint32], err error) {
 	if tx.rootRecords != nil {
 		return tx.rootRecords, nil
 	}
 
-	records = immutable.NewSortedMap(nil)
+	records = immutable.NewSortedMap[string, uint32](nil)
 	for pgno := readMetaRootRecordPageNo(tx.meta[:]); pgno != 0; {
 		page, _, err := tx.readPage(pgno)
 		if err != nil {
@@ -516,8 +515,7 @@ func (tx *Tx) RootRecords() (records *immutable.SortedMap, err error) {
 }
 
 // writeRootRecordPages writes a list of root record pages.
-func (tx *Tx) writeRootRecordPages(records *immutable.SortedMap) (err error) {
-
+func (tx *Tx) writeRootRecordPages(records *immutable.SortedMap[string, uint32]) (err error) {
 	// Release all existing root record pages.
 	for pgno := readMetaRootRecordPageNo(tx.meta[:]); pgno != 0; {
 		page, _, err := tx.readPage(pgno)
@@ -1000,9 +998,9 @@ func (tx *Tx) inusePageSet() (map[uint32]struct{}, error) {
 		errorList.Append(err)
 	} else {
 		for itr := records.Iterator(); !itr.Done(); {
-			_, pgno := itr.Next()
+			_, pgno, _ := itr.Next()
 
-			if err := tx.walkTree(pgno.(uint32), 0, func(pgno, parent, typ uint32, err error) error {
+			if err := tx.walkTree(pgno, 0, func(pgno, parent, typ uint32, err error) error {
 				if err != nil {
 					errorList.Append(err)
 				}
@@ -1030,15 +1028,15 @@ func (tx *Tx) GetSizeBytesWithPrefix(prefix string) (n uint64, err error) {
 
 	// Loop over each bitmap in the database.
 	for itr := records.Iterator(); !itr.Done(); {
-		name, pgno := itr.Next()
+		name, pgno, _ := itr.Next()
 
 		// Skip over any bitmaps that don't have a matching prefix.
-		if !strings.HasPrefix(name.(string), prefix) {
+		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
 
 		// Traverse the bitmap's b-tree and count the bytes for each page.
-		if err := tx.walkTree(pgno.(uint32), 0, func(pgno, parent, typ uint32, err error) error {
+		if err := tx.walkTree(pgno, 0, func(pgno, parent, typ uint32, err error) error {
 			n += PageSize
 			return err
 		}); err != nil {
@@ -1416,109 +1414,6 @@ func (tx *Tx) ApplyFilter(name string, key uint64, filter roaring.BitmapFilter) 
 	return f.ApplyFilter()
 }
 
-func (tx *Tx) ForEach(name string, fn func(i uint64) error) error {
-	return tx.ForEachRange(name, 0, math.MaxUint64, fn)
-}
-
-func (tx *Tx) ForEachRange(name string, start, end uint64, fn func(uint64) error) error {
-	tx.mu.RLock()
-	defer tx.mu.RUnlock()
-
-	c, err := tx.cursor(name)
-	if err == ErrBitmapNotFound {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	defer c.Close()
-
-	if _, err := c.Seek(highbits(start)); err != nil {
-		return err
-	}
-
-	for {
-		if err := c.Next(); err == io.EOF {
-			return nil
-		} else if err != nil {
-			return err
-		}
-
-		elem := &c.stack.elems[c.stack.top]
-		leafPage, _, err := c.tx.readPage(elem.pgno)
-		if err != nil {
-			return err
-		}
-		cell := readLeafCell(leafPage, elem.index)
-
-		switch cell.Type {
-		case ContainerTypeArray:
-			for _, lo := range toArray16(cell.Data) {
-				v := cell.Key<<16 | uint64(lo)
-				if v < start {
-					continue
-				} else if v > end {
-					return nil
-				} else if err := fn(v); err != nil {
-					return err
-				}
-			}
-		case ContainerTypeRLE:
-			for _, r := range toInterval16(cell.Data) {
-				for lo := int(r.Start); lo <= int(r.Last); lo++ {
-					v := cell.Key<<16 | uint64(lo)
-					if v < start {
-						continue
-					} else if v > end {
-						return nil
-					} else if err := fn(v); err != nil {
-						return err
-					}
-				}
-			}
-		case ContainerTypeBitmap:
-			for i, bits := range toArray64(cell.Data) {
-				for j := uint(0); j < 64; j++ {
-					if bits&(1<<j) == 0 {
-						continue
-					}
-
-					v := cell.Key<<16 | (uint64(i) * 64) | uint64(j)
-					if v < start {
-						continue
-					} else if v > end {
-						return nil
-					} else if err := fn(v); err != nil {
-						return err
-					}
-				}
-			}
-		case ContainerTypeBitmapPtr:
-			_, bm, err := c.tx.leafCellBitmap(toPgno(cell.Data))
-			if err != nil {
-				return err
-			}
-			for i, bits := range bm {
-				for j := uint(0); j < 64; j++ {
-					if bits&(1<<j) == 0 {
-						continue
-					}
-
-					v := cell.Key<<16 | (uint64(i) * 64) | uint64(j)
-					if v < start {
-						continue
-					} else if v > end {
-						return nil
-					} else if err := fn(v); err != nil {
-						return err
-					}
-				}
-			}
-		default:
-			vprint.PanicOn(fmt.Sprintf("invalid container type: %d", cell.Type))
-		}
-	}
-}
-
 func (tx *Tx) Count(name string) (uint64, error) {
 	tx.mu.RLock()
 	defer tx.mu.RUnlock()
@@ -1773,7 +1668,10 @@ func (s *containerFilter) ApplyFilter() (err error) {
 	}
 	for err := s.cursor.Next(); err == nil; err = s.cursor.Next() {
 		elem := &s.cursor.stack.elems[s.cursor.stack.top]
-		leafPage, _, _ := s.cursor.tx.readPage(elem.pgno)
+		leafPage, _, err := s.cursor.tx.readPage(elem.pgno)
+		if err != nil {
+			return fmt.Errorf("reading from pgno %d applying filter: %s", elem.pgno, err)
+		}
 		readLeafCellInto(&cell, leafPage, elem.index)
 		key := roaring.FilterKey(cell.Key)
 		if key < minKey {
@@ -1835,7 +1733,10 @@ func (s *containerFilter) ApplyRewriter() (err error) {
 	}
 	for err := s.cursor.Next(); err == nil; err = s.cursor.Next() {
 		elem := &s.cursor.stack.elems[s.cursor.stack.top]
-		leafPage, _, _ := s.cursor.tx.readPage(elem.pgno)
+		leafPage, _, err := s.cursor.tx.readPage(elem.pgno)
+		if err != nil {
+			return fmt.Errorf("reading from pgno %d applying rewriter: %s", elem.pgno, err)
+		}
 		readLeafCellInto(&cell, leafPage, elem.index)
 		key = roaring.FilterKey(cell.Key)
 		if key < minKey {
@@ -1846,7 +1747,10 @@ func (s *containerFilter) ApplyRewriter() (err error) {
 			return res.Err
 		}
 		if res.YesKey <= key && res.NoKey <= key {
-			data := intoWritableContainer(cell, s.cursor.tx, &s.header, s.body[:])
+			data, err := intoWritableContainer(cell, s.cursor.tx, &s.header, s.body[:])
+			if err != nil {
+				return fmt.Errorf("applying rewriter: %s", err)
+			}
 			res = s.rewriter.RewriteData(key, data, writeback)
 			if res.Err != nil {
 				return res.Err
@@ -1906,13 +1810,13 @@ func (si *emptyContainerIterator) Close() {}
 func (si *emptyContainerIterator) Next() bool {
 	return false
 }
+
 func (si *emptyContainerIterator) Value() (uint64, *roaring.Container) {
 	vprint.PanicOn("emptyContainerIterator never has any Values")
 	return 0, nil
 }
 
 func (tx *Tx) ImportRoaringBits(name string, itr roaring.RoaringIterator, clear bool, log bool, rowSize uint64) (changed int, rowSet map[uint64]int, err error) {
-
 	// begin write boilerplate
 	if tx.db == nil {
 		err = ErrTxClosed
@@ -2239,9 +2143,9 @@ func (tx *Tx) PageInfos() ([]PageInfo, error) {
 		errorList.Append(err)
 	} else {
 		for itr := records.Iterator(); !itr.Done(); {
-			name, pgno := itr.Next()
+			name, pgno, _ := itr.Next()
 
-			if err := tx.walkPageInfo(infos, pgno.(uint32), name.(string)); err != nil {
+			if err := tx.walkPageInfo(infos, pgno, name); err != nil {
 				errorList.Append(err)
 			}
 		}
@@ -2351,8 +2255,8 @@ func (tx *Tx) GetSortedFieldViewList() (fvs []txkey.FieldView, _ error) {
 	}
 	it := records.Iterator()
 	for !it.Done() {
-		k, _ := it.Next()
-		root := k.(string)
+		k, _, _ := it.Next()
+		root := k
 		fv := txkey.FieldViewFromPrefix([]byte(root))
 		fvs = append(fvs, fv)
 	}

@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"io/ioutil"
+	"os"
 	"sort"
 	"strconv"
 	"sync"
@@ -149,6 +149,8 @@ func (r *Record) StreamOffset() (string, uint64) {
 
 var _ idk.OffsetStreamRecord = &Record{}
 
+func (r *Record) Schema() interface{} { return nil }
+
 func (r *Record) Commit(ctx context.Context) error {
 	r.src.mu.Lock()
 	defer r.src.mu.Unlock()
@@ -185,11 +187,6 @@ func (r *Record) Commit(ctx context.Context) error {
 	return nil
 }
 
-// Assuming committed msgs are in order
-func calOffsetDiff(section, committed []confluent.TopicPartition) []confluent.TopicPartition {
-	return section[len(committed):]
-}
-
 func (r *Record) Data() []interface{} {
 	return r.data
 }
@@ -200,7 +197,7 @@ func (s *Source) Open() error {
 		return errors.New("needs header specification file")
 	}
 
-	headerData, err := ioutil.ReadFile(s.Header)
+	headerData, err := os.ReadFile(s.Header)
 	if err != nil {
 		return errors.Wrap(err, "reading header file")
 	}

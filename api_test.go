@@ -22,49 +22,26 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt"
 	pilosa "github.com/featurebasedb/featurebase/v3"
 	"github.com/featurebasedb/featurebase/v3/authn"
-	"github.com/featurebasedb/featurebase/v3/boltdb"
 	"github.com/featurebasedb/featurebase/v3/roaring"
 	"github.com/featurebasedb/featurebase/v3/server"
 	"github.com/featurebasedb/featurebase/v3/shardwidth"
 	"github.com/featurebasedb/featurebase/v3/test"
 	. "github.com/featurebasedb/featurebase/v3/vprint" // nolint:staticcheck
+	"github.com/golang-jwt/jwt"
 
 	"golang.org/x/sync/errgroup"
 )
 
 func TestAPI_Import(t *testing.T) {
-	c := test.MustRunCluster(t, 3,
-		[]server.CommandOption{
-			server.OptCommandServerOptions(
-				pilosa.OptServerNodeID("node0"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
-				pilosa.OptServerOpenTranslateStore(boltdb.OpenTranslateStore),
-				pilosa.OptServerOpenTranslateReader(pilosa.GetOpenTranslateReaderFunc(nil)),
-			)},
-		[]server.CommandOption{
-			server.OptCommandServerOptions(
-				pilosa.OptServerNodeID("node1"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
-				pilosa.OptServerOpenTranslateStore(boltdb.OpenTranslateStore),
-				pilosa.OptServerOpenTranslateReader(pilosa.GetOpenTranslateReaderFunc(nil)),
-			)},
-		[]server.CommandOption{
-			server.OptCommandServerOptions(
-				pilosa.OptServerNodeID("node2"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
-				pilosa.OptServerOpenTranslateStore(boltdb.OpenTranslateStore),
-				pilosa.OptServerOpenTranslateReader(pilosa.GetOpenTranslateReaderFunc(nil)),
-			)},
-	)
+	c := test.MustRunCluster(t, 3)
 	defer c.Close()
 
 	m0 := c.GetNode(0)
 	m1 := c.GetNode(1)
 
-	indexNames := map[bool]string{false: "i", true: "ki"}
+	indexNames := map[bool]string{false: c.Idx("u"), true: c.Idx("k")}
 	fieldNames := map[bool]string{false: "f", true: "kf"}
 
 	ctx := context.Background()
@@ -104,7 +81,7 @@ func TestAPI_Import(t *testing.T) {
 
 	t.Run("RowIDColumnKey", func(t *testing.T) {
 		// Import data with keys to the primary and verify that it gets
-		// translated and forwarded to the owner of shard 0 (node1; because of offsetModHasher)
+		// translated and forwarded to the owner of shard 0
 		req := &pilosa.ImportRequest{
 			Index:      indexNames[true],
 			Field:      fieldNames[false],
@@ -152,7 +129,7 @@ func TestAPI_Import(t *testing.T) {
 		}
 	})
 	t.Run("ExpectedErrors", func(t *testing.T) {
-		t.Skip() // skipping due to change partitioning strategy
+		t.Skip("partitioning strategy changed, test not supported") // skipping due to change partitioning strategy
 		ctx := context.Background()
 		for ik, indexName := range indexNames {
 			for fk, fieldName := range fieldNames {
@@ -224,26 +201,7 @@ func TestAPI_Import(t *testing.T) {
 }
 
 func TestAPI_ImportValue(t *testing.T) {
-	c := test.MustRunCluster(t, 3,
-		[]server.CommandOption{
-			server.OptCommandServerOptions(
-				pilosa.OptServerNodeID("node0"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
-				pilosa.OptServerOpenTranslateReader(pilosa.GetOpenTranslateReaderFunc(nil)),
-			)},
-		[]server.CommandOption{
-			server.OptCommandServerOptions(
-				pilosa.OptServerNodeID("node1"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
-				pilosa.OptServerOpenTranslateReader(pilosa.GetOpenTranslateReaderFunc(nil)),
-			)},
-		[]server.CommandOption{
-			server.OptCommandServerOptions(
-				pilosa.OptServerNodeID("node2"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
-				pilosa.OptServerOpenTranslateReader(pilosa.GetOpenTranslateReaderFunc(nil)),
-			)},
-	)
+	c := test.MustRunCluster(t, 3)
 	defer c.Close()
 
 	coord := c.GetPrimary()
@@ -253,7 +211,7 @@ func TestAPI_ImportValue(t *testing.T) {
 
 	t.Run("ValColumnKey", func(t *testing.T) {
 		ctx := context.Background()
-		index := "valck"
+		index := c.Idx("valck")
 		field := "f"
 
 		_, err := coord.API.CreateIndex(ctx, index, pilosa.IndexOptions{Keys: true})
@@ -275,7 +233,7 @@ func TestAPI_ImportValue(t *testing.T) {
 		colKeys := []string{"col10", "col8", "col9", "col6", "col7", "col4", "col5", "col2", "col3", "col1"}
 
 		// Import data with keys to the primary and verify that it gets
-		// translated and forwarded to the owner of shard 0 (node1; because of offsetModHasher)
+		// translated and forwarded to the owner of shard 0
 		req := &pilosa.ImportValueRequest{
 			Index:      index,
 			Field:      field,
@@ -293,18 +251,24 @@ func TestAPI_ImportValue(t *testing.T) {
 		pql := fmt.Sprintf("Row(%s>0)", field)
 
 		// Query node0.
-		if res, err := m0.API.Query(ctx, &pilosa.QueryRequest{Index: index, Query: pql}); err != nil {
+		res, err := m0.API.Query(ctx, &pilosa.QueryRequest{Index: index, Query: pql})
+		if err != nil {
 			t.Fatal(err)
-		} else if keys := res.Results[0].(*pilosa.Row).Keys; !reflect.DeepEqual(keys, colKeys) {
+		}
+		keys := res.Results[0].(*pilosa.Row).Keys
+		if !sameStringSlice(keys, colKeys) {
 			t.Fatalf("unexpected column keys: %+v", keys)
 		}
 
 		// Query node1.
 		if err := test.RetryUntil(5*time.Second, func() error {
-			if res, err := m1.API.Query(ctx, &pilosa.QueryRequest{Index: index, Query: pql}); err != nil {
-				return err
-			} else if keys := res.Results[0].(*pilosa.Row).Keys; !reflect.DeepEqual(keys, colKeys) {
-				return fmt.Errorf("unexpected column keys: %+v", keys)
+			res, err := m1.API.Query(ctx, &pilosa.QueryRequest{Index: index, Query: pql})
+			if err != nil {
+				t.Fatal(err)
+			}
+			keys := res.Results[0].(*pilosa.Row).Keys
+			if !sameStringSlice(keys, colKeys) {
+				t.Fatalf("unexpected column keys: %+v", keys)
 			}
 			return nil
 		}); err != nil {
@@ -314,7 +278,7 @@ func TestAPI_ImportValue(t *testing.T) {
 
 	t.Run("ValIntEmpty", func(t *testing.T) {
 		ctx := context.Background()
-		index := "valintempty"
+		index := c.Idx("valintempty")
 		field := "fld"
 		createIndexForTest(index, coord, t)
 		createFieldForTest(index, field, coord, t)
@@ -387,7 +351,7 @@ func TestAPI_ImportValue(t *testing.T) {
 			colIDs = append(colIDs, uint64(i))
 		}
 		// Import data with keys to node1 and verify that it gets translated and
-		// forwarded to the owner of shard 0 (node0; because of offsetModHasher)
+		// forwarded to the owner of shard 0
 		req := &pilosa.ImportValueRequest{
 			Index:       index,
 			Field:       field,
@@ -410,7 +374,7 @@ func TestAPI_ImportValue(t *testing.T) {
 
 	t.Run("ValDecimalFieldNegativeScale", func(t *testing.T) {
 		ctx := context.Background()
-		index := "valdecneg"
+		index := c.Idx("valdecneg")
 		field := "fdecneg"
 
 		_, err := m0.API.CreateIndex(ctx, index, pilosa.IndexOptions{})
@@ -424,9 +388,9 @@ func TestAPI_ImportValue(t *testing.T) {
 	})
 
 	t.Run("ValTimestampField", func(t *testing.T) {
-		t.Skip() // skipping due to change partitioning strategy
+		t.Skip("partition strategy change invalidated") // skipping due to change partitioning strategy
 		ctx := context.Background()
-		index := "valts"
+		index := c.Idx("valts")
 		field := "fts"
 
 		_, err := m1.API.CreateIndex(ctx, index, pilosa.IndexOptions{})
@@ -447,7 +411,7 @@ func TestAPI_ImportValue(t *testing.T) {
 		}
 
 		// Import data with keys to node1 and verify that it gets translated and
-		// forwarded to the owner of shard 0 (node0; because of offsetModHasher)
+		// forwarded to the owner of shard 0
 		req := &pilosa.ImportValueRequest{
 			Index:           index,
 			Field:           field,
@@ -472,9 +436,9 @@ func TestAPI_ImportValue(t *testing.T) {
 	})
 
 	t.Run("ValStringField", func(t *testing.T) {
-		t.Skip() // skipping due to change partitioning strategy
+		t.Skip("partition strategy change invalidated") // skipping due to change partitioning strategy
 		ctx := context.Background()
-		index := "valstr"
+		index := c.Idx("valstr")
 		field := "fstr"
 
 		fgnIndex := "fgnvalstr"
@@ -506,8 +470,7 @@ func TestAPI_ImportValue(t *testing.T) {
 		}
 
 		// Import data with keys to the node0 and verify that it gets translated
-		// and forwarded to the owner of shard 0 (node1; because of
-		// offsetModHasher)
+		// and forwarded to the owner of shard 0
 		req := &pilosa.ImportValueRequest{
 			Index:        index,
 			Field:        field,
@@ -534,17 +497,10 @@ func TestAPI_ImportValue(t *testing.T) {
 func TestAPI_Ingest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c := test.MustRunCluster(t, 1,
-		[]server.CommandOption{
-			server.OptCommandServerOptions(
-				pilosa.OptServerNodeID("node0"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
-				pilosa.OptServerOpenTranslateReader(pilosa.GetOpenTranslateReaderFunc(nil)),
-			)},
-	)
+	c := test.MustRunCluster(t, 1)
 	defer c.Close()
 	coord := c.GetPrimary()
-	index := "ingest"
+	index := c.Idx()
 	setField := "set"
 	timeField := "tq"
 	intField := "int"
@@ -565,72 +521,6 @@ func TestAPI_Ingest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating field: %v", err)
 	}
-
-	t.Run("IngestAPI", func(t *testing.T) {
-		sampleJson := []byte(`
-	[
-	  {
-	    "action": "set",
-	    "records": {
-	      "2": {
-		"set": [2],
-		"tq": { "time": "2006-01-02T15:04:05.999999999Z", "values": [6] }
-	      },
-	      "5": { "set": [3] },
-	      "8": { "set": [3] },
-	      "1": {
-		"set": [2],
-		"tq": { "time": "2006-01-02T15:04:05.999999999Z", "values": [3, 4] }
-	      },
-	      "4": { "set": [3, 7] }
-	    }
-	  },
-	  {
-	    "action": "clear",
-	    "record_ids": [ 5, 6, 7 ],
-	    "fields": [ "tq", "set" ]
-	  },
-	  {
-	    "action": "write",
-	    "records": {
-	      "8": { "tq": { "time": "2006-01-02T15:04:05.999999999Z", "values": [3, 4] } },
-	      "9": { "set": [7, 3] }
-	    }
-	  },
-	  {
-	    "action": "delete",
-	    "record_ids": [ 9 ]
-	  }
-	]
-	`)
-		// just for set row 3:
-		// first operation should set it for 4, 5, and 8.
-		// clear operation should clear it for 5, 6, and 7, leaving it still set for 4 and 8.
-		// the write operation should clear set for record 8, even though record 8 doesn't
-		// contain that field in that op, because set is present in record 9, which also
-		// gets row 3 set. but then we delete 9.
-		// so after all that we expect Row(set=3) to be 4...
-		sampleBuf := bytes.NewBuffer(sampleJson)
-		qcx := coord.API.Txf().NewQcx()
-		defer func() {
-			if err := qcx.Finish(); err != nil {
-				t.Fatalf("finishing qcx: %v", err)
-			}
-		}()
-		err = coord.API.IngestOperations(ctx, qcx, index, sampleBuf)
-		if err != nil {
-			t.Fatalf("importing data: %v", err)
-		}
-		query := "Row(set=3)"
-		res, err := coord.API.Query(context.Background(), &pilosa.QueryRequest{Index: index, Query: query})
-		if err != nil {
-			t.Errorf("query: %v", err)
-		}
-		r := res.Results[0].(*pilosa.Row).Columns()
-		if len(r) != 1 || r[0] != 4 {
-			t.Fatalf("expected row with 4 set, got %d", r)
-		}
-	})
 
 	t.Run("ImportRoaringShard", func(t *testing.T) {
 		setBuf := &bytes.Buffer{}
@@ -654,7 +544,7 @@ func TestAPI_Ingest(t *testing.T) {
 				},
 			},
 		}
-		if err := coord.API.ImportRoaringShard(context.Background(), "ingest", 8, request); err != nil {
+		if err := coord.API.ImportRoaringShard(context.Background(), c.Idx(), 8, request); err != nil {
 			t.Fatalf("ingesting: %v", err)
 		}
 
@@ -666,19 +556,19 @@ func TestAPI_Ingest(t *testing.T) {
 			return res
 		}
 
-		res := mustQuery(t, "ingest", "Row(set=0)")
+		res := mustQuery(t, c.Idx(), "Row(set=0)")
 		r := res.Results[0].(*pilosa.Row).Columns()
 		if len(r) != 1 || r[0] != pilosa.ShardWidth*8+7 {
 			t.Fatalf("expected row with pilosa.ShardWidth*8+7 set, got %d", r)
 		}
 
-		res = mustQuery(t, "ingest", "Row(set=1)")
+		res = mustQuery(t, c.Idx(), "Row(set=1)")
 		r = res.Results[0].(*pilosa.Row).Columns()
 		if len(r) != 1 || r[0] != pilosa.ShardWidth*8+7 {
 			t.Fatalf("expected row with pilosa.ShardWidth*8+7 set, got %d", r)
 		}
 
-		res = mustQuery(t, "ingest", "Row(int==1)")
+		res = mustQuery(t, c.Idx(), "Row(int==1)")
 		r = res.Results[0].(*pilosa.Row).Columns()
 		if len(r) != 1 || r[0] != pilosa.ShardWidth*8+7 {
 			t.Fatalf("expected row with, pilosa.ShardWidth*8+7 set, got %d", r)
@@ -699,23 +589,23 @@ func TestAPI_Ingest(t *testing.T) {
 				},
 			},
 		}
-		if err := coord.API.ImportRoaringShard(context.Background(), "ingest", 8, request); err != nil {
+		if err := coord.API.ImportRoaringShard(context.Background(), c.Idx(), 8, request); err != nil {
 			t.Fatalf("ingesting: %v", err)
 		}
 
-		res = mustQuery(t, "ingest", "Row(set=0)")
+		res = mustQuery(t, c.Idx(), "Row(set=0)")
 		r = res.Results[0].(*pilosa.Row).Columns()
 		if len(r) != 0 {
 			t.Fatalf("expected no values after clearing, got: %v", r)
 		}
 
-		res = mustQuery(t, "ingest", "Row(set=1)")
+		res = mustQuery(t, c.Idx(), "Row(set=1)")
 		r = res.Results[0].(*pilosa.Row).Columns()
 		if len(r) != 0 {
 			t.Fatalf("expected no values after clearing, got: %v", r)
 		}
 
-		res = mustQuery(t, "ingest", "Row(int==1)")
+		res = mustQuery(t, c.Idx(), "Row(int==1)")
 		r = res.Results[0].(*pilosa.Row).Columns()
 		if len(r) != 0 {
 			t.Fatalf("expected no values after clearing, got: %v", r)
@@ -724,98 +614,8 @@ func TestAPI_Ingest(t *testing.T) {
 	})
 }
 
-// ingestBenchmarkHelper makes it easier to exclude this from benchmark computations
-// and profiles.
-func ingestBenchmarkHelper() []byte {
-	buf := &bytes.Buffer{}
-	buf.WriteString(`[{"action": "write", "records": {`)
-	comma := ""
-	now := time.Now().Add(-3840000 * time.Second)
-	for i := 0; i < 1000000; i++ {
-		then := now.Add(time.Duration(rand.Int63n(1234567)) * time.Second)
-		fmt.Fprintf(buf, `%s"%d": { "set": [%d, %d], "int": %d, "tq": { "time": "%s", "values": %d } }`, comma, i, i%2, (i%4)+2, rand.Int63n(163840),
-			then.Format(time.RFC3339), rand.Int63n(25))
-		comma = ", "
-	}
-	buf.WriteString(`}}]`)
-	data := buf.Bytes()
-	return data
-}
-
-func BenchmarkIngest(b *testing.B) {
-	b.StopTimer()
-	data := ingestBenchmarkHelper()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	c := test.MustRunCluster(b, 1,
-		[]server.CommandOption{
-			server.OptCommandServerOptions(
-				pilosa.OptServerNodeID("node0"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
-				pilosa.OptServerOpenTranslateReader(pilosa.GetOpenTranslateReaderFunc(nil)),
-			)},
-	)
-	defer c.Close()
-
-	coord := c.GetPrimary()
-	m0 := c.GetNode(0)
-	// m1 := c.GetNode(1)
-	// m2 := c.GetNode(2)
-
-	index := "ingest"
-	setField := "set"
-	intField := "int"
-	tqField := "tq"
-	_, err := coord.API.CreateIndex(ctx, index, pilosa.IndexOptions{Keys: false})
-	if err != nil {
-		b.Fatalf("creating index: %v", err)
-	}
-	_, err = coord.API.CreateField(ctx, index, setField, pilosa.OptFieldTypeSet("none", 0))
-	if err != nil {
-		b.Fatalf("creating field: %v", err)
-	}
-	_, err = coord.API.CreateField(ctx, index, intField, pilosa.OptFieldTypeInt(0, 163840))
-	if err != nil {
-		b.Fatalf("creating field: %v", err)
-	}
-	_, err = coord.API.CreateField(ctx, index, tqField, pilosa.OptFieldTypeTime("YMDH", "0"))
-	if err != nil {
-		b.Fatalf("creating field: %v", err)
-	}
-	b.ReportAllocs()
-	b.StartTimer()
-	for i := 0; i < b.N; i++ {
-		qcx := m0.API.Txf().NewQcx()
-		defer qcx.Abort()
-		err = coord.API.IngestOperations(ctx, qcx, index, bytes.NewBuffer(data))
-		if err != nil {
-			b.Fatalf("ingest: %v", err)
-		}
-		err = qcx.Finish()
-		if err != nil {
-			b.Fatalf("finish: %v", err)
-		}
-	}
-}
-
-// offsetModHasher represents a simple, mod-based hashing offset by 1.
-type offsetModHasher struct{}
-
-func (*offsetModHasher) Hash(key uint64, n int) int {
-	return int(key+1) % n
-}
-
-func (*offsetModHasher) Name() string { return "mod" }
-
 func TestAPI_ClearFlagForImportAndImportValues(t *testing.T) {
-	c := test.MustRunCluster(t, 1,
-		[]server.CommandOption{
-			server.OptCommandServerOptions(
-				pilosa.OptServerNodeID("node0"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
-				pilosa.OptServerOpenTranslateReader(pilosa.GetOpenTranslateReaderFunc(nil)),
-			)},
-	)
+	c := test.MustRunCluster(t, 1)
 	defer c.Close()
 
 	// plan:
@@ -828,7 +628,7 @@ func TestAPI_ClearFlagForImportAndImportValues(t *testing.T) {
 	m0api := m0.API
 
 	ctx := context.Background()
-	index := "i"
+	index := c.Idx()
 	fieldAcct0 := "acct0"
 
 	opts := pilosa.OptFieldTypeInt(-1000, 1000)
@@ -1037,7 +837,7 @@ func TestAPI_IDAlloc(t *testing.T) {
 			t.Fatalf("obtaining random bytes: %v", err)
 		}
 		ids3, err := primary.ReserveIDs(key, session, 0, 2)
-		var esync pilosa.ErrIDOffsetDesync
+		var esync pilosa.IDOffsetDesyncError
 		if errors.As(err, &esync) {
 			if esync.Requested != 0 {
 				t.Errorf("incorrect requested offset in error: provided %d but got %d", 0, esync.Requested)
@@ -1072,7 +872,9 @@ type mutexCheckField struct {
 }
 
 func TestAPI_MutexCheck(t *testing.T) {
-	c := test.MustNewCluster(t, 3)
+	// Can't share this one, because it has to get custom option settings and needs
+	// replication.
+	c := test.MustUnsharedCluster(t, 3)
 	for _, c := range c.Nodes {
 		c.Config.Cluster.ReplicaN = 2
 	}
@@ -1094,7 +896,7 @@ func TestAPI_MutexCheck(t *testing.T) {
 
 	ctx := context.Background()
 	for _, keyedIndex := range []bool{false, true} {
-		indexName := fmt.Sprintf("i%t", keyedIndex)
+		indexName := c.Idx(map[bool]string{false: "u", true: "k"}[keyedIndex])
 		index, err := m0.API.CreateIndex(ctx, indexName, pilosa.IndexOptions{Keys: keyedIndex, TrackExistence: true})
 		if err != nil {
 			t.Fatalf("creating index: %v", err)
@@ -1446,34 +1248,34 @@ func createFieldForTest(index string, field string, coord *test.Command, t *test
 
 func TestVariousApiTranslateCalls(t *testing.T) {
 	for i := 1; i < 8; i += 3 {
-		m := test.MustRunCluster(t, i)
-		defer m.Close()
-		node := m.GetNode(0)
+		c := test.MustRunCluster(t, i)
+		defer c.Close()
+		node := c.GetNode(0)
 		api := node.API
 		// this should never actually get used because we're testing for errors here
 		r := strings.NewReader("")
 		// test index
-		idx, err := api.Holder().CreateIndex("index", pilosa.IndexOptions{})
+		idx, err := api.Holder().CreateIndex(c.Idx(), "", pilosa.IndexOptions{})
 		if err != nil {
 			t.Fatalf("%v: could not create test index", err)
 		}
-		if _, err = idx.CreateFieldIfNotExistsWithOptions("field", &pilosa.FieldOptions{Keys: false}); err != nil {
+		if _, err = idx.CreateFieldIfNotExistsWithOptions("field", "", &pilosa.FieldOptions{Keys: false}); err != nil {
 			t.Fatalf("creating field: %v", err)
 		}
 		t.Run("translateIndexDbOnNilIndex",
 			func(t *testing.T) {
 				err := api.TranslateIndexDB(context.Background(), "nonExistentIndex", 0, r)
-				expected := fmt.Errorf("index %q not found", "nonExistentIndex")
-				if !reflect.DeepEqual(err, expected) {
+				expected := fmt.Sprintf("index %q not found", "nonExistentIndex")
+				if err == nil || err.Error() != expected {
 					t.Fatalf("expected '%#v', got '%#v'", expected, err)
 				}
 			})
 
 		t.Run("translateIndexDbOnNilTranslateStore",
 			func(t *testing.T) {
-				err := api.TranslateIndexDB(context.Background(), "index", 0, r)
-				expected := fmt.Errorf("index %q has no translate store", "index")
-				if !reflect.DeepEqual(err, expected) {
+				err := api.TranslateIndexDB(context.Background(), c.Idx(), 0, r)
+				expected := fmt.Sprintf("index %q has no translate store", c.Idx())
+				if err == nil || err.Error() != expected {
 					t.Fatalf("expected '%#v', got '%#v'", expected, err)
 				}
 			})
@@ -1481,24 +1283,24 @@ func TestVariousApiTranslateCalls(t *testing.T) {
 		t.Run("translateFieldDbOnNilIndex",
 			func(t *testing.T) {
 				err := api.TranslateFieldDB(context.Background(), "nonExistentIndex", "field", r)
-				expected := fmt.Errorf("index %q not found", "nonExistentIndex")
-				if !reflect.DeepEqual(err, expected) {
+				expected := fmt.Sprintf("index %q not found", "nonExistentIndex")
+				if err == nil || err.Error() != expected {
 					t.Fatalf("expected '%#v', got '%#v'", expected, err)
 				}
 			})
 
 		t.Run("translateFieldDbOnNilField",
 			func(t *testing.T) {
-				err := api.TranslateFieldDB(context.Background(), "index", "nonExistentField", r)
-				expected := fmt.Errorf("field %q/%q not found", "index", "nonExistentField")
-				if !reflect.DeepEqual(err, expected) {
+				err := api.TranslateFieldDB(context.Background(), c.Idx(), "nonExistentField", r)
+				expected := fmt.Sprintf("field %q/%q not found", c.Idx(), "nonExistentField")
+				if err == nil || err.Error() != expected {
 					t.Fatalf("expected '%#v', got '%#v'", expected, err)
 				}
 			})
 
 		t.Run("translateFieldDbNilField_keys",
 			func(t *testing.T) {
-				err := api.TranslateFieldDB(context.Background(), "index", "_keys", r)
+				err := api.TranslateFieldDB(context.Background(), c.Idx(), "_keys", r)
 				if err != nil {
 					t.Fatalf("expected 'nil', got '%#v'", err)
 				}
@@ -1508,8 +1310,8 @@ func TestVariousApiTranslateCalls(t *testing.T) {
 		   stores, which is a bug, but one that we will eventually fix. when we do, this
 		   test might come in handy t.Run("translateFieldDbOnNilTranslateStore",
 		   func(t *testing.T) {
-		       err := api.TranslateFieldDB(context.Background(), "index", "field", r)
-		       expected := fmt.Errorf("field %q/%q has no translate store", "index", "field")
+		       err := api.TranslateFieldDB(context.Background(), c.Idx(), "field", r)
+		       expected := fmt.Errorf("field %q/%q has no translate store", c.Idx(), "field")
 		       if !reflect.DeepEqual(err, expected) {
 		           t.Fatalf("expected '%#v', got '%#v'", expected, err)
 		       }
@@ -1529,7 +1331,7 @@ func TestAPI_CreateField(t *testing.T) {
 		nodes[i] = c.GetNode(i)
 	}
 
-	if _, err := nodes[0].API.CreateIndex(ctx, "i", pilosa.IndexOptions{}); err != nil {
+	if _, err := nodes[0].API.CreateIndex(ctx, c.Idx(), pilosa.IndexOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	eg, ctx := errgroup.WithContext(context.Background())
@@ -1537,7 +1339,7 @@ func TestAPI_CreateField(t *testing.T) {
 		node := n
 		eg.Go(func() error {
 			for i := 0; i < 10; i++ {
-				_, err := node.API.CreateField(ctx, "i", fmt.Sprintf("f%d", i))
+				_, err := node.API.CreateField(ctx, c.Idx(), fmt.Sprintf("f%d", i))
 				if err != nil && !errors.Is(err, pilosa.ErrFieldExists) {
 					return err
 				}
@@ -1557,19 +1359,12 @@ func TestAPI_CreateField(t *testing.T) {
 func TestAPI_RBFDebugInfo(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c := test.MustRunCluster(t, 1,
-		[]server.CommandOption{
-			server.OptCommandServerOptions(
-				pilosa.OptServerNodeID("node0"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
-				pilosa.OptServerOpenTranslateReader(pilosa.GetOpenTranslateReaderFunc(nil)),
-			)},
-	)
+	c := test.MustRunCluster(t, 1)
 	defer c.Close()
 
 	coord := c.GetPrimary()
 
-	if _, err := coord.API.CreateIndex(ctx, "i", pilosa.IndexOptions{}); err != nil {
+	if _, err := coord.API.CreateIndex(ctx, c.Idx(), pilosa.IndexOptions{}); err != nil {
 		t.Fatal(err)
 	} else if infos := coord.API.RBFDebugInfo(); infos == nil {
 		t.Fatal("expected info")
@@ -1608,23 +1403,11 @@ func TestAuth_MultiNode(t *testing.T) {
     "test": "write"
 admin: "ac97c9e2-346b-42a2-b6da-18bcb61a32fe"`
 	adminUser := makeUser(t, []authn.Group{{GroupID: "ac97c9e2-346b-42a2-b6da-18bcb61a32fe", GroupName: "adminGroup"}}, "admin", "DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF")
-	adminCtx := context.WithValue(
-		context.Background(),
-		"userinfo",
-		adminUser,
-	)
+	adminCtx := authn.WithUserInfo(context.Background(), adminUser)
 	readUser := makeUser(t, []authn.Group{{GroupID: "dca35310-ecda-4f23-86cd-876aee55906b", GroupName: "readGroup"}}, "reader", "DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF")
-	readCtx := context.WithValue(
-		context.Background(),
-		"userinfo",
-		readUser,
-	)
+	readCtx := authn.WithUserInfo(context.Background(), readUser)
 	writeUser := makeUser(t, []authn.Group{{GroupID: "dca35310-ecda-4f23-86cd-876aee55906f", GroupName: "writeGroup"}}, "writer", "DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEED")
-	writeCtx := context.WithValue(
-		context.Background(),
-		"userinfo",
-		writeUser,
-	)
+	writeCtx := authn.WithUserInfo(context.Background(), writeUser)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token, ok := r.Header["Authorization"]
 		if !ok || len(token) == 0 {
@@ -1699,25 +1482,22 @@ f9Oeos0UUothgiDktdQHxdNEwLjQf7lJJBzV+5OtwswCWA==
 	config.TLS.CertificateKeyPath = writeTestFile(t, "certKey.pem", localhostKey)
 	config.TLS.CertificatePath = writeTestFile(t, "cert.pem", localhostCert)
 
-	c := test.MustRunCluster(t, 3,
+	c := test.MustRunUnsharedCluster(t, 3,
 		[]server.CommandOption{
 			server.OptCommandServerOptions(
 				pilosa.OptServerNodeID("node0"),
-				pilosa.OptServerClusterHasher(&test.ModHasher{}),
 			),
 			server.OptCommandConfig(config),
 		},
 		[]server.CommandOption{
 			server.OptCommandServerOptions(
 				pilosa.OptServerNodeID("node1"),
-				pilosa.OptServerClusterHasher(&test.ModHasher{}),
 			),
 			server.OptCommandConfig(config),
 		},
 		[]server.CommandOption{
 			server.OptCommandServerOptions(
 				pilosa.OptServerNodeID("node2"),
-				pilosa.OptServerClusterHasher(&test.ModHasher{}),
 			),
 			server.OptCommandConfig(config),
 		},
@@ -1727,6 +1507,8 @@ f9Oeos0UUothgiDktdQHxdNEwLjQf7lJJBzV+5OtwswCWA==
 	primaryAPI := c.GetPrimary().API
 
 	// needs internal/cluster/message
+	// Note: This indexName wouldn't be safe on a shared cluster, but we have to use an
+	// unshared cluster to set up the auth config anyway.
 	indexName := "test"
 	_, err := primaryAPI.CreateIndex(adminCtx, indexName, pilosa.IndexOptions{})
 	if err != nil {

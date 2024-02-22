@@ -3,9 +3,9 @@ package idk
 // comment
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"os"
@@ -15,12 +15,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt"
+	pilosa "github.com/featurebasedb/featurebase/v3"
 	"github.com/featurebasedb/featurebase/v3/authn"
+	batch "github.com/featurebasedb/featurebase/v3/batch"
 	pilosaclient "github.com/featurebasedb/featurebase/v3/client"
+	"github.com/featurebasedb/featurebase/v3/dax"
+	controllerclient "github.com/featurebasedb/featurebase/v3/dax/controller/client"
 	"github.com/featurebasedb/featurebase/v3/idk/idktest"
+	"github.com/featurebasedb/featurebase/v3/idk/serverless"
 	"github.com/featurebasedb/featurebase/v3/logger"
+	"github.com/featurebasedb/featurebase/v3/pql"
+	"github.com/golang-jwt/jwt"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 )
 
 func configureTestFlags(main *Main) {
@@ -36,6 +43,81 @@ func configureTestFlags(main *Main) {
 	}
 
 	main.Stats = ""
+}
+
+func configureTestFlagsController(main *Main, address dax.Address, qtbl *dax.QualifiedTable) {
+	main.ControllerAddress = address.String()
+	main.Stats = ""
+	main.Pprof = ""
+	main.PackBools = ""
+	main.OrganizationID = qtbl.Qualifier().OrganizationID
+	main.DatabaseID = qtbl.Qualifier().DatabaseID
+	main.TableName = qtbl.Name
+	main.Qtbl = qtbl
+	main.SchemaManager = serverless.NewSchemaManager(address, qtbl.Qualifier(), logger.StderrLogger)
+	main.Index = string(qtbl.Key())
+
+	controllerClient := controllerclient.New(dax.Address(address), logger.StderrLogger)
+	main.NewImporterFn = func() pilosa.Importer {
+		return serverless.NewImporter(controllerClient, qtbl.QualifiedDatabaseID, &qtbl.Table)
+	}
+}
+
+type versionHolder struct {
+	Version string
+}
+
+func TestFeaturebaseVersion(t *testing.T) {
+	m := NewMain()
+	configureTestFlags(m)
+	// We don't need to fully run an ingester, but we do need its client set up.
+	_, err := m.setupClient()
+	if err != nil {
+		t.Fatalf("setting up client: %v", err)
+	}
+	c := m.PilosaClient()
+	status, body, err := c.HTTPRequest("GET", "/version", nil, nil)
+	if err != nil {
+		t.Fatalf("getting version: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("unexpected status: %d (wanted StatusOK)", status)
+	}
+	var vh versionHolder
+	err = json.Unmarshal(body, &vh)
+	if err != nil {
+		t.Fatalf("unmarshalling version: %v", err)
+	}
+	v := vh.Version
+	expectedTag := os.Getenv("IDK_FEATUREBASE_TAG")
+	if expectedTag != "" {
+		// if a tag is set, we're in a tagged pipeline, and the version
+		// should just be vX.Y or something similar, without a commit
+		// hash. in that case, the tag passed to us from the environment
+		// will look like vX.Y, but the version reported by the version
+		// endpoint is just X.Y. Argh.
+		if v != expectedTag && ("v"+v) != expectedTag {
+			t.Fatalf("version %s does not match expected tag %s", v, expectedTag)
+		}
+		t.Logf("featurebase version %q matches expectations", expectedTag)
+		return
+	}
+	// no tag. we expect to always have a hash, and if there's a specific
+	// expected hash, we verify it.
+	expectedHash := os.Getenv("IDK_FEATUREBASE_HASH")
+	if expectedHash == "" {
+		t.Skipf("featurebase version: %s [no expected version]", v)
+	}
+	offset := strings.LastIndex(v, "-g")
+	if offset == -1 {
+		t.Fatalf("version %s doesn't have -g followed by a hash", v)
+	}
+	hash := v[offset+2:]
+	// allow either hash to be abbreviated
+	if !strings.HasPrefix(expectedHash, hash) && !strings.HasPrefix(hash, expectedHash) {
+		t.Fatalf("expected hash to look like %q, got %q", expectedHash, hash)
+	}
+	t.Logf("featurebase commit %q matches expectations", hash)
 }
 
 func TestErrFlush(t *testing.T) {
@@ -195,6 +277,64 @@ func TestIngestSignedIntBoolField(t *testing.T) {
 	}
 }
 
+//The following two tests are used to test the functionality of a new feature in which we skip bad records coming into idk and log them.
+//First function checks that we can successfully skip some bad rows coming into idk
+//Second function checks whether we get error if we have more bad records than acceptable errors by idk mentioned by SkipBadRows parameter.
+
+func skipBadRowsTestSource() *testSource {
+	ts := newTestSource([]Field{StringField{NameVal: "rcid"}, SignedIntBoolKeyField{NameVal: "svals"}},
+		[][]interface{}{
+			{"c", "badrecord1"},
+			{"d", "badrecord2"},
+			{"a", "badrecord3"},
+			{"x", int64(66)},
+			{"b", int64(11)},
+			{"b", int64(22)},
+			{"b", int64(-32)},
+			{"b", int64(-44)},
+			{"b", "badrecord4"},
+			{"b", int64(11)},
+			{"b", int64(7)},
+			{"c", int64(5)},
+		})
+	return ts
+
+}
+func ingesterCreationForSkipBadRowsTest(skipbadrows int) *Main {
+	ts := skipBadRowsTestSource()
+	ingester := NewMain()
+	configureTestFlags(ingester)
+	ingester.NewSource = func() (Source, error) { return ts, nil }
+	rand.Seed(time.Now().UTC().UnixNano())
+	ingester.Index = fmt.Sprintf("ingestint%d", rand.Intn(100000))
+	ingester.BatchSize = 2
+	ingester.SkipBadRows = skipbadrows
+	ingester.PrimaryKeyFields = []string{"rcid"}
+	return ingester
+}
+func TestSkipBadRowsFunctionality(t *testing.T) {
+
+	ingester := ingesterCreationForSkipBadRowsTest(3)
+
+	err := ingester.Run()
+	if err != nil {
+		t.Fatalf("%s: %v", idktest.ErrRunningIngest, err)
+	}
+}
+
+func TestSkipBadRowsFunctionalityWhenErrorCountIsMore(t *testing.T) {
+
+	ingester := ingesterCreationForSkipBadRowsTest(1)
+
+	err := ingester.Run()
+	if err == nil {
+		t.Fatalf("%s: %v", idktest.ErrRunningIngest, err)
+	}
+	if !strings.Contains(err.Error(), "consecutive bad records exceeded limit") {
+		t.Fatalf("did not receive expected error from idk %v", err.Error())
+	}
+}
+
 // TestSingleBoolClear essentially creates an import batch which
 // clears a bit in a particular fragment without setting a bit in that
 // same fragment.  There's a potential optimization in the pilosa client
@@ -212,6 +352,7 @@ func TestSingleBoolClear(t *testing.T) {
 	ingester.Index = fmt.Sprintf("single_bool_clear%d", rand.Intn(100000))
 	ingester.BatchSize = 1
 	ingester.IDField = "id"
+	ingester.PackBools = "bools"
 
 	if err := ingester.Run(); err != nil {
 		t.Fatalf("%s: %v", idktest.ErrRunningIngest, err)
@@ -243,6 +384,7 @@ func TestSingleBoolClear(t *testing.T) {
 	ingester2.NewSource = func() (Source, error) { return ts2, nil }
 	ingester2.Index = ingester.Index
 	ingester2.IDField = "id"
+	ingester2.PackBools = "bools"
 
 	if err := ingester2.Run(); err != nil {
 		t.Fatalf("running ingester2: %v", err)
@@ -436,12 +578,12 @@ func TestIngesterServesPrometheusEndpoint(t *testing.T) {
 	if err != nil {
 		t.Errorf("request error: %v", err)
 	}
-	contents, err := ioutil.ReadAll(response.Body)
+	contents, err := io.ReadAll(response.Body)
 	defer response.Body.Close()
 	if err != nil {
 		t.Errorf("read error: %v", err)
 	}
-	if strings.Contains(string(contents), MetricIngesterRowsAdded) {
+	if !strings.Contains(string(contents), MetricIngesterRowsAdded) {
 		t.Errorf("metric name missing: %v", MetricIngesterRowsAdded)
 	}
 	close(records)
@@ -509,6 +651,7 @@ func TestDelete(t *testing.T) {
 	deleter := NewMain()
 	configureTestFlags(deleter)
 	deleter.Delete = true
+	deleter.PackBools = "bools"
 	deleter.NewSource = func() (Source, error) { return tsDelete, nil }
 	deleter.Index = indexName
 	deleter.BatchSize = 5
@@ -522,6 +665,7 @@ func TestDelete(t *testing.T) {
 
 	ingester := NewMain()
 	configureTestFlags(ingester)
+	ingester.PackBools = "bools"
 	ingester.NewSource = func() (Source, error) { return tsWrite, nil }
 	ingester.PrimaryKeyFields = primaryKeyFields
 	ingester.Index = indexName
@@ -651,7 +795,7 @@ func TestGetPrimaryKeyRecordizer(t *testing.T) {
 				t.Errorf("unmatched skips exp/got\n%+v\n%+v", test.expSkip, skips)
 			}
 
-			row := &pilosaclient.Row{}
+			row := &batch.Row{}
 			err = rdz(test.rawRec, row)
 			if err != nil {
 				t.Fatalf("unexpected error from recordizer: %v", err)
@@ -688,11 +832,11 @@ func TestBatchFromSchema(t *testing.T) {
 		err             string
 		batchErr        string
 		rdzErrs         []string
-		time            pilosaclient.QuantizedTime
+		time            batch.QuantizedTime
 		lookupWriteIdxs []int
 	}
-	getQuantizedTime := func(t time.Time) pilosaclient.QuantizedTime {
-		qt := pilosaclient.QuantizedTime{}
+	getQuantizedTime := func(t time.Time) batch.QuantizedTime {
+		qt := batch.QuantizedTime{}
 		qt.Set(t)
 		return qt
 	}
@@ -782,13 +926,13 @@ func TestBatchFromSchema(t *testing.T) {
 		{
 			name:    "empty",
 			autogen: true,
-			err:     "can't batch with no fields or batch size",
+			err:     "can't batch with no fields",
 		},
 		{
 			name:    "empty-w/ExtGen",
 			autogen: true,
 			extgen:  true,
-			err:     "can't batch with no fields or batch size",
+			err:     "can't batch with no fields",
 		},
 		{
 			name:    "no id field",
@@ -817,7 +961,6 @@ func TestBatchFromSchema(t *testing.T) {
 			rawRec:  []interface{}{true, uint64(7), false},
 			rowID:   uint64(7),
 			rowVals: []interface{}{true, false},
-			err:     "field type 'bool' is not currently supported through Batch",
 		},
 		{
 			name:    "mutex field",
@@ -1214,7 +1357,7 @@ type testSource struct {
 	schema  []Field
 }
 
-func (t *testSource) Close() error {
+func (s *testSource) Close() error {
 	return nil
 }
 
@@ -1238,6 +1381,10 @@ func (s *sliceRecord) Commit(ctx context.Context) error {
 
 func (s *sliceRecord) Data() []interface{} {
 	return s.data
+}
+
+func (s *sliceRecord) Schema() interface{} {
+	return nil
 }
 
 func (s *testSource) Record() (Record, error) {
@@ -1372,6 +1519,7 @@ func TestNilIngest(t *testing.T) {
 		err        string
 		batchErr   string
 		rdzErrs    []string
+		packBools  string
 	}
 	runTest := func(t *testing.T, test testcase, removeIndex bool, server serverInfo, rawRec []interface{}, clearmap map[int]interface{}, values []interface{}) {
 		m := NewMain()
@@ -1380,6 +1528,7 @@ func TestNilIngest(t *testing.T) {
 		m.PrimaryKeyFields = test.pkFields
 		m.BatchSize = 2
 		m.Pprof = ""
+		m.PackBools = test.packBools
 		m.NewSource = func() (Source, error) { return nil, nil }
 		if server.AuthToken != "" {
 			m.AuthToken = server.AuthToken
@@ -1465,12 +1614,13 @@ func TestNilIngest(t *testing.T) {
 			Vals2:      []interface{}{nil, nil},
 			Vals3:      []interface{}{nil, nil},
 		}, {
-			name:     "bools null",
-			pkFields: []string{"user_id"},
-			rawRec1:  []interface{}{"1a", true}, // bool and bool-exists
-			rawRec2:  []interface{}{"1a", DELETE_SENTINEL},
-			rawRec3:  []interface{}{"1a", nil},
-			rowID:    "1a",
+			name:      "bools null",
+			packBools: "bools",
+			pkFields:  []string{"user_id"},
+			rawRec1:   []interface{}{"1a", true}, // bool and bool-exists
+			rawRec2:   []interface{}{"1a", DELETE_SENTINEL},
+			rawRec3:   []interface{}{"1a", nil},
+			rowID:     "1a",
 			schema: []Field{
 				StringField{NameVal: "user_id"},
 				BoolField{NameVal: "bool_val_1"},
@@ -1529,4 +1679,323 @@ func TestNilIngest(t *testing.T) {
 		}
 	}
 
+}
+
+func TestBoolIngest(t *testing.T) {
+	rand.Seed(time.Now().UTC().UnixNano())
+	indexName := fmt.Sprintf("boolingest%d", rand.Intn(100000))
+	primaryKeyFields := []string{"user_id"}
+
+	tests := []struct {
+		src      *testSource
+		expTrue  []string
+		expFalse []string
+		expNull  []string
+	}{
+		{
+			src: newTestSource(
+				[]Field{
+					StringField{NameVal: "user_id"},
+					BoolField{NameVal: "bool_val"},
+				},
+				[][]interface{}{
+					{"a1", true},
+				},
+			),
+			expTrue:  []string{"a1"},
+			expFalse: nil,
+			expNull:  nil,
+		},
+		{
+			src: newTestSource(
+				[]Field{
+					StringField{NameVal: "user_id"},
+					BoolField{NameVal: "bool_val"},
+				},
+				[][]interface{}{
+					{"a1", false},
+				},
+			),
+			expTrue:  nil,
+			expFalse: []string{"a1"},
+			expNull:  nil,
+		},
+		{
+			src: newTestSource(
+				[]Field{
+					StringField{NameVal: "user_id"},
+					BoolField{NameVal: "bool_val"},
+				},
+				[][]interface{}{
+					{"a1", nil},
+				},
+			),
+			expTrue:  nil,
+			expFalse: nil,
+			expNull:  []string{"a1"},
+		},
+		{
+			src: newTestSource(
+				[]Field{
+					StringField{NameVal: "user_id"},
+					BoolField{NameVal: "bool_val"},
+				},
+				[][]interface{}{
+					{"a1", DELETE_SENTINEL},
+				},
+			),
+			expTrue:  nil,
+			expFalse: nil,
+			expNull:  []string{"a1"},
+		},
+	}
+
+	var ing *Main
+	defer func() {
+		ing := ing
+		if err := ing.PilosaClient().DeleteIndexByName(ing.Index); err != nil {
+			t.Logf("%s for index %s: %v", idktest.ErrDeletingIndex, ing.Index, err)
+		}
+	}()
+
+	for i, test := range tests {
+		t.Run(fmt.Sprintf("test-%d", i), func(t *testing.T) {
+			ingester := NewMain()
+			configureTestFlags(ingester)
+			ingester.PackBools = ""
+			ingester.NewSource = func() (Source, error) { return test.src, nil }
+			ingester.PrimaryKeyFields = primaryKeyFields
+			ingester.Index = indexName
+			ingester.BatchSize = 1
+			ingester.UseShardTransactionalEndpoint = true
+
+			// Set ing so the defer can do cleanup.
+			if i == 0 {
+				ing = ingester
+			}
+
+			if err := ingester.Run(); err != nil {
+				t.Fatalf("%s: %v", idktest.ErrRunningIngest, err)
+			}
+
+			client := ingester.PilosaClient()
+			idx := ingester.index
+			fld := ingester.index.Field("bool_val")
+
+			// Check true.
+			{
+				resp, err := client.Query(fld.Row(true))
+				assert.NoError(t, err)
+				assert.Equal(t, test.expTrue, resp.Result().Row().Keys)
+			}
+
+			// Check false.
+			{
+				resp, err := client.Query(fld.Row(false))
+				assert.NoError(t, err)
+				assert.Equal(t, test.expFalse, resp.Result().Row().Keys)
+			}
+
+			// Check nil. This is used to test the ingestion of nil and null.
+			{
+				resp, err := client.Query(idx.Difference(idx.All(), idx.Union(fld.Row(true), fld.Row(false))))
+				assert.NoError(t, err)
+				assert.Equal(t, test.expNull, resp.Result().Row().Keys)
+			}
+		})
+	}
+}
+
+func TestBatchTargetServerless(t *testing.T) {
+	var controllerHost string
+	if controller, ok := os.LookupEnv("IDK_TEST_CONTROLLER_HOST"); ok {
+		controllerHost = controller
+	} else {
+		controllerHost = "dax:8080"
+	}
+
+	controllerAddress := dax.Address(controllerHost + "/" + dax.ServicePrefixController)
+	orgID := dax.OrganizationID("acme")
+	dbID := dax.DatabaseID("db1")
+
+	controllerClient := controllerclient.New(controllerAddress, logger.StderrLogger)
+
+	ctx := context.Background()
+
+	// Create the database.
+	qdb := &dax.QualifiedDatabase{
+		OrganizationID: orgID,
+		Database: dax.Database{
+			ID:   dbID,
+			Name: "dbname1",
+			Options: dax.DatabaseOptions{
+				WorkersMin: 1,
+				WorkersMax: 1,
+			},
+		},
+	}
+	controllerClient.CreateDatabase(ctx, qdb)
+
+	t.Run("FieldTypes", func(t *testing.T) {
+		tests := []struct {
+			fieldType    dax.BaseType
+			fieldOptions dax.FieldOptions
+			fieldFn      fieldFn
+			in           [][]interface{}
+		}{
+			// {
+			// 	fieldType: types.FieldTypeBool,
+			// 	fieldFn:   boolFn,
+			// 	in: [][]interface{}{
+			// 		{1, true},
+			// 		{2, false},
+			// 	},
+			// },
+			{
+				fieldType: dax.BaseTypeDecimal,
+				fieldOptions: dax.FieldOptions{
+					Scale: 4,
+					Min:   pql.NewDecimal(-100, 0),
+					Max:   pql.NewDecimal(100, 0),
+				},
+				fieldFn: decimalFn,
+				in: [][]interface{}{
+					{1, "12.3456"},
+					{2, "-7.8"},
+				},
+			},
+			{
+				fieldType: dax.BaseTypeID,
+				fieldFn:   idFn,
+				in: [][]interface{}{
+					{1, uint64(11)},
+					{2, uint64(22)},
+				},
+			},
+			{
+				fieldType: dax.BaseTypeIDSet,
+				fieldFn:   idSetFn,
+				in: [][]interface{}{
+					{1, []uint64{11, 12, 13}},
+					{2, []uint64{22, 24, 26, 28}},
+				},
+			},
+			{
+				fieldType: dax.BaseTypeInt,
+				fieldFn:   intFn,
+				in: [][]interface{}{
+					{1, int(11)},
+					{2, int(-22)},
+				},
+				fieldOptions: dax.FieldOptions{Min: pql.NewDecimal(-100, 0), Max: pql.NewDecimal(100, 0)},
+			},
+			{
+				fieldType: dax.BaseTypeString,
+				fieldFn:   stringFn,
+				in: [][]interface{}{
+					{1, "cycling"},
+					{2, "running"},
+				},
+			},
+			{
+				fieldType: dax.BaseTypeStringSet,
+				fieldFn:   stringSetFn,
+				in: [][]interface{}{
+					{1, []string{"cycling", "swimming"}},
+					{2, []string{"running", "cooking"}},
+				},
+			},
+			{
+				fieldType: dax.BaseTypeTimestamp,
+				fieldFn:   timestampFn,
+				in: [][]interface{}{
+					{1, time.Now()},
+					{2, time.Now()},
+				},
+				fieldOptions: dax.FieldOptions{TimeUnit: "s", Epoch: time.Unix(0, 0)}, // TODO w/o this, it used to silently fail (just logs in the controller svc). Eventually should probably have a default unit and not fail at all.
+			},
+		}
+		for i, test := range tests {
+			t.Run(fmt.Sprintf("test-%s-%d", test.fieldType, i), func(t *testing.T) {
+				// Generate a random tableName to use for the test.
+				rand.Seed(time.Now().UTC().UnixNano())
+				tableName := fmt.Sprintf("tbl_%s_%d", test.fieldType, rand.Intn(100000))
+				fieldName := fmt.Sprintf("fld_%s_%d", test.fieldType, rand.Intn(100000))
+
+				tblName := dax.TableName(tableName)
+
+				tbl := dax.NewTable(tblName)
+				tbl.PartitionN = dax.DefaultPartitionN
+				tbl.Fields = []*dax.Field{
+					{
+						Name: dax.PrimaryKeyFieldName,
+						Type: dax.BaseTypeID,
+					},
+					{
+						Name:    dax.FieldName(fieldName),
+						Type:    test.fieldType,
+						Options: test.fieldOptions,
+					},
+				}
+
+				qtbl := dax.NewQualifiedTable(
+					dax.NewQualifiedDatabaseID(orgID, dbID),
+					tbl,
+				)
+
+				// Create the table in Controller Schemar.
+				if err := controllerClient.CreateTable(ctx, qtbl); err != nil {
+					t.Fatalf("creating table: %v", err)
+				}
+
+				// qtblWithID is the same as qtbl above, but now Controller has
+				// assigned the table a unique ID.
+				qtblWithID, err := controllerClient.Table(ctx, qtbl.QualifiedID())
+				assert.NoError(t, err)
+
+				ts := newTestSource([]Field{
+					IDField{NameVal: "id"},
+					test.fieldFn(fieldName, test.fieldOptions),
+				}, test.in)
+
+				ingester := NewMain()
+				configureTestFlagsController(ingester, controllerAddress, qtblWithID)
+
+				ingester.NewSource = func() (Source, error) { return ts, nil }
+				ingester.BatchSize = 10
+				ingester.IDField = "id"
+
+				if err := ingester.Run(); err != nil {
+					t.Fatalf("running ingester: %v", err)
+				}
+			})
+		}
+	})
+}
+
+type fieldFn func(string, dax.FieldOptions) Field
+
+func boolFn(name string, fo dax.FieldOptions) Field {
+	return BoolField{NameVal: name}
+}
+func decimalFn(name string, fo dax.FieldOptions) Field {
+	return DecimalField{NameVal: name, Scale: fo.Scale}
+}
+func idFn(name string, fo dax.FieldOptions) Field {
+	return IDField{NameVal: name, Mutex: true}
+}
+func idSetFn(name string, fo dax.FieldOptions) Field {
+	return IDArrayField{NameVal: name}
+}
+func intFn(name string, fo dax.FieldOptions) Field {
+	return IntField{NameVal: name}
+}
+func stringFn(name string, fo dax.FieldOptions) Field {
+	return StringField{NameVal: name, Mutex: true}
+}
+func stringSetFn(name string, fo dax.FieldOptions) Field {
+	return StringArrayField{NameVal: name}
+}
+func timestampFn(name string, fo dax.FieldOptions) Field {
+	return TimestampField{NameVal: name}
 }

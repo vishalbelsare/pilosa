@@ -1,5 +1,4 @@
-// Copyright 2022 Molecula Corp. (DBA FeatureBase).
-// SPDX-License-Identifier: Apache-2.0
+// Copyright 2021 Molecula Corp. All rights reserved.
 // package ctl contains all pilosa subcommands other than 'server'. These are
 // generally administration, testing, and debugging tools.
 package client
@@ -7,6 +6,7 @@ package client
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,15 +20,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto" //nolint:staticcheck
 	pilosa "github.com/featurebasedb/featurebase/v3"
+	"github.com/featurebasedb/featurebase/v3/client/types"
 	fbproto "github.com/featurebasedb/featurebase/v3/encoding/proto" // TODO use this everywhere and get rid of proto import
 	"github.com/featurebasedb/featurebase/v3/logger"
 	pnet "github.com/featurebasedb/featurebase/v3/net"
 	"github.com/featurebasedb/featurebase/v3/pb"
 	"github.com/featurebasedb/featurebase/v3/pql"
 	"github.com/featurebasedb/featurebase/v3/roaring"
-	"github.com/featurebasedb/featurebase/v3/stats"
+	"github.com/featurebasedb/featurebase/v3/vprint"
+	"github.com/golang/protobuf/proto" //nolint:staticcheck
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -40,8 +41,6 @@ const PQLVersion = "1.0"
 // DefaultShardWidth is used if an index doesn't have it defined.
 const DefaultShardWidth = pilosa.ShardWidth
 
-const maxHosts = 10
-
 // Client is the HTTP client for Pilosa server.
 type Client struct {
 	cluster            *Cluster
@@ -52,7 +51,6 @@ type Client struct {
 	manualFragmentNode *fragmentNode
 	manualServerURI    *pnet.URI
 	tracer             opentracing.Tracer
-	Stats              stats.StatsClient
 	// An exponential backoff algorithm retries requests exponentially (if an HTTP request fails),
 	// increasing the waiting time between retries up to a maximum backoff time.
 	maxBackoff time.Duration
@@ -63,6 +61,12 @@ type Client struct {
 	shardNodes shardNodes
 	tick       *time.Ticker
 	done       chan struct{}
+
+	// pathPrefix is prepended to every URL path. This is used, for example,
+	// when running a compute nodes as a sub-service of the featurebase command.
+	// In that case, a path might look like `localhost:8080/compute/schema`,
+	// where `/compute` is the pathPrefix.
+	pathPrefix string
 
 	AuthToken string
 }
@@ -196,6 +200,8 @@ func newClientWithOptions(options *ClientOptions) *Client {
 		done:       make(chan struct{}),
 
 		nat: options.nat,
+
+		pathPrefix: options.pathPrefix,
 	}
 
 	if options.tracer == nil {
@@ -203,17 +209,11 @@ func newClientWithOptions(options *ClientOptions) *Client {
 	} else {
 		c.tracer = options.tracer
 	}
-	if options.stats == nil {
-		c.Stats = stats.NopStatsClient
-	} else {
-		c.Stats = options.stats
-	}
 
 	c.maxRetries = *options.retries
 	c.maxBackoff = 2 * time.Minute
 	go c.runChangeDetection()
 	return c
-
 }
 
 // NewClient creates a client with the given address, URI, or cluster and options.
@@ -265,6 +265,15 @@ func NewClient(addrURIOrCluster interface{}, options ...ClientOption) (*Client, 
 	}
 
 	return newClientWithCluster(cluster, clientOptions), nil
+}
+
+// prefix is a helper function which allows us to provide a pathPrefix value as
+// "compute" instead of "/compute".
+func (c *Client) prefix() string {
+	if c.pathPrefix == "" {
+		return ""
+	}
+	return "/" + c.pathPrefix
 }
 
 // Query runs the given query against the server with the given options.
@@ -751,7 +760,8 @@ func (c *Client) Info() (Info, error) {
 	span := c.tracer.StartSpan("Client.Info")
 	defer span.Finish()
 
-	_, data, err := c.HTTPRequest("GET", "/info", nil, c.augmentHeaders(nil))
+	path := "/info"
+	_, data, err := c.HTTPRequest("GET", path, nil, c.augmentHeaders(nil))
 	if err != nil {
 		return Info{}, errors.Wrap(err, "requesting /info")
 	}
@@ -768,7 +778,8 @@ func (c *Client) Status() (Status, error) {
 	span := c.tracer.StartSpan("Client.Status")
 	defer span.Finish()
 
-	_, data, err := c.HTTPRequest("GET", "/status", nil, nil)
+	path := "/status"
+	_, data, err := c.HTTPRequest("GET", path, nil, nil)
 	if err != nil {
 		return Status{}, errors.Wrap(err, "requesting /status")
 	}
@@ -781,7 +792,8 @@ func (c *Client) Status() (Status, error) {
 }
 
 func (c *Client) readSchema() ([]SchemaIndex, error) {
-	_, data, err := c.HTTPRequest("GET", "/schema", nil, c.augmentHeaders(nil))
+	path := "/schema"
+	_, data, err := c.HTTPRequest("GET", path, nil, c.augmentHeaders(nil))
 	if err != nil {
 		return nil, errors.Wrap(err, "requesting /schema")
 	}
@@ -793,36 +805,9 @@ func (c *Client) readSchema() ([]SchemaIndex, error) {
 	return schemaInfo.Indexes, nil
 }
 
-func (c *Client) IngestSchema(reqBody map[string]interface{}) (body []byte, err error) {
-	data, err := json.Marshal(reqBody)
-	if err != nil {
-		return data, errors.Wrap(err, "error building Schema body to Ingest")
-	}
-	return c.IngestRequest("/internal/schema", data)
-}
-
-func (c *Client) IngestData(index string, reqBody []map[string]interface{}) (body []byte, err error) {
-	data, err := json.Marshal(reqBody)
-	if err != nil {
-		return data, errors.Wrap(err, "error building request body to Ingest")
-	}
-	return c.IngestRequest("/internal/ingest/"+index, data)
-}
-
-func (c *Client) IngestRequest(uri string, data []byte) (body []byte, err error) {
-	var header = make(map[string]string)
-	header["Content-Type"] = "application/json"
-	header["Accept"] = "application/json"
-	header["User-Agent"] = "pilosa/" + pilosa.Version
-	status, body, err := c.HTTPRequest("POST", uri, data, header)
-	if err != nil {
-		return nil, errors.Wrapf(err, "requesting %s status: %d", uri, status)
-	}
-	return body, err
-}
-
 func (c *Client) shardsMax() (map[string]uint64, error) {
-	_, data, err := c.HTTPRequest("GET", "/internal/shards/max", nil, nil)
+	path := "/internal/shards/max"
+	_, data, err := c.HTTPRequest("GET", path, nil, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "requesting /internal/shards/max")
 	}
@@ -865,7 +850,8 @@ func (c *Client) httpRequest(method string, path string, data []byte, headers ma
 		// doRequest implements expotential backoff
 		status, body, err = c.doRequest(host, method, path, c.augmentHeaders(headers), data)
 		// conditions when primary should not be tried
-		if err == nil || usePrimary || path == "/status" {
+		pathCheck := "/status"
+		if err == nil || usePrimary || path == pathCheck {
 			break
 		}
 
@@ -900,8 +886,9 @@ func (c *Client) host(usePrimary bool) (*pnet.URI, error) {
 					c.primaryLock.Unlock()
 					return nil, errors.Wrap(err, "fetching primary node")
 				}
-				if host, err = pnet.NewURIFromAddress(fmt.Sprintf("%s://%s:%d", node.Scheme, node.Host, node.Port)); err != nil {
-					return nil, errors.Wrap(err, "parsing primary node URL")
+				addr := fmt.Sprintf("%s://%s:%d", node.Scheme, node.Host, node.Port)
+				if host, err = pnet.NewURIFromAddress(addr); err != nil {
+					return nil, errors.Wrapf(err, "parsing primary node URL: %s", addr)
 				}
 			} else {
 				host = c.primaryURI
@@ -928,6 +915,12 @@ func (c *Client) doRequest(host *pnet.URI, method, path string, headers map[stri
 		sleepTime time.Duration
 		rand      = rand.New(rand.NewSource(time.Now().UnixNano()))
 	)
+
+	// We have to add the service prefix to the path here (where applicable)
+	// because the pnet.URI type doesn't support the path portion of an address.
+	// Where needed, we already have a service prefix set on the Client.
+	path = c.prefix() + path
+
 	for retry := 0; ; {
 		if req, err = buildRequest(host, method, path, headers, data); err != nil {
 			return 0, nil, errors.Wrap(err, "building request")
@@ -1198,7 +1191,8 @@ func (c *Client) startTransaction(id string, timeout time.Duration, exclusive bo
 		return nil, errors.Wrap(err, "marshalling transaction")
 	}
 
-	status, data, err := c.httpRequest("POST", "/transaction", bod, c.augmentHeaders(defaultJSONHeaders()), true)
+	path := "/transaction"
+	status, data, err := c.httpRequest("POST", path, bod, c.augmentHeaders(defaultJSONHeaders()), true)
 	if status == http.StatusConflict && time.Now().Before(deadline) {
 		// if we're getting StatusConflict after all the usual timeouts/retries, keep retrying until the deadline
 		time.Sleep(time.Second)
@@ -1225,7 +1219,8 @@ func (c *Client) startTransaction(id string, timeout time.Duration, exclusive bo
 }
 
 func (c *Client) FinishTransaction(id string) (*pilosa.Transaction, error) {
-	_, data, err := c.httpRequest("POST", "/transaction/"+id+"/finish", nil, c.augmentHeaders(defaultJSONHeaders()), true)
+	path := fmt.Sprintf("/transaction/%s/finish", id)
+	_, data, err := c.httpRequest("POST", path, nil, c.augmentHeaders(defaultJSONHeaders()), true)
 	if err != nil && len(data) == 0 {
 		return nil, err
 	}
@@ -1247,7 +1242,8 @@ func (c *Client) FinishTransaction(id string) (*pilosa.Transaction, error) {
 }
 
 func (c *Client) Transactions() (map[string]*pilosa.Transaction, error) {
-	_, respData, err := c.httpRequest("GET", "/transactions", nil, c.augmentHeaders(defaultJSONHeaders()), true)
+	path := "/transactions"
+	_, respData, err := c.httpRequest("GET", path, nil, c.augmentHeaders(defaultJSONHeaders()), true)
 	if err != nil {
 		return nil, errors.Wrap(err, "getting transactions")
 	}
@@ -1261,7 +1257,8 @@ func (c *Client) Transactions() (map[string]*pilosa.Transaction, error) {
 }
 
 func (c *Client) GetTransaction(id string) (*pilosa.Transaction, error) {
-	_, data, err := c.httpRequest("GET", "/transaction/"+id, nil, c.augmentHeaders(defaultJSONHeaders()), true)
+	path := fmt.Sprintf("/transaction/%s", id)
+	_, data, err := c.httpRequest("GET", path, nil, c.augmentHeaders(defaultJSONHeaders()), true)
 	if err != nil {
 		return nil, err
 	}
@@ -1355,8 +1352,8 @@ type ClientOptions struct {
 	manualServerAddress bool
 	tracer              opentracing.Tracer
 	retries             *int
-	stats               stats.StatsClient
 	nat                 map[pnet.URI]pnet.URI
+	pathPrefix          string
 }
 
 func (co *ClientOptions) addOptions(options ...ClientOption) error {
@@ -1440,14 +1437,6 @@ func OptClientRetries(retries int) ClientOption {
 	}
 }
 
-// OptClientStatsClient sets a stats client, such as Prometheus
-func OptClientStatsClient(stats stats.StatsClient) ClientOption {
-	return func(options *ClientOptions) error {
-		options.stats = stats
-		return nil
-	}
-}
-
 // OptClientNAT sets a NAT map used to translate the advertised URI to something
 // else (for example, when accessing pilosa running in docker).
 func OptClientNAT(nat map[string]string) ClientOption {
@@ -1464,6 +1453,14 @@ func OptClientNAT(nat map[string]string) ClientOption {
 			}
 		}
 		options.nat = m
+		return nil
+	}
+}
+
+// OptClientPathPrefix sets the http path prefix.
+func OptClientPathPrefix(prefix string) ClientOption {
+	return func(options *ClientOptions) error {
+		options.pathPrefix = prefix
 		return nil
 	}
 }
@@ -1703,6 +1700,7 @@ type SchemaOptions struct {
 	TimeUnit       string        `json:"timeUnit"`
 	Base           int64         `json:"base"`
 	Epoch          time.Time     `json:"epoch"`
+	ForeignIndex   string        `json:"foreignIndex"`
 }
 
 func (so SchemaOptions) asIndexOptions() *IndexOptions {
@@ -1719,7 +1717,7 @@ func (so SchemaOptions) asFieldOptions() *FieldOptions {
 		fieldType:      so.FieldType,
 		cacheSize:      int(so.CacheSize),
 		cacheType:      CacheType(so.CacheType),
-		timeQuantum:    TimeQuantum(so.TimeQuantum),
+		timeQuantum:    types.TimeQuantum(so.TimeQuantum),
 		ttl:            so.TTL,
 		min:            so.Min,
 		max:            so.Max,
@@ -1729,6 +1727,7 @@ func (so SchemaOptions) asFieldOptions() *FieldOptions {
 		timeUnit:       so.TimeUnit,
 		base:           so.Base,
 		epoch:          so.Epoch,
+		foreignIndex:   so.ForeignIndex,
 	}
 }
 
@@ -1762,8 +1761,8 @@ func (r *exportReader) Read(p []byte) (n int, err error) {
 		headers := map[string]string{
 			"Accept": "text/csv",
 		}
-		path := fmt.Sprintf("/export?index=%s&field=%s&shard=%d",
-			r.field.index.Name(), r.field.Name(), r.currentShard)
+		path := fmt.Sprintf("%s/export?index=%s&field=%s&shard=%d",
+			r.client.prefix(), r.field.index.Name(), r.field.Name(), r.currentShard)
 		_, respData, err := r.client.doRequest(uri, "GET", path, headers, nil)
 		if err != nil {
 			return 0, errors.Wrap(err, "doing export request")
@@ -1778,4 +1777,54 @@ func (r *exportReader) Read(p []byte) (n int, err error) {
 		r.currentShard++
 	}
 	return
+}
+
+// SetAuthToken sets the Client.AuthToken value. We needed this to be a method
+// in order to satisfy the SchemaManager interface.
+func (c *Client) SetAuthToken(token string) {
+	c.AuthToken = token
+}
+
+// ApplyDataframeChangeset will create or append the existing dataframe
+// if creating, the provided schema will be used
+// if appending, the provided schema will be used to validate against
+// Only one shard can be written to at a time so slight care must be taken
+// Server side locking will prevent writting conflict
+func (c *Client) ApplyDataframeChangeset(indexName string, cr *pilosa.ChangesetRequest, shard uint64) (map[string]interface{}, error) {
+	path := fmt.Sprintf("/index/%s/dataframe/%d", indexName, shard)
+
+	headers := c.augmentHeaders(map[string]string{
+		"Content-Type": "application/octet-stream",
+		"Accept":       "application/json",
+	})
+
+	var buffer bytes.Buffer
+	enc := gob.NewEncoder(&buffer)
+	err := enc.Encode(cr)
+	if err != nil {
+		return nil, errors.Wrap(err, "encoding changesetrequest")
+	}
+	uris, err := c.getURIsForShard(indexName, shard)
+	if err != nil {
+		return nil, errors.Wrap(err, "getting URIs for import")
+	}
+
+	eg := errgroup.Group{}
+	data := buffer.Bytes()
+	for _, uri := range uris {
+		uri := uri
+		eg.Go(func() error {
+			vprint.VV("SENDING: %v", uri)
+			status, body, err := c.doRequest(uri, "POST", path, headers, data)
+			if err != nil {
+				return errors.Wrap(err, "executing request")
+			}
+			if status != http.StatusOK {
+				return errors.Errorf("find dataframe request failed (status: %d): %q", status, string(body))
+			}
+			return nil
+		})
+	}
+	err = eg.Wait()
+	return nil, err
 }

@@ -6,9 +6,10 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -17,8 +18,8 @@ import (
 	"github.com/featurebasedb/featurebase/v3/authn"
 	"github.com/featurebasedb/featurebase/v3/disco"
 	"github.com/featurebasedb/featurebase/v3/encoding/proto"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/featurebasedb/featurebase/v3/server"
-	"github.com/pkg/errors"
 	"github.com/ricochet2200/go-disk-usage/du"
 	"golang.org/x/sync/errgroup"
 )
@@ -58,17 +59,23 @@ type BackupCommand struct { // nolint: maligned
 	client *pilosa.InternalClient
 
 	// Standard input/output
-	*pilosa.CmdIO
+	logDest logger.Logger
 
 	TLS server.TLSConfig
 
-	AuthToken string
+	AuthToken        string
+	IgnoreSpaceCheck bool
+}
+
+// Logger returns the command's associated Logger to maintain CommandWithTLSSupport interface compatibility
+func (cmd *BackupCommand) Logger() logger.Logger {
+	return cmd.logDest
 }
 
 // NewBackupCommand returns a new instance of BackupCommand.
-func NewBackupCommand(stdin io.Reader, stdout, stderr io.Writer) *BackupCommand {
+func NewBackupCommand(logdest logger.Logger) *BackupCommand {
 	return &BackupCommand{
-		CmdIO:         pilosa.NewCmdIO(stdin, stdout, stderr),
+		logDest:       logdest,
 		Concurrency:   1,
 		RetryPeriod:   time.Minute,
 		HeaderTimeout: time.Second * 3,
@@ -81,19 +88,19 @@ func (cmd *BackupCommand) Run(ctx context.Context) (err error) {
 	logger := cmd.Logger()
 	close, err := startProfilingServer(cmd.Pprof, logger)
 	if err != nil {
-		return errors.Wrap(err, "starting profiling server")
+		return fmt.Errorf("starting profiling server: %w", err)
 	}
 	defer close()
 
 	// Validate arguments.
 	if cmd.OutputDir == "" {
-		return fmt.Errorf("-o flag required")
+		return fmt.Errorf("%w: -o flag required", ErrUsage)
 	} else if cmd.Concurrency <= 0 {
-		return fmt.Errorf("concurrency must be at least one")
+		return fmt.Errorf("%w: concurrency must be at least one", ErrUsage)
 	}
 	if cmd.HeaderTimeoutStr != "" {
 		if dur, err := time.ParseDuration(cmd.HeaderTimeoutStr); err != nil {
-			return fmt.Errorf("could not parse '%s' as a duration: %v", cmd.HeaderTimeoutStr, err)
+			return fmt.Errorf("%w: could not parse '%s' as a duration: %v", ErrUsage, cmd.HeaderTimeoutStr, err)
 		} else {
 			cmd.HeaderTimeout = dur
 		}
@@ -113,11 +120,7 @@ func (cmd *BackupCommand) Run(ctx context.Context) (err error) {
 	cmd.client = client
 
 	if cmd.AuthToken != "" {
-		ctx = context.WithValue(
-			ctx,
-			authn.ContextValueAccessToken,
-			"Bearer "+cmd.AuthToken,
-		)
+		ctx = authn.WithAccessToken(ctx, "Bearer "+cmd.AuthToken)
 	}
 
 	// Determine the field type in order to correctly handle the input data.
@@ -141,15 +144,17 @@ func (cmd *BackupCommand) Run(ctx context.Context) (err error) {
 	schema := &pilosa.Schema{Indexes: indexes}
 
 	// Ensure output directory doesn't exist; then create output directory.
-	if _, err := os.Stat(cmd.OutputDir); !os.IsNotExist(err) {
+	if _, err := os.Stat(cmd.OutputDir); !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("output directory already exists")
-	} else if err := os.MkdirAll(cmd.OutputDir, 0750); err != nil {
+	} else if err := os.MkdirAll(cmd.OutputDir, 0o750); err != nil {
 		return err
 	}
 
-	// Ensure there is enough free space
-	if err := cmd.checkFreeSpace(ctx); err != nil {
-		return fmt.Errorf("not enough disk space available: %w", err)
+	if !cmd.IgnoreSpaceCheck {
+		// Ensure there is enough free space
+		if err := cmd.checkFreeSpace(ctx); err != nil {
+			return fmt.Errorf("not enough disk space available: %w", err)
+		}
 	}
 
 	// Backup schema.
@@ -194,7 +199,7 @@ func (cmd *BackupCommand) backupSchema(ctx context.Context, schema *pilosa.Schem
 		return fmt.Errorf("marshaling schema: %w", err)
 	}
 
-	if err := ioutil.WriteFile(filepath.Join(cmd.OutputDir, "schema"), buf, 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(cmd.OutputDir, "schema"), buf, 0o600); err != nil {
 		return fmt.Errorf("writing schema: %w", err)
 	}
 
@@ -317,6 +322,14 @@ func (cmd *BackupCommand) backupShard(ctx context.Context, indexName string, sha
 
 	for _, node := range nodes {
 		if e := cmd.backupShardNode(ctx, indexName, shard, node); e == nil {
+			break
+		} else if err == nil {
+			err = e // save first error, try next node
+		}
+	}
+
+	for _, node := range nodes {
+		if e := cmd.backupShardDataframe(ctx, indexName, shard, node); e == nil {
 			return nil // backup ok, exit
 		} else if err == nil {
 			err = e // save first error, try next node
@@ -335,14 +348,13 @@ func (cmd *BackupCommand) backupShardNode(ctx context.Context, indexName string,
 		pilosa.WithClientRetryPeriod(cmd.RetryPeriod),
 		pilosa.WithSerializer(proto.Serializer{}))
 	rc, err := client.ShardReader(ctx, indexName, shard)
-
 	if err != nil {
 		return fmt.Errorf("fetching shard reader: %w", err)
 	}
 	defer rc.Close()
 
 	filename := filepath.Join(cmd.OutputDir, "indexes", indexName, "shards", fmt.Sprintf("%04d", shard))
-	if err := os.MkdirAll(filepath.Dir(filename), 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(filename), 0o750); err != nil {
 		return err
 	}
 
@@ -400,7 +412,7 @@ func (cmd *BackupCommand) backupIndexPartitionTranslateData(ctx context.Context,
 	defer rc.Close()
 
 	filename := filepath.Join(cmd.OutputDir, "indexes", name, "translate", fmt.Sprintf("%04d", partitionID))
-	if err := os.MkdirAll(filepath.Dir(filename), 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(filename), 0o750); err != nil {
 		return err
 	}
 
@@ -429,7 +441,7 @@ func (cmd *BackupCommand) backupFieldTranslateData(ctx context.Context, indexNam
 	defer rc.Close()
 
 	filename := filepath.Join(cmd.OutputDir, "indexes", indexName, "fields", fieldName, "translate")
-	if err := os.MkdirAll(filepath.Dir(filename), 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(filename), 0o750); err != nil {
 		return err
 	}
 
@@ -522,5 +534,42 @@ func (cmd *BackupCommand) syncDir(path string) error {
 		return fmt.Errorf("syncing directory: %w", err)
 	}
 
+	return f.Close()
+}
+
+func (cmd *BackupCommand) backupShardDataframe(ctx context.Context, indexName string, shard uint64, node *disco.Node) error {
+	logger := cmd.Logger()
+	logger.Printf("backing up dataframe shard: index=%q shard=%d", indexName, shard)
+
+	client := pilosa.NewInternalClientFromURI(&node.URI,
+		pilosa.GetHTTPClient(cmd.tlsConfig, pilosa.ClientResponseHeaderTimeoutOption(cmd.HeaderTimeout)),
+	)
+
+	resp, err := client.GetDataframeShard(ctx, indexName, shard)
+	// no error if doesn't exist
+	if err != nil {
+		return fmt.Errorf("getting dataframe: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 404 {
+		// no error if not present server maynot have it turned on
+		return nil
+	}
+	filename := filepath.Join(cmd.OutputDir, "indexes", indexName, "dataframe", fmt.Sprintf("%04d", shard))
+	if err := os.MkdirAll(filepath.Dir(filename), 0o750); err != nil {
+		return err
+	}
+
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		return err
+	} else if err := cmd.syncFile(f); err != nil {
+		return err
+	}
 	return f.Close()
 }

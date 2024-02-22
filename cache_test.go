@@ -62,7 +62,7 @@ func TestCache_Rank_Dirty(t *testing.T) {
 		cache.Add(v.ID, v.Count)
 	}
 
-	var got []pair
+	var got []pair //nolint:prealloc
 	for _, p := range cache.Top() {
 		got = append(got, pair(p))
 	}

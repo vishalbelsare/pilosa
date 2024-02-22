@@ -4,7 +4,6 @@ package testhook
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"sync"
 	"testing"
@@ -25,6 +24,10 @@ func RegisterPostTestHook(fn Callback) {
 	mu.Lock()
 	defer mu.Unlock()
 	postHooks = append(postHooks, fn)
+	// ... but put it at the beginning of the list, so they're LIFO,
+	// so test hook pairs nest cleanly.
+	copy(postHooks[1:], postHooks)
+	postHooks[0] = fn
 }
 
 // RegisterPreTestHook registers a function to be called after tests
@@ -55,23 +58,34 @@ func RunTestsWithHooks(m *testing.M) {
 		fmt.Fprint(os.Stderr, "pre-hooks failed, aborting.\n")
 		os.Exit(ret)
 	}
-	ret = m.Run()
-	mu.Lock()
-	defer mu.Unlock()
-	for _, fn := range postHooks {
-		err := fn()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "post-hook failure: %v\n", err)
-			ret = 1
-		}
-	}
+
+	// This inner function lets us get a deferred run of our post-test
+	// hooks which necessarily succeeds, but can trap an error even
+	// from those and set the return value. You can't do this with a
+	// direct os.Exit() wrapper because defers don't run after os.Exit.
+	// Don't ask how many tries it took me to figure that out, I'll
+	// just cry.
+	func() {
+		defer func() {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, fn := range postHooks {
+				err := fn()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "post-hook failure: %v\n", err)
+					ret = 1
+				}
+			}
+		}()
+		ret = m.Run()
+	}()
 	os.Exit(ret)
 }
 
 // TempDir creates a temp directory that will be automatically deleted when
 // this test completes, using go1.14's [TB].Cleanup() if available.
 func TempDir(tb testing.TB, pattern string) (path string, err error) {
-	path, err = ioutil.TempDir("", pattern)
+	path, err = os.MkdirTemp("", pattern)
 	if err == nil {
 		Cleanup(tb, func() {
 			os.RemoveAll(path)
@@ -83,7 +97,7 @@ func TempDir(tb testing.TB, pattern string) (path string, err error) {
 // TempFile creates a temp file that will be automatically deleted when
 // this test completes, using go1.14's [TB].Cleanup() if available.
 func TempFile(tb testing.TB, pattern string) (file *os.File, err error) {
-	file, err = ioutil.TempFile("", pattern)
+	file, err = os.CreateTemp("", pattern)
 	if err == nil {
 		path := file.Name()
 		Cleanup(tb, func() {
@@ -99,7 +113,7 @@ func TempFile(tb testing.TB, pattern string) (file *os.File, err error) {
 // path instead of the default Go TMPDIR. Only some tests use this, which is
 // possibly an error...
 func TempDirInDir(tb testing.TB, dir string, pattern string) (path string, err error) {
-	path, err = ioutil.TempDir(dir, pattern)
+	path, err = os.MkdirTemp(dir, pattern)
 	if err == nil {
 		Cleanup(tb, func() {
 			os.RemoveAll(path)
@@ -113,7 +127,7 @@ func TempDirInDir(tb testing.TB, dir string, pattern string) (path string, err e
 // path instead of the default Go TMPDIR. Only some tests use this, which is
 // possibly an error...
 func TempFileInDir(tb testing.TB, dir string, pattern string) (file *os.File, err error) {
-	file, err = ioutil.TempFile(dir, pattern)
+	file, err = os.CreateTemp(dir, pattern)
 	if err == nil {
 		path := file.Name()
 		Cleanup(tb, func() {

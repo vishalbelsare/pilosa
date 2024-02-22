@@ -3,24 +3,20 @@
 package cmd
 
 import (
-	"context"
-	"io"
-
 	"github.com/featurebasedb/featurebase/v3/ctl"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/spf13/cobra"
 )
 
-func newBackupCommand(stdin io.Reader, stdout io.Writer, stderr io.Writer) *cobra.Command {
-	cmd := ctl.NewBackupCommand(stdin, stdout, stderr)
+func newBackupCommand(logdest logger.Logger) *cobra.Command {
+	cmd := ctl.NewBackupCommand(logdest)
 	ccmd := &cobra.Command{
 		Use:   "backup",
 		Short: "Back up FeatureBase server",
 		Long: `
 Backs up a FeatureBase server to a local, tar-formatted snapshot file.
 `,
-		RunE: func(c *cobra.Command, args []string) error {
-			return cmd.Run(context.Background())
-		},
+		RunE: UsageErrorWrapper(cmd),
 	}
 
 	flags := ccmd.Flags()
@@ -34,5 +30,6 @@ Backs up a FeatureBase server to a local, tar-formatted snapshot file.
 	ctl.SetTLSConfig(flags, "", &cmd.TLS.CertificatePath, &cmd.TLS.CertificateKeyPath, &cmd.TLS.CACertPath, &cmd.TLS.SkipVerify, &cmd.TLS.EnableClientVerification)
 	flags.StringVar(&cmd.AuthToken, "auth-token", "", "Authentication token")
 	flags.StringVar(&cmd.HeaderTimeoutStr, "header-timeout", cmd.HeaderTimeoutStr, "Length of time to wait for initial HTTP response before giving up.")
+	flags.BoolVar(&cmd.IgnoreSpaceCheck, "ignore-space-check", false, "Disable disk space check")
 	return ccmd
 }

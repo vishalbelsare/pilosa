@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt"
 	"github.com/featurebasedb/featurebase/v3/logger"
+	"github.com/golang-jwt/jwt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
@@ -67,7 +67,7 @@ func TestSetGRPCMetadata(t *testing.T) {
 		"otherCookies": {"cookie": []string{a.accessCookieName + "=something", "blah=blah"}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			ogCookies, _ := md["cookie"]
+			ogCookies := md["cookie"]
 			ctx := grpc.NewContextWithServerTransportStream(
 				metadata.NewIncomingContext(context.TODO(),
 					md,
@@ -78,7 +78,7 @@ func TestSetGRPCMetadata(t *testing.T) {
 			if !ok {
 				t.Fatalf("expected ok, got: %v", ok)
 			}
-			err := a.SetGRPCMetadata(ctx, md, "accesstoken!", "refreshtoken!")
+			ctx, err := a.SetGRPCMetadata(ctx, md, "accesstoken!", "refreshtoken!")
 			if err != nil {
 				t.Fatalf("expected no errors, got: %v", err)
 			}
@@ -280,8 +280,7 @@ func TestAuthenticate(t *testing.T) {
 				a.groupsCache[token] = cachedGroups{time.Now(), test.groups}
 			}
 			if test.refresh {
-				var srv *httptest.Server
-				srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					if err := r.ParseForm(); err != nil {
 						t.Fatalf("unexpected error: %v", err)
 					}
@@ -378,7 +377,6 @@ func TestAuthenticate_CleanCache(t *testing.T) {
 			t.Errorf("goldy should not have been deleted")
 		}
 	})
-
 }
 
 func TestGetGroups(t *testing.T) {
@@ -464,7 +462,6 @@ func TestGetGroups(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func TestDecodeHex(t *testing.T) {
@@ -616,7 +613,6 @@ func TestHandlers(t *testing.T) {
 			t.Fatalf("expected BadRequest, got %v", resp.StatusCode)
 		}
 	})
-
 }
 
 // This type is used for mocking ServerTransportStreams in tests
@@ -668,7 +664,6 @@ func assertEqual(exp, got interface{}, t *testing.T) {
 }
 
 func TestCheckAllowedNetworks(t *testing.T) {
-
 	tests := []struct {
 		requestIP     string
 		configuredIPs []string
@@ -722,7 +717,6 @@ func TestCheckAllowedNetworks(t *testing.T) {
 }
 
 func TestConvertIP(t *testing.T) {
-
 	tests := []struct {
 		configuredIPs []string
 		convertedIPs  []net.IPNet

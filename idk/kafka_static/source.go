@@ -5,8 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -26,14 +26,23 @@ import (
 // source. It is not threadsafe! Due to the way Kafka clients work, to
 // achieve concurrency, create multiple Sources.
 type Source struct {
-	Hosts    []string
-	Topics   []string
-	Group    string
-	TLS      idk.TLSConfig
-	Log      logger.Logger
-	Timeout  time.Duration
-	SkipOld  bool
-	Header   string
+	Hosts   []string
+	Topics  []string
+	Group   string
+	TLS     idk.TLSConfig
+	Log     logger.Logger
+	Timeout time.Duration
+	SkipOld bool
+
+	// Header is a file or url referencing a file containing JSON header
+	// configuration.
+	Header string
+
+	// HeaderFields can be provided instead of Header. It is a slice of
+	// RawFields which will be marshalled and parsed the same way a JSON object
+	// in Header would be. It is used only if a Header is not provided.
+	HeaderFields []idk.RawField
+
 	S3Region string
 
 	AllowMissingFields bool
@@ -136,6 +145,8 @@ func (r *Record) StreamOffset() (string, uint64) {
 
 var _ idk.OffsetStreamRecord = &Record{}
 
+func (r *Record) Schema() interface{} { return nil }
+
 func (r *Record) Commit(ctx context.Context) error {
 	idx, base := r.idx, r.src.spoolBase
 	if idx < base {
@@ -160,23 +171,30 @@ func (r *Record) Data() []interface{} {
 
 // Open initializes the kafka source.
 func (s *Source) Open() error {
-	if len(s.Header) == 0 {
-		return errors.New("needs header specification file")
+	if len(s.Header) == 0 && len(s.HeaderFields) == 0 {
+		return errors.New("needs header specification (file or fields)")
 	}
 
-	{
-		headerData, err := s.readFileOrURL(s.Header)
+	var headerData []byte
+	var err error
+	if s.Header != "" {
+		headerData, err = s.readFileOrURL(s.Header)
 		if err != nil {
 			return errors.Wrap(err, "reading header file")
 		}
-
-		schema, paths, err := idk.ParseHeader(headerData)
+	} else {
+		headerData, err = json.Marshal(s.HeaderFields)
 		if err != nil {
-			return errors.Wrap(err, "processing header")
+			return errors.Wrap(err, "marshalling header fields")
 		}
-		s.schema = schema
-		s.paths = paths
 	}
+
+	schema, paths, err := idk.ParseHeader(headerData)
+	if err != nil {
+		return errors.Wrap(err, "processing header")
+	}
+	s.schema = schema
+	s.paths = paths
 
 	// init (custom) config, enable errors and notifications
 	config := segmentio.ReaderConfig{
@@ -206,7 +224,7 @@ func (s *Source) Open() error {
 	for _, topic := range s.Topics {
 		config := config
 		config.Topic = topic
-		readers[topic] = internal.RetryReader{segmentio.NewReader(config)} //nolint:govet
+		readers[topic] = internal.RetryReader{Reader: segmentio.NewReader(config)}
 	}
 
 	// Throw the readers into a blender.
@@ -262,7 +280,7 @@ func (s *Source) readFileOrURL(name string) ([]byte, error) {
 		s.Log.Printf("read %d bytes from %s\n", bytesRead, name)
 		content = buf.Bytes()
 	} else {
-		content, err = ioutil.ReadFile(name)
+		content, err = os.ReadFile(name)
 		if err != nil {
 			return nil, errors.Wrapf(err, "reading file %v", name)
 		}

@@ -13,19 +13,23 @@ import (
 	"sync"
 	"time"
 
+	"github.com/featurebasedb/featurebase/v3/dax"
 	"github.com/featurebasedb/featurebase/v3/disco"
 	"github.com/featurebasedb/featurebase/v3/pql"
 	"github.com/featurebasedb/featurebase/v3/roaring"
-	"github.com/featurebasedb/featurebase/v3/stats"
 	"github.com/featurebasedb/featurebase/v3/testhook"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 )
 
 // Index represents a container for fields.
 type Index struct {
-	mu            sync.RWMutex
-	createdAt     int64
+	mu          sync.RWMutex
+	createdAt   int64
+	owner       string
+	description string
+
 	path          string
 	name          string
 	qualifiedName string
@@ -39,15 +43,14 @@ type Index struct {
 	fields map[string]*Field
 
 	broadcaster broadcaster
-	Schemator   disco.Schemator
 	serializer  Serializer
-	Stats       stats.StatsClient
 
 	// Passed to field for foreign-index lookup.
 	holder *Holder
 
 	// Per-partition translation stores
-	translateStores map[int]TranslateStore
+	translatePartitions dax.PartitionNums
+	translateStores     map[int]TranslateStore
 
 	translationSyncer TranslationSyncer
 
@@ -64,7 +67,6 @@ type Index struct {
 // NewIndex returns an existing (but possibly empty) instance of
 // Index at path. It will not erase any prior content.
 func NewIndex(holder *Holder, path, name string) (*Index, error) {
-
 	// Emulate what the spf13/cobra does, letting env vars override
 	// the defaults, because we may be under a simple "go test" run where
 	// not all that command line machinery has been spun up.
@@ -80,11 +82,9 @@ func NewIndex(holder *Holder, path, name string) (*Index, error) {
 		fields: make(map[string]*Field),
 
 		broadcaster:    NopBroadcaster,
-		Stats:          stats.NopStatsClient,
 		holder:         holder,
 		trackExistence: true,
 
-		Schemator:  disco.NewInMemSchemator(),
 		serializer: NopSerializer,
 
 		translateStores: make(map[int]TranslateStore),
@@ -105,6 +105,11 @@ func (i *Index) CreatedAt() int64 {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return i.createdAt
+}
+
+// DataframePath returns the path of the dataframes specific to an index
+func (i *Index) DataframesPath() string {
+	return filepath.Join(i.path, DataframesDir)
 }
 
 // Name returns name of the index.
@@ -150,6 +155,7 @@ func (i *Index) Options() IndexOptions {
 
 func (i *Index) options() IndexOptions {
 	return IndexOptions{
+		Description:    i.description,
 		Keys:           i.keys,
 		TrackExistence: i.trackExistence,
 	}
@@ -190,9 +196,16 @@ func (i *Index) open(idx *disco.Index) (err error) {
 	defer i.mu.Unlock()
 	// Ensure the path exists.
 	i.holder.Logger.Debugf("ensure index path exists: %s", i.FieldsPath())
-	if err := os.MkdirAll(i.FieldsPath(), 0750); err != nil {
+	if err := os.MkdirAll(i.FieldsPath(), 0o750); err != nil {
 		return errors.Wrap(err, "creating directory")
 	}
+
+	// Ensure the dataframes path exists
+	i.holder.Logger.Debugf("ensure dataframes path exists: %s", i.DataframesPath())
+	if err := os.MkdirAll(i.DataframesPath(), 0o750); err != nil {
+		return errors.Wrap(err, "creating dataframes directory")
+	}
+
 	i.closing = make(chan struct{})
 	// fmt.Printf("new channel %p for index %p\n", i.closing, i)
 
@@ -238,6 +251,28 @@ func (i *Index) open(idx *disco.Index) (err error) {
 
 		var g errgroup.Group
 		var mu sync.Mutex
+		// TODO(tlt): this for loop doesn't work because if we assign a
+		// translate partition to this node later (after the table has been
+		// created with a sub-set of translatePartitions), then the new
+		// TranslateStores don't get initialized. For now I just put it back so
+		// it opens a TranslateStore for every partition no matter what, but we
+		// really need to have the ApplyDirective logic able to initialize any
+		// TranslateStore which doesn't already exist (and perhaps shut down any
+		// that are to be removed).
+		//
+		// for _, partition := range i.translatePartitions {
+		//	  partitionID := int(partition.Num)
+		//
+		//
+		// TODO(tlt): instead of i.holder.partitionN, we need to use
+		// len(i.translatePartitions), or actually we need to know the
+		// keypartitions for the qtbl (i don't think we can rely on the length
+		// of this slice) but that will only apply here... we need to go through
+		// all the code and see where these are being used:
+		// - i.holder.partitionN
+		// - DefaultPartitionN
+		//
+		//
 		for partitionID := 0; partitionID < i.holder.partitionN; partitionID++ {
 			partitionID := partitionID
 
@@ -350,6 +385,7 @@ func (i *Index) openExistenceField() error {
 	cfm := &CreateFieldMessage{
 		Index:     i.name,
 		Field:     existenceFieldName,
+		Owner:     "",
 		CreatedAt: 0,
 		Meta:      &FieldOptions{Type: FieldTypeSet, CacheType: CacheTypeNone, CacheSize: 0},
 	}
@@ -469,11 +505,11 @@ func (i *Index) AvailableShards(localOnly bool) *roaring.Bitmap {
 
 	b := roaring.NewBitmap()
 	for _, f := range i.fields {
-		//b.Union(f.AvailableShards(localOnly))
+		// b.Union(f.AvailableShards(localOnly))
 		b.UnionInPlace(f.AvailableShards(localOnly))
 	}
 
-	i.Stats.Gauge(MetricMaxShard, float64(b.Max()), 1.0)
+	GaugeIndexMaxShard.With(prometheus.Labels{"index": i.name}).Set(float64(b.Max()))
 	return b
 }
 
@@ -525,8 +561,13 @@ func (i *Index) recalculateCaches() {
 	}
 }
 
-// CreateField creates a field.
-func (i *Index) CreateField(name string, opts ...FieldOption) (*Field, error) {
+// createNullableField is just like CreateField, except that it allows
+// the field to not have TrackExistence enabled. This should be used
+// only for existing fields which were already actually created, where
+// what we're really doing now is reifying them, so for instance, this
+// shows up in api_directive:createField to apply directives, which
+// are assumed to correctly reflect the intended behavior.
+func (i *Index) createNullableField(name string, requestUserID string, opts ...FieldOption) (*Field, error) {
 	err := ValidateName(name)
 	if err != nil {
 		return nil, errors.Wrap(err, "validating name")
@@ -554,11 +595,54 @@ func (i *Index) CreateField(name string, opts ...FieldOption) (*Field, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "applying option")
 	}
+	return i.createFieldWithOptions(name, requestUserID, fo)
+}
 
+// CreateField creates a field. This interface enforces the setting
+// of the TrackExistence flag; if you don't want that, use
+// createNullableField, but actually don't. That should be used only
+// for applying previously-created fields.
+func (i *Index) CreateField(name string, requestUserID string, opts ...FieldOption) (*Field, error) {
+	err := ValidateName(name)
+	if err != nil {
+		return nil, errors.Wrap(err, "validating name")
+	}
+
+	// Grab lock, check for field existing, release lock. We don't want
+	// to stay holding the lock, but we might care about the ErrFieldExists
+	// part of this.
+	err = func() error {
+		i.mu.Lock()
+		defer i.mu.Unlock()
+
+		// Ensure field doesn't already exist.
+		if i.fields[name] != nil {
+			return newConflictError(ErrFieldExists)
+		}
+		return nil
+	}()
+	if err != nil {
+		return nil, err
+	}
+
+	// Apply and validate functional options.
+	fo, err := newFieldOptions(opts...)
+	if err != nil {
+		return nil, errors.Wrap(err, "applying option")
+	}
+	fo.TrackExistence = true
+	return i.createFieldWithOptions(name, requestUserID, fo)
+}
+
+// createFieldWithOptions creates a field given a finalized FieldOptions
+// structure, instead of functional options.
+func (i *Index) createFieldWithOptions(name string, requestUserID string, fo *FieldOptions) (*Field, error) {
+	ts := timestamp()
 	cfm := &CreateFieldMessage{
 		Index:     i.name,
 		Field:     name,
-		CreatedAt: timestamp(),
+		CreatedAt: ts,
+		Owner:     requestUserID,
 		Meta:      fo,
 	}
 
@@ -587,7 +671,9 @@ func (i *Index) CreateField(name string, opts ...FieldOption) (*Field, error) {
 }
 
 // CreateFieldIfNotExists creates a field with the given options if it doesn't exist.
-func (i *Index) CreateFieldIfNotExists(name string, opts ...FieldOption) (*Field, error) {
+//
+// Does NOT apply the "default" TrackExistence.
+func (i *Index) CreateFieldIfNotExists(name string, requestUserID string, opts ...FieldOption) (*Field, error) {
 	err := ValidateName(name)
 	if err != nil {
 		return nil, errors.Wrap(err, "validating name")
@@ -607,10 +693,12 @@ func (i *Index) CreateFieldIfNotExists(name string, opts ...FieldOption) (*Field
 		return nil, errors.Wrap(err, "applying option")
 	}
 
+	ts := timestamp()
 	cfm := &CreateFieldMessage{
 		Index:     i.name,
 		Field:     name,
-		CreatedAt: timestamp(),
+		CreatedAt: ts,
+		Owner:     requestUserID,
 		Meta:      fo,
 	}
 
@@ -631,7 +719,9 @@ func (i *Index) CreateFieldIfNotExists(name string, opts ...FieldOption) (*Field
 // function options, taking a *FieldOptions struct. TODO: This should
 // definintely be refactored so we don't have these virtually equivalent
 // methods, but I'm puttin this here for now just to see if it works.
-func (i *Index) CreateFieldIfNotExistsWithOptions(name string, opt *FieldOptions) (*Field, error) {
+//
+// Does NOT apply the "default" TrackExistence.
+func (i *Index) CreateFieldIfNotExistsWithOptions(name string, requestUserID string, opt *FieldOptions) (*Field, error) {
 	err := ValidateName(name)
 	if err != nil {
 		return nil, errors.Wrap(err, "validating name")
@@ -682,10 +772,12 @@ func (i *Index) CreateFieldIfNotExistsWithOptions(name string, opt *FieldOptions
 		}
 	}
 
+	ts := timestamp()
 	cfm := &CreateFieldMessage{
 		Index:     i.name,
 		Field:     name,
-		CreatedAt: timestamp(),
+		CreatedAt: ts,
+		Owner:     requestUserID,
 		Meta:      opt,
 	}
 
@@ -714,8 +806,8 @@ func (i *Index) persistField(ctx context.Context, cfm *CreateFieldMessage) error
 	}
 
 	if b, err := i.serializer.Marshal(cfm); err != nil {
-		return errors.Wrap(err, "marshaling")
-	} else if err := i.Schemator.CreateField(ctx, cfm.Index, cfm.Field, b); errors.Cause(err) == disco.ErrFieldExists {
+		return errors.Wrap(err, "marshaling field")
+	} else if err := i.holder.Schemator.CreateField(ctx, cfm.Index, cfm.Field, b); errors.Cause(err) == disco.ErrFieldExists {
 		return ErrFieldExists
 	} else if err != nil {
 		return errors.Wrapf(err, "writing field to disco: %s/%s", cfm.Index, cfm.Field)
@@ -731,8 +823,8 @@ func (i *Index) persistUpdateField(ctx context.Context, cfm *CreateFieldMessage)
 	}
 
 	if b, err := i.serializer.Marshal(cfm); err != nil {
-		return errors.Wrap(err, "marshaling")
-	} else if err := i.Schemator.UpdateField(ctx, cfm.Index, cfm.Field, b); errors.Cause(err) == disco.ErrFieldDoesNotExist {
+		return errors.Wrap(err, "marshaling field")
+	} else if err := i.holder.Schemator.UpdateField(ctx, cfm.Index, cfm.Field, b); errors.Cause(err) == disco.ErrFieldDoesNotExist {
 		return ErrFieldNotFound
 	} else if err != nil {
 		return errors.Wrapf(err, "writing field to disco: %s/%s", cfm.Index, cfm.Field)
@@ -740,9 +832,9 @@ func (i *Index) persistUpdateField(ctx context.Context, cfm *CreateFieldMessage)
 	return nil
 }
 
-func (i *Index) UpdateField(ctx context.Context, name string, update FieldUpdate) (*CreateFieldMessage, error) {
+func (i *Index) UpdateField(ctx context.Context, name string, requestUserID string, update FieldUpdate) (*CreateFieldMessage, error) {
 	// Get field from etcd
-	buf, err := i.Schemator.Field(ctx, i.name, name)
+	buf, err := i.holder.Schemator.Field(ctx, i.name, name)
 	if err != nil {
 		return nil, errors.Wrapf(err, "getting field '%s' from etcd", name)
 	}
@@ -785,6 +877,9 @@ func (i *Index) UpdateField(ctx context.Context, name string, update FieldUpdate
 		return nil, errors.Wrap(err, "persisting updated field")
 	}
 
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
 	return cfm, nil
 }
 
@@ -804,7 +899,6 @@ func (i *Index) UpdateFieldLocal(cfm *CreateFieldMessage, update FieldUpdate) er
 	}
 
 	return nil
-
 }
 
 // createFieldIfNotExists creates the field if it does not already exist in the
@@ -845,6 +939,7 @@ func (i *Index) createField(cfm *CreateFieldMessage) (*Field, error) {
 		return nil, errors.Wrap(err, "initializing")
 	}
 	f.createdAt = cfm.CreatedAt
+	f.owner = cfm.Owner
 
 	// Pass holder through to the field for use in looking
 	// up a foreign index.
@@ -877,9 +972,7 @@ func (i *Index) newField(path, name string) (*Field, error) {
 		return nil, err
 	}
 	f.idx = i
-	f.Stats = i.Stats
 	f.broadcaster = i.broadcaster
-	f.schemator = i.Schemator
 	f.serializer = i.serializer
 	f.OpenTranslateStore = i.OpenTranslateStore
 	return f, nil
@@ -902,7 +995,7 @@ func (i *Index) DeleteField(name string) error {
 	}
 
 	// Delete the field from etcd as the system of record.
-	if err := i.Schemator.DeleteField(context.TODO(), i.name, name); err != nil {
+	if err := i.holder.Schemator.DeleteField(context.TODO(), i.name, name); err != nil {
 		return errors.Wrapf(err, "deleting field from etcd: %s/%s", i.name, name)
 	}
 
@@ -923,6 +1016,29 @@ func (i *Index) DeleteField(name string) error {
 	return i.translationSyncer.Reset()
 }
 
+// SetTranslatePartitions sets the cached value: translatePartitions.
+//
+// There's already logic in api_directive.go which creates a new index with
+// partitions. This particular function is used when the index already exists on
+// the node, but we get a Directive which changes its partition list. In that
+// case, we need to update this cached value. Really, this is kind of hacky and
+// we need to revisit the ApplyDirective logic so that it's more intuitive with
+// respect to index.translatePartitions.
+func (i *Index) SetTranslatePartitions(tp dax.PartitionNums) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.translatePartitions = tp
+}
+
+// TODO (twg) refine parquet strategy a bit
+func (i *Index) GetDataFramePath(shard uint64) string {
+	path := i.DataframesPath()
+	os.MkdirAll(i.path, 0o750)
+	shardpad := fmt.Sprintf("%04d", shard)
+	return filepath.Join(path, shardpad)
+}
+
 type indexSlice []*Index
 
 func (p indexSlice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
@@ -931,11 +1047,25 @@ func (p indexSlice) Less(i, j int) bool { return p[i].Name() < p[j].Name() }
 
 // IndexInfo represents schema information for an index.
 type IndexInfo struct {
-	Name       string       `json:"name"`
-	CreatedAt  int64        `json:"createdAt,omitempty"`
-	Options    IndexOptions `json:"options"`
-	Fields     []*FieldInfo `json:"fields"`
-	ShardWidth uint64       `json:"shardWidth"`
+	Name           string       `json:"name"`
+	CreatedAt      int64        `json:"createdAt,omitempty"`
+	UpdatedAt      int64        `json:"updatedAt"`
+	Owner          string       `json:"owner"`
+	LastUpdateUser string       `json:"lastUpdatedUser"`
+	Options        IndexOptions `json:"options"`
+	Fields         []*FieldInfo `json:"fields"`
+	ShardWidth     uint64       `json:"shardWidth"`
+}
+
+// Field returns the FieldInfo the provided field name. If the field does not
+// exist, it returns nil
+func (ii *IndexInfo) Field(name string) *FieldInfo {
+	for _, fld := range ii.Fields {
+		if fld.Name == name {
+			return fld
+		}
+	}
+	return nil
 }
 
 type indexInfoSlice []*IndexInfo
@@ -946,8 +1076,10 @@ func (p indexInfoSlice) Less(i, j int) bool { return p[i].Name < p[j].Name }
 
 // IndexOptions represents options to set when initializing an index.
 type IndexOptions struct {
-	Keys           bool `json:"keys"`
-	TrackExistence bool `json:"trackExistence"`
+	Keys           bool   `json:"keys"`
+	TrackExistence bool   `json:"trackExistence"`
+	PartitionN     int    `json:"partitionN"`
+	Description    string `json:"description"`
 }
 
 type importData struct {
@@ -958,8 +1090,4 @@ type importData struct {
 // FormatQualifiedIndexName generates a qualified name for the index to be used with Tx operations.
 func FormatQualifiedIndexName(index string) string {
 	return fmt.Sprintf("%s\x00", index)
-}
-
-func (i *Index) Txf() *TxFactory {
-	return i.holder.txf
 }

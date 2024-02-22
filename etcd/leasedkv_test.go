@@ -18,8 +18,10 @@ import (
 	"go.etcd.io/etcd/pkg/types"
 )
 
-const initVal = "test"
-const newVal = "newValue"
+const (
+	initVal = "test"
+	newVal  = "newValue"
+)
 
 func TestClusterKv(t *testing.T) {
 	if !AllowCluster() {
@@ -30,26 +32,23 @@ func TestClusterKv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("starting cluster: %v", err)
 	}
-	c.MustAwaitClusterState(disco.ClusterStateDown)
+	c.MustAwaitClusterState(disco.ClusterStateDown, 10*time.Second)
 	err = c.BringUp()
 	if err != nil {
 		t.Fatalf("bringing up cluster: %v", err)
 	}
-	c.MustAwaitClusterState(disco.ClusterStateNormal)
-	_, err = c.Elect()
-	if err != nil {
-		t.Fatalf("trying to cause election: %v", err)
-	}
+	c.MustAwaitClusterState(disco.ClusterStateNormal, 10*time.Second)
 	ctx := context.TODO()
 	c.nodes[0].SetState(ctx, disco.NodeStateStarting)
 	c.nodes[1].SetState(ctx, disco.NodeStateStarting)
-	c.MustAwaitClusterState(disco.ClusterStateStarting)
+	c.MustAwaitClusterState(disco.ClusterStateDown, 10*time.Second)
 	c.nodes[0].SetState(ctx, disco.NodeStateStarted)
-	c.nodes[1].SetState(ctx, disco.NodeStateStarted)
 	// Two of three nodes are up, one is down, we have 2 replicas, so
 	// we should be able to handle reads but not writes, so we're in
 	// a Degraded state.
-	c.MustAwaitClusterState(disco.ClusterStateDegraded)
+	c.MustAwaitClusterState(disco.ClusterStateDegraded, 10*time.Second)
+	c.nodes[1].SetState(ctx, disco.NodeStateStarted)
+	c.MustAwaitClusterState(disco.ClusterStateNormal, 10*time.Second)
 	err = c.Stop()
 	if err != nil {
 		t.Fatalf("stopping cluster: %v", err)
@@ -66,6 +65,7 @@ func TestLeasedKv(t *testing.T) {
 	cfg.LCUrls = types.MustNewURLs([]string{clientURL})
 	cfg.ACUrls = types.MustNewURLs([]string{clientURL})
 	cfg.InitialCluster = cfg.Name + "=" + peerURL
+	cfg.EnableGRPCGateway = false
 
 	dir, err := testhook.TempDir(t, "leasedkv-*")
 	if err != nil {

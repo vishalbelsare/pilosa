@@ -10,13 +10,13 @@ import (
 	pilosa "github.com/featurebasedb/featurebase/v3"
 	"github.com/featurebasedb/featurebase/v3/pql"
 	"github.com/featurebasedb/featurebase/v3/testhook"
-	"github.com/featurebasedb/featurebase/v3/vprint"
-	"github.com/pkg/errors"
 )
 
 // Holder is a test wrapper for pilosa.Holder.
 type Holder struct {
 	*pilosa.Holder
+	tb     testing.TB
+	closed bool
 }
 
 // NewHolder returns a new instance of Holder with a temporary path.
@@ -26,10 +26,8 @@ func NewHolder(tb testing.TB) *Holder {
 		panic(err)
 	}
 
-	cfg := pilosa.DefaultHolderConfig()
-	cfg.StorageConfig.FsyncEnabled = false
-	cfg.RBFConfig.FsyncEnabled = false
-	h := &Holder{Holder: pilosa.NewHolder(path, cfg)}
+	cfg := pilosa.TestHolderConfig()
+	h := &Holder{Holder: pilosa.NewHolder(path, cfg), tb: tb}
 
 	return h
 }
@@ -38,13 +36,24 @@ func NewHolder(tb testing.TB) *Holder {
 func MustOpenHolder(tb testing.TB) *Holder {
 	h := NewHolder(tb)
 	if err := h.Open(); err != nil {
-		panic(err)
+		tb.Fatalf("opening holder: %v", err)
 	}
+	tb.Cleanup(func() {
+		err := h.Close()
+		if err != nil {
+			tb.Fatalf("closing holder after test: %v", err)
+		}
+	})
 	return h
 }
 
-// Close closes the holder. The data should be removed by the
+// Close closes the holder. The data should be removed by the cleanup
+// registered when we created the initial tempdir.
 func (h *Holder) Close() error {
+	if h.closed {
+		h.tb.Fatal("double-closed holder")
+	}
+	h.closed = true
 	return h.Holder.Close()
 }
 
@@ -56,9 +65,9 @@ func (h *Holder) Reopen() error {
 
 // MustCreateIndexIfNotExists returns a given index. Panic on error.
 func (h *Holder) MustCreateIndexIfNotExists(index string, opt pilosa.IndexOptions) *Index {
-	idx, err := h.Holder.CreateIndexIfNotExists(index, opt)
+	idx, err := h.Holder.CreateIndexIfNotExists(index, "", opt)
 	if err != nil {
-		panic(err)
+		h.tb.Fatalf("creating index: %v", err)
 	}
 	return &Index{Index: idx}
 }
@@ -66,59 +75,62 @@ func (h *Holder) MustCreateIndexIfNotExists(index string, opt pilosa.IndexOption
 // Row returns a Row for a given field.
 func (h *Holder) Row(index, field string, rowID uint64) *pilosa.Row {
 	idx := h.MustCreateIndexIfNotExists(index, pilosa.IndexOptions{})
-	f, err := idx.CreateFieldIfNotExists(field, pilosa.OptFieldTypeDefault())
+	f, err := idx.CreateFieldIfNotExists(field, "", pilosa.OptFieldTypeDefault())
 	if err != nil {
 		panic(err)
 	}
-	var tx pilosa.Tx
+	qcx := h.Txf().NewQcx()
+	defer qcx.Abort()
 
-	row, err := f.Row(tx, rowID)
+	row, err := f.Row(qcx, rowID)
 	if err != nil {
-		panic(err)
+		h.tb.Fatalf("retrieving row: %v", err)
 	}
 	// clone it so that mmapped storage doesn't disappear from under it
-	// once the tx goes away.
-	return row.Clone()
+	// once the qcx goes away.
+	return row
 }
 
 // ReadRow returns a Row for a given field. If the field does not exist,
-// it panics rather than creating the field.
+// it fails the holder's test rather than creating the field.
 func (h *Holder) ReadRow(index, field string, rowID uint64) *pilosa.Row {
 	idx := h.Holder.Index(index)
 	if idx == nil {
-		panic(errors.Wrap(pilosa.ErrIndexNotFound, index))
+		h.tb.Fatalf("read row from index %q: index not found", index)
 	}
 	f := idx.Field(field)
 	if f == nil {
-		panic(errors.Wrap(pilosa.ErrFieldNotFound, field))
+		h.tb.Fatalf("read row from field %q/%q: field not found", index, field)
 	}
-	var tx pilosa.Tx
+	qcx := h.Txf().NewQcx()
+	defer qcx.Abort()
 
-	row, err := f.Row(tx, rowID)
+	row, err := f.Row(qcx, rowID)
 	if err != nil {
-		panic(err)
+		h.tb.Fatalf("retrieving row: %v", err)
 	}
 
 	// clone it so that mmapped storage doesn't disappear from under it
-	// once the tx goes away.
+	// once the qcx goes away.
 	return row.Clone()
 }
 
 func (h *Holder) RowTime(index, field string, rowID uint64, t time.Time, quantum string) *pilosa.Row {
 	idx := h.MustCreateIndexIfNotExists(index, pilosa.IndexOptions{})
-	f, err := idx.CreateFieldIfNotExists(field, pilosa.OptFieldTypeDefault())
+	f, err := idx.CreateFieldIfNotExists(field, "", pilosa.OptFieldTypeDefault())
 	if err != nil {
 		panic(err)
 	}
-	var tx pilosa.Tx
+	qcx := h.Txf().NewQcx()
+	defer qcx.Abort()
 
-	row, err := f.RowTime(tx, rowID, t, quantum)
+	row, err := f.RowTime(qcx, rowID, t, quantum)
 	if err != nil {
 		panic(err)
 	}
 
 	// clone it so that mmapped storage doesn't disappear from under it
-	// once the tx goes away.
+	// once the qcx goes away.
 	return row.Clone()
 }
 
@@ -130,39 +142,43 @@ func (h *Holder) SetBit(index, field string, rowID, columnID uint64) {
 // SetBitTime sets a bit with timestamp on the given field.
 func (h *Holder) SetBitTime(index, field string, rowID, columnID uint64, t *time.Time) {
 	idx := h.MustCreateIndexIfNotExists(index, pilosa.IndexOptions{})
-	f, err := idx.CreateFieldIfNotExists(field, pilosa.OptFieldTypeDefault())
+	f, err := idx.CreateFieldIfNotExists(field, "", pilosa.OptFieldTypeDefault())
 	if err != nil {
 		panic(err)
 	}
 
-	shard := columnID / pilosa.ShardWidth
-	tx := idx.Index.Txf().NewTx(pilosa.Txo{Write: true, Index: idx.Index, Shard: shard})
-	defer tx.Rollback()
+	qcx := h.Txf().NewWritableQcx()
+	defer qcx.Abort()
 
-	_, err = f.SetBit(tx, rowID, columnID, t)
+	_, err = f.SetBit(qcx, rowID, columnID, t)
 	if err != nil {
-		panic(err)
+		h.tb.Fatalf("setting bit: %v", err)
 	}
-	vprint.PanicOn(tx.Commit())
+	err = qcx.Finish()
+	if err != nil {
+		h.tb.Fatalf("finishing qcx: %v", err)
+	}
 }
 
 // ClearBit clears a bit on the given field.
 func (h *Holder) ClearBit(index, field string, rowID, columnID uint64) {
 	idx := h.MustCreateIndexIfNotExists(index, pilosa.IndexOptions{})
-	f, err := idx.CreateFieldIfNotExists(field, pilosa.OptFieldTypeDefault())
+	f, err := idx.CreateFieldIfNotExists(field, "", pilosa.OptFieldTypeDefault())
 	if err != nil {
 		panic(err)
 	}
 
-	shard := columnID / pilosa.ShardWidth
-	tx := idx.Index.Txf().NewTx(pilosa.Txo{Write: true, Index: idx.Index, Shard: shard})
-	defer tx.Rollback()
+	qcx := h.Txf().NewWritableQcx()
+	defer qcx.Abort()
 
-	_, err = f.ClearBit(tx, rowID, columnID)
+	_, err = f.ClearBit(qcx, rowID, columnID)
 	if err != nil {
-		panic(err)
+		h.tb.Fatalf("clearing bit: %v", err)
 	}
-	vprint.PanicOn(tx.Commit())
+	err = qcx.Finish()
+	if err != nil {
+		h.tb.Fatalf("finishing qcx: %v", err)
+	}
 }
 
 // MustSetBits sets columns on a row. Panic on error.
@@ -176,20 +192,21 @@ func (h *Holder) MustSetBits(index, field string, rowID uint64, columnIDs ...uin
 // SetValue sets an integer value on the given field.
 func (h *Holder) SetValue(index, field string, columnID uint64, value int64) *Index {
 	idx := h.MustCreateIndexIfNotExists(index, pilosa.IndexOptions{})
-	f, err := idx.CreateFieldIfNotExists(field, pilosa.OptFieldTypeInt(math.MinInt64, math.MaxInt64))
+	f, err := idx.CreateFieldIfNotExists(field, "", pilosa.OptFieldTypeInt(math.MinInt64, math.MaxInt64))
 	if err != nil {
 		panic(err)
 	}
-	shard := columnID / pilosa.ShardWidth
-	tx := idx.Index.Txf().NewTx(pilosa.Txo{Write: true, Index: idx.Index, Shard: shard})
-	defer tx.Rollback()
 
-	_, err = f.SetValue(tx, columnID, value)
+	qcx := h.Txf().NewWritableQcx()
+	defer qcx.Abort()
+	_, err = f.SetValue(qcx, columnID, value)
 	if err != nil {
-		panic(err)
+		h.tb.Fatalf("setting value: %v", err)
 	}
-	if err := tx.Commit(); err != nil {
-		panic(err)
+
+	err = qcx.Finish()
+	if err != nil {
+		h.tb.Fatalf("finishing qcx: %v", err)
 	}
 	return idx
 }
@@ -197,15 +214,15 @@ func (h *Holder) SetValue(index, field string, columnID uint64, value int64) *In
 // Value returns the integer value for a given column.
 func (h *Holder) Value(index, field string, columnID uint64) (int64, bool) {
 	idx := h.MustCreateIndexIfNotExists(index, pilosa.IndexOptions{})
-	f, err := idx.CreateFieldIfNotExists(field, pilosa.OptFieldTypeInt(math.MinInt64, math.MaxInt64))
+	f, err := idx.CreateFieldIfNotExists(field, "", pilosa.OptFieldTypeInt(math.MinInt64, math.MaxInt64))
 	if err != nil {
 		panic(err)
 	}
-	shard := columnID / pilosa.ShardWidth
-	tx := idx.Index.Txf().NewTx(pilosa.Txo{Write: false, Index: idx.Index, Shard: shard})
-	defer tx.Rollback()
 
-	val, exists, err := f.Value(tx, columnID)
+	qcx := h.Txf().NewQcx()
+	defer qcx.Abort()
+
+	val, exists, err := f.Value(qcx, columnID)
 	if err != nil {
 		panic(err)
 	}
@@ -216,7 +233,7 @@ func (h *Holder) Value(index, field string, columnID uint64) (int64, bool) {
 // on the given range.
 func (h *Holder) Range(index, field string, op pql.Token, predicate int64) *pilosa.Row {
 	idx := h.MustCreateIndexIfNotExists(index, pilosa.IndexOptions{})
-	f, err := idx.CreateFieldIfNotExists(field, pilosa.OptFieldTypeInt(math.MinInt64, math.MaxInt64))
+	f, err := idx.CreateFieldIfNotExists(field, "", pilosa.OptFieldTypeInt(math.MinInt64, math.MaxInt64))
 	if err != nil {
 		panic(err)
 	}
@@ -230,6 +247,6 @@ func (h *Holder) Range(index, field string, op pql.Token, predicate int64) *pilo
 	}
 
 	// clone it so that mmapped storage doesn't disappear from under it
-	// once the tx goes away.
+	// once the qcx goes away.
 	return row.Clone()
 }

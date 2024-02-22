@@ -3,17 +3,52 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 
 	pilosa "github.com/featurebasedb/featurebase/v3"
+	"github.com/featurebasedb/featurebase/v3/ctl"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
 
-func NewRootCommand(stdin io.Reader, stdout, stderr io.Writer) *cobra.Command {
+// runner represents a thing, like any of the NewFooCommand we produce
+// in ctl/*.go, which has a Run(context) error method, which is used
+// to implement a command. We use this so we can just specify the
+// object, rather than its run method, in calling usageErrorWrapper.
+type runner interface {
+	Run(context.Context) error
+}
+
+// UsageErrorWrapper takes a thing with a Run(context) error, and produces
+// a func(*cobra.Command, []string) error from it which will run that
+// command, and then set Cobra's SilenceUsage flag unless the returned
+// error errors.Is() a ctl.UsageError.
+func UsageErrorWrapper(inner runner) func(*cobra.Command, []string) error {
+	return func(c *cobra.Command, args []string) error {
+		return considerUsageError(c, inner.Run(context.Background()))
+	}
+}
+
+// considerUsageError sets a command to silence usage errors if
+// the given error is not a ctl.UsageError, then returns the
+// unmodified error. It's here to let us write one-liner Run
+// wrappers.
+func considerUsageError(cmd *cobra.Command, err error) error {
+	cmd.SilenceErrors = true
+	if !errors.Is(err, ctl.ErrUsage) {
+		cmd.SilenceUsage = true
+	}
+	return err
+}
+
+func NewRootCommand(stderr io.Writer) *cobra.Command {
+	logdest := logger.NewStandardLogger(stderr)
 	rc := &cobra.Command{
 		Use: "featurebase",
 		// TODO: These short/long descriptions could use some updating.
@@ -28,8 +63,12 @@ at https://docs.featurebase.com/.
 ` + pilosa.VersionInfo(true) + "\n",
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			v := viper.New()
-			err := setAllConfig(v, cmd.Flags())
-			if err != nil {
+
+			switch cmd.Use {
+			case "dax":
+				v.Set("future.rename", true) // always use FEATUREBASE env for dax
+			}
+			if err := SetAllConfig(v, cmd.Flags(), ""); err != nil {
 				return err
 			}
 
@@ -46,50 +85,57 @@ at https://docs.featurebase.com/.
 
 			return nil
 		},
+		SilenceErrors: true,
 	}
 	rc.PersistentFlags().Bool("dry-run", false, "stop before executing")
 	_ = rc.PersistentFlags().MarkHidden("dry-run")
 	rc.PersistentFlags().StringP("config", "c", "", "Configuration file to read from.")
 
-	rc.AddCommand(newChkSumCommand(stdin, stdout, stderr))
-	rc.AddCommand(newBackupCommand(stdin, stdout, stderr))
-	rc.AddCommand(newRestoreCommand(stdin, stdout, stderr))
-	rc.AddCommand(newConfigCommand(stdin, stdout, stderr))
-	rc.AddCommand(newExportCommand(stdin, stdout, stderr))
-	rc.AddCommand(newGenerateConfigCommand(stdin, stdout, stderr))
-	rc.AddCommand(newImportCommand(stdin, stdout, stderr))
-	rc.AddCommand(newAuthTokenCommand(stdin, stdout, stderr))
-	rc.AddCommand(newRBFCommand(stdin, stdout, stderr))
-	rc.AddCommand(newServeCmd(stdin, stdout, stderr))
-	rc.AddCommand(newHolderCmd(stdin, stdout, stderr))
-	rc.AddCommand(newHolderCmd(stdin, stdout, stderr))
-	rc.AddCommand(newKeygenCommand(stdin, stdout, stderr))
+	rc.AddCommand(newChkSumCommand(logdest))
+	rc.AddCommand(newBackupCommand(logdest))
+	rc.AddCommand(newRestoreCommand(logdest))
+	rc.AddCommand(newBackupTarCommand(stderr))
+	rc.AddCommand(newRestoreTarCommand(logdest))
+	rc.AddCommand(newConfigCommand(stderr))
+	rc.AddCommand(newExportCommand(logdest))
+	rc.AddCommand(newGenerateConfigCommand(logdest))
+	rc.AddCommand(newImportCommand(logdest))
+	rc.AddCommand(newAuthTokenCommand(logdest))
+	rc.AddCommand(newRBFCommand(logdest))
+	rc.AddCommand(newServeCmd(stderr))
+	rc.AddCommand(newHolderCmd(stderr))
+	rc.AddCommand(newKeygenCommand(logdest))
+	rc.AddCommand(newDAXCommand(stderr))
+	rc.AddCommand(newDataframeCsvLoaderCommand(logdest))
+	rc.AddCommand(newPreSortCommand(logdest))
+	rc.AddCommand(newParquetInfoCommand(logdest))
 
 	rc.SetOutput(stderr)
 	return rc
 }
 
-// setAllConfig takes a FlagSet to be the definition of all configuration
+// SetAllConfig takes a FlagSet to be the definition of all configuration
 // options, as well as their defaults. It then reads from the command line, the
 // environment, and a config file (if specified), and applies the configuration
 // in that priority order. Since each flag in the set contains a pointer to
-// where its value should be stored, setAllConfig can directly modify the value
+// where its value should be stored, SetAllConfig can directly modify the value
 // of each config variable.
 //
-// setAllConfig looks for environment variables which are capitalized versions
+// SetAllConfig looks for environment variables which are capitalized versions
 // of the flag names with dashes replaced by underscores, and prefixed with
 // envPrefix plus an underscore.
-func setAllConfig(v *viper.Viper, flags *pflag.FlagSet) error { // nolint: unparam
+func SetAllConfig(v *viper.Viper, flags *pflag.FlagSet, envPrefix string) error { // nolint: unparam
 	// add cmd line flag def to viper
 	err := v.BindPFlags(flags)
 	if err != nil {
 		return err
 	}
 
-	envPrefix := "PILOSA"
-	rename := v.GetBool("future.rename")
-	if rename {
-		envPrefix = "FEATUREBASE"
+	if envPrefix == "" {
+		envPrefix = "PILOSA"
+		if v.GetBool("future.rename") {
+			envPrefix = "FEATUREBASE"
+		}
 	}
 
 	// add env to viper
@@ -115,10 +161,12 @@ func setAllConfig(v *viper.Viper, flags *pflag.FlagSet) error { // nolint: unpar
 
 		for _, key := range v.AllKeys() {
 			if _, ok := validTags[key]; !ok {
+				if key == "future.rename" {
+					continue
+				}
 				return fmt.Errorf("invalid option in configuration file: %v", key)
 			}
 		}
-
 	}
 
 	// set all values from viper

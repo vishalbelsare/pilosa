@@ -16,7 +16,6 @@ import (
 	txkey "github.com/featurebasedb/featurebase/v3/short_txkey"
 	"github.com/featurebasedb/featurebase/v3/storage"
 
-	"github.com/featurebasedb/featurebase/v3/vprint"
 	"github.com/pkg/errors"
 )
 
@@ -68,7 +67,6 @@ func (w *RbfDBWrapper) CleanupTx(tx Tx) {
 // rbfDBRegistrar also allows opening the same path twice to
 // result in sharing the same open database handle, and
 // thus the same transactional guarantees.
-//
 type rbfDBRegistrar struct {
 	mu sync.Mutex
 	mp map[*RbfDBWrapper]bool
@@ -220,14 +218,99 @@ func (tx *RBFTx) Remove(index, field, view string, shard uint64, a ...uint64) (c
 	return tx.addOrRemove(index, field, view, shard, true, a...)
 }
 
+// Removed clears the specified bits and tells you which ones it actually removed.
+func (tx *RBFTx) Removed(index, field, view string, shard uint64, a ...uint64) (changed []uint64, err error) {
+	if len(a) == 0 {
+		return a, nil
+	}
+	name := rbfName(index, field, view, shard)
+	// this special case can/should possibly go away, except that it
+	// turns out to be by far the most common case, and we need to know
+	// there's at least two items to simplify the check-sorted thing.
+	if len(a) == 1 {
+		hi, lo := highbits(a[0]), lowbits(a[0])
+		rc, err := tx.tx.Container(name, hi)
+		if err != nil {
+			return a[:0], errors.Wrap(err, "failed to retrieve container")
+		}
+		if rc.N() == 0 {
+			return a[:0], nil
+		}
+		rc1, chng := rc.Remove(lo)
+		if !chng {
+			return a[:0], nil
+		}
+		if rc1.N() == 0 {
+			err = tx.tx.RemoveContainer(name, hi)
+		} else {
+			err = tx.tx.PutContainer(name, hi, rc1)
+		}
+		if err != nil {
+			return a[:0], err
+		}
+		return a[:1], nil
+	}
+
+	changeCount := 0
+	changed = a
+
+	var lastHi uint64 = math.MaxUint64 // highbits is always less than this starter.
+	var rc *roaring.Container
+	var hi uint64
+	var lo uint16
+
+	for i, v := range a {
+		hi, lo = highbits(v), lowbits(v)
+		if hi != lastHi {
+			// either first time through, or changed to a different container.
+			// do we need put the last updated container now?
+			if i > 0 {
+				// not first time through, write what we got.
+				if rc == nil || rc.N() == 0 {
+					err = tx.tx.RemoveContainer(name, lastHi)
+					if err != nil {
+						return a[:0], errors.Wrap(err, "failed to remove container")
+					}
+				} else {
+					err = tx.tx.PutContainer(name, lastHi, rc)
+					if err != nil {
+						return a[:0], errors.Wrap(err, "failed to put container")
+					}
+				}
+			}
+			// get the next container
+			rc, err = tx.tx.Container(name, hi)
+			if err != nil {
+				return a[:0], errors.Wrap(err, "failed to retrieve container")
+			}
+		} // else same container, keep adding bits to rct.
+		chng := false
+		rc, chng = rc.Remove(lo)
+		if chng {
+			changed[changeCount] = v
+			changeCount++
+		}
+		lastHi = hi
+	}
+	// write the last updates.
+
+	if rc == nil || rc.N() == 0 {
+		err = tx.tx.RemoveContainer(name, hi)
+		if err != nil {
+			return a[:0], errors.Wrap(err, "failed to remove container")
+		}
+	} else {
+		err = tx.tx.PutContainer(name, hi, rc)
+		if err != nil {
+			return a[:0], errors.Wrap(err, "failed to put container")
+		}
+	}
+	return changed[:changeCount], nil
+}
+
 // sortedParanoia is a flag to enable a check for unsorted inputs to addOrRemove,
 // which is expensive in practice and only really useful occasionally.
 const sortedParanoia = false
-
-type countResults struct {
-	changeCount int
-	err         error
-}
 
 func (tx *RBFTx) addOrRemove(index, field, view string, shard uint64, remove bool, a ...uint64) (changeCount int, err error) {
 	if len(a) == 0 {
@@ -368,14 +451,6 @@ func (tx *RBFTx) ContainerIterator(index, field, view string, shard uint64, key 
 	return tx.tx.ContainerIterator(rbfName(index, field, view, shard), key)
 }
 
-func (tx *RBFTx) ForEach(index, field, view string, shard uint64, fn func(i uint64) error) error {
-	return tx.tx.ForEach(rbfName(index, field, view, shard), fn)
-}
-
-func (tx *RBFTx) ForEachRange(index, field, view string, shard uint64, start, end uint64, fn func(uint64) error) error {
-	return tx.tx.ForEachRange(rbfName(index, field, view, shard), start, end, fn)
-}
-
 func (tx *RBFTx) Count(index, field, view string, shard uint64) (uint64, error) {
 	return tx.tx.Count(rbfName(index, field, view, shard))
 }
@@ -402,18 +477,14 @@ func (tx *RBFTx) ImportRoaringBits(index, field, view string, shard uint64, rit 
 	return tx.tx.ImportRoaringBits(rbfName(index, field, view, shard), rit, clear, log, rowSize)
 }
 
-func (tx *RBFTx) NewTxIterator(index, field, view string, shard uint64) *roaring.Iterator {
-	b, err := tx.RoaringBitmap(index, field, view, shard)
-	vprint.PanicOn(err)
-	return b.Iterator()
-}
-
 func (tx *RBFTx) ApplyFilter(index, field, view string, shard uint64, ckey uint64, filter roaring.BitmapFilter) (err error) {
-	return tx.tx.ApplyFilter(rbfName(index, field, view, shard), ckey, filter)
+	err = tx.tx.ApplyFilter(rbfName(index, field, view, shard), ckey, filter)
+	return errors.Wrap(err, fmt.Sprintf("applying  filter for index %s, field %s, view %s, shard %d", index, field, view, shard))
 }
 
 func (tx *RBFTx) ApplyRewriter(index, field, view string, shard uint64, ckey uint64, filter roaring.BitmapRewriter) (err error) {
-	return tx.tx.ApplyRewriter(rbfName(index, field, view, shard), ckey, filter)
+	err = tx.tx.ApplyRewriter(rbfName(index, field, view, shard), ckey, filter)
+	return errors.Wrap(err, fmt.Sprintf("applying rewriter for index %s, field %s, view %s, shard %d", index, field, view, shard))
 }
 
 func (tx *RBFTx) GetSortedFieldViewList(idx *Index, shard uint64) (fvs []txkey.FieldView, err error) {

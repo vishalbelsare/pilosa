@@ -27,10 +27,6 @@ func init() {
 
 var _ Tx = (*catcherTx)(nil)
 
-func (c *catcherTx) NewTxIterator(index, field, view string, shard uint64) *roaring.Iterator {
-	return c.b.NewTxIterator(index, field, view, shard)
-}
-
 func (c *catcherTx) ImportRoaringBits(index, field, view string, shard uint64, rit roaring.RoaringIterator, clear bool, log bool, rowSize uint64) (changed int, rowSet map[uint64]int, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -128,6 +124,17 @@ func (c *catcherTx) Remove(index, field, view string, shard uint64, a ...uint64)
 	return c.b.Remove(index, field, view, shard, a...)
 }
 
+func (c *catcherTx) Removed(index, field, view string, shard uint64, a ...uint64) (changed []uint64, err error) {
+
+	defer func() {
+		if r := recover(); r != nil {
+			vprint.AlwaysPrintf("see Removed() PanicOn '%v' at '%v'", r, vprint.Stack())
+			vprint.PanicOn(r)
+		}
+	}()
+	return c.b.Removed(index, field, view, shard, a...)
+}
+
 func (c *catcherTx) Contains(index, field, view string, shard uint64, key uint64) (exists bool, err error) {
 
 	defer func() {
@@ -148,28 +155,6 @@ func (c *catcherTx) ContainerIterator(index, field, view string, shard uint64, f
 		}
 	}()
 	return c.b.ContainerIterator(index, field, view, shard, firstRoaringContainerKey)
-}
-
-func (c *catcherTx) ForEach(index, field, view string, shard uint64, fn func(i uint64) error) error {
-
-	defer func() {
-		if r := recover(); r != nil {
-			vprint.AlwaysPrintf("see ForEach() PanicOn '%v' at '%v'", r, vprint.Stack())
-			vprint.PanicOn(r)
-		}
-	}()
-	return c.b.ForEach(index, field, view, shard, fn)
-}
-
-func (c *catcherTx) ForEachRange(index, field, view string, shard uint64, start, end uint64, fn func(uint64) error) error {
-
-	defer func() {
-		if r := recover(); r != nil {
-			vprint.AlwaysPrintf("see ForEachRange() PanicOn '%v' at '%v'", r, vprint.Stack())
-			vprint.PanicOn(r)
-		}
-	}()
-	return c.b.ForEachRange(index, field, view, shard, start, end, fn)
 }
 
 func (c *catcherTx) Count(index, field, view string, shard uint64) (uint64, error) {
@@ -243,6 +228,6 @@ func (c *catcherTx) GetSortedFieldViewList(idx *Index, shard uint64) (fvs []txke
 	return c.b.GetSortedFieldViewList(idx, shard)
 }
 
-func (tx *catcherTx) GetFieldSizeBytes(index, field string) (uint64, error) {
+func (c *catcherTx) GetFieldSizeBytes(index, field string) (uint64, error) {
 	return 0, nil
 }

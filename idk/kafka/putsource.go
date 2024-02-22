@@ -15,13 +15,13 @@ import (
 	"time"
 
 	confluent "github.com/confluentinc/confluent-kafka-go/kafka"
-	"github.com/go-avro/avro"
-	liavro "github.com/linkedin/goavro/v2"
 	"github.com/featurebasedb/featurebase/v3/idk"
 	"github.com/featurebasedb/featurebase/v3/idk/common"
 	"github.com/featurebasedb/featurebase/v3/idk/kafka/csrc"
 	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/featurebasedb/featurebase/v3/pql"
+	"github.com/go-avro/avro"
+	liavro "github.com/linkedin/goavro/v2"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -181,7 +181,7 @@ func (p *PutSource) Run() error {
 
 func convertToJson(schema []idk.Field, record []interface{}) ([]byte, error) {
 	if len(schema) != len(record) {
-		return []byte{}, fmt.Errorf("Length of schema %v and record %v don't match", len(schema), len(record))
+		return []byte{}, fmt.Errorf("length of schema %v and record %v don't match", len(schema), len(record))
 	}
 	mesg := make(map[string]interface{})
 	for i := range schema {

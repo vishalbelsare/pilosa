@@ -13,11 +13,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/featurebasedb/featurebase/v3/dax"
 	"github.com/featurebasedb/featurebase/v3/disco"
 	"github.com/featurebasedb/featurebase/v3/logger"
 	rbfcfg "github.com/featurebasedb/featurebase/v3/rbf/cfg"
 	"github.com/featurebasedb/featurebase/v3/roaring"
-	"github.com/featurebasedb/featurebase/v3/stats"
 	"github.com/featurebasedb/featurebase/v3/storage"
 	"github.com/featurebasedb/featurebase/v3/testhook"
 	"github.com/featurebasedb/featurebase/v3/vprint"
@@ -40,6 +40,9 @@ const (
 
 	// FieldsDir is the default fields directory used by each index.
 	FieldsDir = "fields"
+
+	// DataframesDir is the directory where we store the dataframe files (currently Apache Arrow)
+	DataframesDir = "dataframes"
 )
 
 func init() {
@@ -65,7 +68,7 @@ type Holder struct {
 	opened lockedChan
 
 	broadcaster broadcaster
-	schemator   disco.Schemator
+	Schemator   disco.Schemator
 	sharder     disco.Sharder
 	serializer  Serializer
 
@@ -75,9 +78,6 @@ type Holder struct {
 	// Close management
 	wg      sync.WaitGroup
 	closing chan struct{}
-
-	// Stats
-	Stats stats.StatsClient
 
 	// Data directory path.
 	path string
@@ -132,6 +132,17 @@ type Holder struct {
 	// on holding mu.
 	imu     sync.RWMutex
 	indexes map[string]*Index
+
+	// directive is the latest directive applied to the node.
+	directive *dax.Directive
+
+	// directiveApplied is used for testing (in an attempt to avoid sleeps). It
+	// should be removed once we sort out the logic between controller and
+	// computer nodes. For example, the Controller really needs to send out
+	// directives asynchronously and allow a computer to load data from
+	// snapshotter/writelogger; then the Controller should only start directing
+	// queries to that computer once it has completed applying the snapshot.
+	directiveApplied bool
 }
 
 // HolderOpts holds information about the holder which other things might want
@@ -140,6 +151,49 @@ type HolderOpts struct {
 	// StorageBackend controls the tx/storage engine we instatiate. Set by
 	// server.go OptServerStorageConfig
 	StorageBackend string
+}
+
+func (h *Holder) Directive() dax.Directive {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.directive == nil {
+		return dax.Directive{}
+	}
+	return *h.directive
+}
+
+func (h *Holder) SetDirective(d *dax.Directive) {
+	if d == nil {
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Only set the cached directive if the incoming version is newer than that
+	// of the existing directive's version.
+	if h.directive == nil || d.Version > h.directive.Version {
+		h.directive = d
+		h.directiveApplied = false
+	}
+}
+
+// DirectiveApplied returns true if the Holder's latest directive has been fully
+// applied and is safe for queries. This is primarily used in testing and will
+// likely evolve to something smarter.
+func (h *Holder) DirectiveApplied() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.directiveApplied
+}
+
+// SetDirectiveApplied sets the value of directiveApplied. See the node on the
+// DirectiveApplied method.
+func (h *Holder) SetDirectiveApplied(a bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.directiveApplied = a
 }
 
 func (h *Holder) StartTransaction(ctx context.Context, id string, timeout time.Duration, exclusive bool) (*Transaction, error) {
@@ -174,14 +228,14 @@ type lockedChan struct {
 
 func (lc *lockedChan) Close() {
 	lc.mu.RLock()
+	defer lc.mu.RUnlock()
 	close(lc.ch)
-	lc.mu.RUnlock()
 }
 
 func (lc *lockedChan) Recv() {
 	lc.mu.RLock()
+	defer lc.mu.RUnlock()
 	<-lc.ch
-	lc.mu.RUnlock()
 }
 
 // HolderConfig holds configuration details that need to be set up at
@@ -199,16 +253,18 @@ type HolderConfig struct {
 	Schemator            disco.Schemator
 	Sharder              disco.Sharder
 	CacheFlushInterval   time.Duration
-	StatsClient          stats.StatsClient
 	Logger               logger.Logger
 
-	StorageConfig       *storage.Config
-	RBFConfig           *rbfcfg.Config
-	AntiEntropyInterval time.Duration
+	StorageConfig *storage.Config
+	RBFConfig     *rbfcfg.Config
 
 	LookupDBDSN string
 }
 
+// DefaultHolderConfig provides a holder config with reasonable
+// defaults. Note that a production server would almost certainly
+// need to override these; that's usually handled by server options
+// such as OptServerOpenTranslateStore.
 func DefaultHolderConfig() *HolderConfig {
 	return &HolderConfig{
 		PartitionN:           disco.DefaultPartitionN,
@@ -219,13 +275,26 @@ func DefaultHolderConfig() *HolderConfig {
 		TranslationSyncer:    NopTranslationSyncer,
 		Serializer:           GobSerializer,
 		Schemator:            disco.NewInMemSchemator(),
-		Sharder:              disco.InMemSharder,
+		Sharder:              disco.NewInMemSharder(),
 		CacheFlushInterval:   defaultCacheFlushInterval,
-		StatsClient:          stats.NopStatsClient,
 		Logger:               logger.NopLogger,
 		StorageConfig:        storage.NewDefaultConfig(),
 		RBFConfig:            rbfcfg.NewDefaultConfig(),
 	}
+}
+
+// TestHolderConfig provides a holder config with reasonable
+// defaults for tests. This means it tries to disable fsync
+// and sets significantly smaller file size limits for RBF,
+// for instance. Do not use this outside of the test
+// infrastructure.
+func TestHolderConfig() *HolderConfig {
+	cfg := DefaultHolderConfig()
+	cfg.StorageConfig.FsyncEnabled = false
+	cfg.RBFConfig.FsyncEnabled = false
+	cfg.RBFConfig.MaxSize = (1 << 28)
+	cfg.RBFConfig.MaxWALSize = (1 << 28)
+	return cfg
 }
 
 // NewHolder returns a new instance of Holder for the given path.
@@ -249,7 +318,6 @@ func NewHolder(path string, cfg *HolderConfig) *Holder {
 		broadcaster: NopBroadcaster,
 
 		partitionN:           cfg.PartitionN,
-		Stats:                cfg.StatsClient,
 		cacheFlushInterval:   cfg.CacheFlushInterval,
 		OpenTranslateStore:   cfg.OpenTranslateStore,
 		OpenTranslateReader:  cfg.OpenTranslateReader,
@@ -258,7 +326,7 @@ func NewHolder(path string, cfg *HolderConfig) *Holder {
 		translationSyncer:    cfg.TranslationSyncer,
 		serializer:           cfg.Serializer,
 		sharder:              cfg.Sharder,
-		schemator:            cfg.Schemator,
+		Schemator:            cfg.Schemator,
 		Logger:               cfg.Logger,
 		Opts:                 HolderOpts{StorageBackend: cfg.StorageConfig.Backend},
 
@@ -295,7 +363,7 @@ func (h *Holder) deletePerShard(index *Index, shard uint64) error {
 		return nil
 	}
 
-	tx := index.Txf().NewTx(Txo{Write: !writable, Index: index, Shard: shard})
+	tx := h.Txf().NewTx(Txo{Write: !writable, Index: index, Shard: shard})
 	defer tx.Rollback()
 
 	// filter rows based on having _exists>=1, which is used to flag delete in-flight
@@ -377,7 +445,7 @@ func (h *Holder) Open() error {
 	h.closing = make(chan struct{})
 
 	h.Logger.Printf("open holder path: %s", h.path)
-	if err := os.MkdirAll(h.IndexesPath(), 0750); err != nil {
+	if err := os.MkdirAll(h.IndexesPath(), 0o750); err != nil {
 		return errors.Wrap(err, "creating directory")
 	}
 
@@ -395,7 +463,7 @@ func (h *Holder) Open() error {
 	}
 
 	// Load schema from etcd.
-	schema, err := h.schemator.Schema(context.Background())
+	schema, err := h.Schemator.Schema(context.Background())
 	if err != nil {
 		return errors.Wrap(err, "getting schema")
 	}
@@ -418,14 +486,17 @@ func (h *Holder) Open() error {
 			return errors.Wrap(err, "opening index")
 		}
 
-		// Since we don't have createdAt stored on disk within the data
+		// Since we don't have createdAt and the other metadata stored on disk within the data
 		// directory, we need to populate it from the etcd schema data.
+
 		// TODO: we may no longer need the createdAt value stored in memory on
 		// the index struct; it may only be needed in the schema return value
 		// from the API, which already comes from etcd. In that case, this logic
 		// could be removed, and the createdAt on the index struct could be
 		// removed.
 		index.createdAt = cim.CreatedAt
+		index.owner = cim.Owner
+		index.description = cim.Meta.Description
 
 		err = index.OpenWithSchema(idx)
 		if err != nil {
@@ -448,8 +519,6 @@ func (h *Holder) Open() error {
 
 	// Check if deletion was in progress when server was shutdown
 	h.processDeleteInflight()
-
-	h.Stats.Open()
 
 	h.opened.Close()
 
@@ -478,7 +547,6 @@ func (h *Holder) Open() error {
 	h.Logger.Printf("open holder: complete")
 
 	return nil
-
 }
 
 func (h *Holder) sendOrSpool(msg Message) error {
@@ -551,8 +619,6 @@ func (h *Holder) Close() error {
 	if globalUseStatTx {
 		fmt.Printf("%v\n", globalCallStats.report())
 	}
-
-	h.Stats.Close()
 
 	// Notify goroutines of closing and wait for completion.
 	close(h.closing)
@@ -644,9 +710,9 @@ func (h *Holder) limitedSchema() ([]*IndexInfo, error) {
 }
 
 func (h *Holder) schema(ctx context.Context, includeViews bool) ([]*IndexInfo, error) {
-	schema, err := h.schemator.Schema(ctx)
+	schema, err := h.Schemator.Schema(ctx)
 	if err != nil {
-		return nil, errors.Wrapf(err, "getting schema via schemator")
+		return nil, errors.Wrapf(err, "getting schema via Schemator")
 	}
 
 	a := make([]*IndexInfo, 0, len(schema))
@@ -660,10 +726,13 @@ func (h *Holder) schema(ctx context.Context, includeViews bool) ([]*IndexInfo, e
 		di := &IndexInfo{
 			Name:       cim.Index,
 			CreatedAt:  cim.CreatedAt,
+			Owner:      cim.Owner,
 			Options:    cim.Meta,
 			ShardWidth: ShardWidth,
 			Fields:     make([]*FieldInfo, 0, len(index.Fields)),
 		}
+		updatedAt := cim.CreatedAt
+		lastUpdateUser := cim.Owner
 		for fieldName, field := range index.Fields {
 			if fieldName == existenceFieldName {
 				continue
@@ -672,9 +741,14 @@ func (h *Holder) schema(ctx context.Context, includeViews bool) ([]*IndexInfo, e
 			if err != nil {
 				return nil, errors.Wrap(err, "decoding CreateFieldMessage")
 			}
+			if cfm.CreatedAt > updatedAt {
+				updatedAt = cfm.CreatedAt
+				lastUpdateUser = cfm.Owner
+			}
 			fi := &FieldInfo{
 				Name:      cfm.Field,
 				CreatedAt: cfm.CreatedAt,
+				Owner:     cfm.Owner,
 				Options:   *cfm.Meta,
 			}
 			if includeViews {
@@ -685,6 +759,8 @@ func (h *Holder) schema(ctx context.Context, includeViews bool) ([]*IndexInfo, e
 			}
 			di.Fields = append(di.Fields, fi)
 		}
+		di.UpdatedAt = updatedAt
+		di.LastUpdateUser = lastUpdateUser
 		sort.Sort(fieldInfoSlice(di.Fields))
 		a = append(a, di)
 	}
@@ -698,14 +774,14 @@ func (h *Holder) applySchema(schema *Schema) error {
 	// We use h.CreateIndex() instead of h.CreateIndexIfNotExists() because we
 	// want to limit the use of this method for now to only new indexes.
 	for _, i := range schema.Indexes {
-		idx, err := h.CreateIndex(i.Name, i.Options)
+		idx, err := h.CreateIndex(i.Name, i.Owner, i.Options)
 		if err != nil {
 			return errors.Wrap(err, "creating index")
 		}
 
 		// Create fields that don't exist.
 		for _, f := range i.Fields {
-			fld, err := idx.CreateFieldIfNotExistsWithOptions(f.Name, &f.Options)
+			fld, err := idx.CreateFieldIfNotExistsWithOptions(f.Name, "", &f.Options)
 			if err != nil {
 				return errors.Wrap(err, "creating field")
 			}
@@ -757,7 +833,7 @@ func (h *Holder) Indexes() []*Index {
 
 // CreateIndex creates an index.
 // An error is returned if the index already exists.
-func (h *Holder) CreateIndex(name string, opt IndexOptions) (*Index, error) {
+func (h *Holder) CreateIndex(name string, requestUserID string, opt IndexOptions) (*Index, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -766,9 +842,11 @@ func (h *Holder) CreateIndex(name string, opt IndexOptions) (*Index, error) {
 		return nil, newConflictError(ErrIndexExists)
 	}
 
+	ts := timestamp()
 	cim := &CreateIndexMessage{
 		Index:     name,
-		CreatedAt: timestamp(),
+		CreatedAt: ts,
+		Owner:     requestUserID,
 		Meta:      opt,
 	}
 
@@ -784,7 +862,7 @@ func (h *Holder) CreateIndex(name string, opt IndexOptions) (*Index, error) {
 // latest schema from etcd.
 type LoadSchemaMessage struct{}
 
-// LoadSchema creates all indexes based on the information stored in schemator.
+// LoadSchema creates all indexes based on the information stored in Schemator.
 // It does not return an error if an index already exists. The thinking is that
 // this method will load all indexes that don't already exist. We likely want to
 // revisit this; for example, we might want to confirm that the createdAt
@@ -796,7 +874,7 @@ func (h *Holder) LoadSchema() error {
 	return h.loadSchema()
 }
 
-// LoadIndex creates an index based on the information stored in schemator.
+// LoadIndex creates an index based on the information stored in Schemator.
 // An error is returned if the index already exists.
 func (h *Holder) LoadIndex(name string) (*Index, error) {
 	h.mu.Lock()
@@ -809,7 +887,7 @@ func (h *Holder) LoadIndex(name string) (*Index, error) {
 	return h.loadIndex(name)
 }
 
-// LoadField creates a field based on the information stored in schemator.
+// LoadField creates a field based on the information stored in Schemator.
 // An error is returned if the field already exists.
 func (h *Holder) LoadField(index, field string) (*Field, error) {
 	// Ensure field doesn't already exist.
@@ -823,7 +901,7 @@ func (h *Holder) LoadField(index, field string) (*Field, error) {
 	return h.loadField(index, field)
 }
 
-// LoadView creates a view based on the information stored in schemator. Unlike
+// LoadView creates a view based on the information stored in Schemator. Unlike
 // index and field, it is not considered an error if the view already exists.
 func (h *Holder) LoadView(index, field, view string) (*view, error) {
 	// If the view already exists, just return with it here.
@@ -856,13 +934,15 @@ func (h *Holder) CreateIndexAndBroadcast(ctx context.Context, cim *CreateIndexMe
 
 // CreateIndexIfNotExists returns an index by name.
 // The index is created if it does not already exist.
-func (h *Holder) CreateIndexIfNotExists(name string, opt IndexOptions) (*Index, error) {
+func (h *Holder) CreateIndexIfNotExists(name string, requestUserID string, opt IndexOptions) (*Index, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	ts := timestamp()
 	cim := &CreateIndexMessage{
 		Index:     name,
-		CreatedAt: timestamp(),
+		CreatedAt: ts,
+		Owner:     requestUserID,
 		Meta:      opt,
 	}
 
@@ -893,7 +973,7 @@ func (h *Holder) persistIndex(ctx context.Context, cim *CreateIndexMessage) erro
 
 	if b, err := h.serializer.Marshal(cim); err != nil {
 		return errors.Wrap(err, "marshaling")
-	} else if err := h.schemator.CreateIndex(ctx, cim.Index, b); err != nil {
+	} else if err := h.Schemator.CreateIndex(ctx, cim.Index, b); err != nil {
 		return errors.Wrapf(err, "writing index to disco: %s", cim.Index)
 	}
 	return nil
@@ -913,6 +993,8 @@ func (h *Holder) createIndex(cim *CreateIndexMessage, broadcast bool) (*Index, e
 	index.keys = cim.Meta.Keys
 	index.trackExistence = cim.Meta.TrackExistence
 	index.createdAt = cim.CreatedAt
+	index.owner = cim.Owner
+	index.description = cim.Meta.Description
 
 	if err = index.Open(); err != nil {
 		return nil, errors.Wrap(err, "opening")
@@ -937,8 +1019,43 @@ func (h *Holder) createIndex(cim *CreateIndexMessage, broadcast bool) (*Index, e
 	return index, nil
 }
 
+// createIndexWithPartitions is similar to createIndex, but it takes a list of
+// partitions for which this node is responsible. This ensures that the node
+// doesn't instantiate more partition TranslateStores than is necessary.
+func (h *Holder) createIndexWithPartitions(cim *CreateIndexMessage, translatePartitions dax.PartitionNums) (*Index, error) {
+	if cim.Index == "" {
+		return nil, errors.New("index name required")
+	}
+
+	// Otherwise create a new index.
+	index, err := h.newIndex(h.IndexPath(cim.Index), cim.Index)
+	if err != nil {
+		return nil, errors.Wrap(err, "creating")
+	}
+
+	index.keys = cim.Meta.Keys
+	index.trackExistence = cim.Meta.TrackExistence
+	index.createdAt = cim.CreatedAt
+	index.translatePartitions = translatePartitions
+
+	if err = index.Open(); err != nil {
+		return nil, errors.Wrap(err, "opening")
+	}
+
+	// Update options.
+	h.addIndex(index)
+
+	// Since this is a new index, we need to kick off
+	// its translation sync.
+	if err := h.translationSyncer.Reset(); err != nil {
+		return nil, errors.Wrap(err, "resetting translation sync")
+	}
+
+	return index, nil
+}
+
 func (h *Holder) loadSchema() error {
-	schema, err := h.schemator.Schema(context.TODO())
+	schema, err := h.Schemator.Schema(context.TODO())
 	if err != nil {
 		return errors.Wrap(err, "getting schema")
 	}
@@ -946,7 +1063,7 @@ func (h *Holder) loadSchema() error {
 	// TODO: This is kind of inefficient because we're ignoring the index.Data
 	// and field.Data values, which contains the index and field information,
 	// and only using the map key to call loadIndex() and loadField(). These
-	// make another call to schemator to get the same index and field
+	// make another call to Schemator to get the same index and field
 	// information that we already have in the map. It probably makes sense to
 	// either copy the parts of the loadIndex and loadField methods here (like
 	// decodeCreateIndexMessage) or split loadIndex and loadField into smaller
@@ -974,7 +1091,7 @@ func (h *Holder) loadSchema() error {
 }
 
 func (h *Holder) loadIndex(indexName string) (*Index, error) {
-	b, err := h.schemator.Index(context.TODO(), indexName)
+	b, err := h.Schemator.Index(context.TODO(), indexName)
 	if err != nil {
 		return nil, errors.Wrapf(err, "getting index: %s", indexName)
 	}
@@ -988,7 +1105,7 @@ func (h *Holder) loadIndex(indexName string) (*Index, error) {
 }
 
 func (h *Holder) loadField(indexName, fieldName string) (*Field, error) {
-	b, err := h.schemator.Field(context.TODO(), indexName, fieldName)
+	b, err := h.Schemator.Field(context.TODO(), indexName, fieldName)
 	if err != nil {
 		return nil, errors.Wrapf(err, "getting field: %s/%s", indexName, fieldName)
 	}
@@ -1008,7 +1125,7 @@ func (h *Holder) loadField(indexName, fieldName string) (*Field, error) {
 }
 
 func (h *Holder) loadView(indexName, fieldName, viewName string) (*view, error) {
-	b, err := h.schemator.View(context.Background(), indexName, fieldName, viewName)
+	b, err := h.Schemator.View(context.Background(), indexName, fieldName, viewName)
 	if err != nil {
 		return nil, errors.Wrapf(err, "getting view: %s/%s/%s", indexName, fieldName, viewName)
 	} else if !b {
@@ -1029,10 +1146,8 @@ func (h *Holder) newIndex(path, name string) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	index.Stats = h.Stats.WithTags(fmt.Sprintf("index:%s", index.Name()))
 	index.broadcaster = h.broadcaster
 	index.serializer = h.serializer
-	index.Schemator = h.schemator
 	index.OpenTranslateStore = h.OpenTranslateStore
 	index.translationSyncer = h.translationSyncer
 	return index, nil
@@ -1042,7 +1157,11 @@ func (h *Holder) newIndex(path, name string) (*Index, error) {
 func (h *Holder) DeleteIndex(name string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.deleteIndex(name)
+}
 
+// deleteIndex is a non-locking version of DeleteIndex().
+func (h *Holder) deleteIndex(name string) error {
 	// Confirm index exists.
 	index := h.Index(name)
 	if index == nil {
@@ -1050,7 +1169,7 @@ func (h *Holder) DeleteIndex(name string) error {
 	}
 
 	// Delete the index from etcd as the system of record.
-	if err := h.schemator.DeleteIndex(context.TODO(), name); err != nil {
+	if err := h.Schemator.DeleteIndex(context.TODO(), name); err != nil {
 		return errors.Wrapf(err, "deleting index from etcd: %s", name)
 	}
 
@@ -1061,7 +1180,7 @@ func (h *Holder) DeleteIndex(name string) error {
 
 	// remove any backing store.
 	if err := h.txf.DeleteIndex(name); err != nil {
-		return errors.Wrap(err, "index.Txf.DeleteIndex")
+		return errors.Wrap(err, "h.Txf.DeleteIndex")
 	}
 
 	// Delete index directory.
@@ -1079,7 +1198,7 @@ func (h *Holder) DeleteIndex(name string) error {
 	}
 
 	// Remove reference.
-	h.deleteIndex(name)
+	h.deleteIndexFromMap(name)
 
 	// I'm not sure if calling Reset() here is necessary
 	// since closing the index stops its translation
@@ -1087,7 +1206,7 @@ func (h *Holder) DeleteIndex(name string) error {
 	return h.translationSyncer.Reset()
 }
 
-func (h *Holder) deleteIndex(index string) {
+func (h *Holder) deleteIndexFromMap(index string) {
 	h.imu.Lock()
 	delete(h.indexes, index)
 	h.imu.Unlock()
@@ -1165,11 +1284,11 @@ func (h *Holder) logStartup() error {
 	time := time.Now().Format(RFC3339NanoFixedWidth)
 	logLine := fmt.Sprintf("%s\t%s\n", time, Version)
 
-	if err := os.MkdirAll(h.path, 0750); err != nil {
+	if err := os.MkdirAll(h.path, 0o750); err != nil {
 		return errors.Wrap(err, "creating data directory")
 	}
 
-	f, err := os.OpenFile(h.path+"/startup.log", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	f, err := os.OpenFile(h.path+"/startup.log", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
 	if err != nil {
 		return errors.Wrap(err, "opening startup log")
 	}
@@ -1199,122 +1318,8 @@ type holderSyncer struct {
 
 	syncers errgroup.Group
 
-	// Stats
-	Stats stats.StatsClient
-
 	// Signals that the sync should stop.
 	Closing <-chan struct{}
-}
-
-// IsClosing returns true if the syncer has been asked to close.
-func (s *holderSyncer) IsClosing() bool {
-	if s.Cluster.abortAntiEntropyQ() {
-		return true
-	}
-	select {
-	case <-s.Closing:
-		return true
-	default:
-		return false
-	}
-}
-
-// SyncHolder compares the holder on host with the local holder and resolves differences.
-func (s *holderSyncer) SyncHolder() error {
-	s.mu.Lock() // only allow one instance of SyncHolder to be running at a time
-	defer s.mu.Unlock()
-	ti := time.Now()
-
-	// Create a snapshot of the cluster to use for node/partition calculations.
-	snap := s.Cluster.NewSnapshot()
-
-	schema, err := s.Holder.Schema()
-	if err != nil {
-		return errors.Wrap(err, "getting schema")
-	}
-
-	// Iterate over schema in sorted order.
-	for _, di := range schema {
-		// Verify syncer has not closed.
-		if s.IsClosing() {
-			return nil
-		}
-
-		tf := time.Now()
-		for _, fi := range di.Fields {
-			// Verify syncer has not closed.
-			if s.IsClosing() {
-				return nil
-			}
-
-			for _, vi := range fi.Views {
-				// Verify syncer has not closed.
-				if s.IsClosing() {
-					return nil
-				}
-
-				itr := s.Holder.Index(di.Name).AvailableShards(includeRemote).Iterator()
-				itr.Seek(0)
-				for shard, eof := itr.Next(); !eof; shard, eof = itr.Next() {
-					// Ignore shards that this host doesn't own.
-					if !snap.OwnsShard(s.Node.ID, di.Name, shard) {
-						continue
-					}
-
-					// Verify syncer has not closed.
-					if s.IsClosing() {
-						return nil
-					}
-
-					// Sync fragment if own it.
-					if err := s.syncFragment(di.Name, fi.Name, vi.Name, shard); err != nil {
-						return fmt.Errorf("fragment sync error: index=%s, field=%s, view=%s, shard=%d, err=%s", di.Name, fi.Name, vi.Name, shard, err)
-					}
-				}
-			}
-			s.Stats.Timing(MetricSyncFieldDurationSeconds, time.Since(tf), 1.0)
-			tf = time.Now() // reset tf
-		}
-		s.Stats.Timing(MetricSyncIndexDurationSeconds, time.Since(ti), 1.0)
-		ti = time.Now() // reset ti
-	}
-
-	return nil
-}
-
-// syncFragment synchronizes a fragment with the rest of the cluster.
-func (s *holderSyncer) syncFragment(index, field, view string, shard uint64) error {
-	// Retrieve local field.
-	f := s.Holder.Field(index, field)
-	if f == nil {
-		return newNotFoundError(ErrFieldNotFound, field)
-	}
-
-	// Ensure view exists locally.
-	v, err := f.createViewIfNotExists(view)
-	if err != nil {
-		return errors.Wrap(err, "creating view")
-	}
-
-	// Ensure fragment exists locally.
-	frag, err := v.CreateFragmentIfNotExists(shard)
-	if err != nil {
-		return errors.Wrap(err, "creating fragment")
-	}
-
-	// Sync fragments together.
-	fs := fragmentSyncer{
-		Fragment:  frag,
-		Node:      s.Node,
-		Cluster:   s.Cluster,
-		FieldType: f.Type(),
-		Closing:   s.Closing,
-	}
-	if err := fs.syncFragment(); err != nil {
-		return errors.Wrap(err, "syncing fragment")
-	}
-
-	return nil
 }
 
 // resetTranslationSync reinitializes streaming sync of translation data.
@@ -1351,7 +1356,6 @@ func (s *holderSyncer) resetTranslationSync() error {
 		return errors.Wrap(err, "initializing translation replication")
 	}
 	return nil
-
 }
 
 ////////////////////////////////////////////////////////////
@@ -1753,4 +1757,35 @@ func decodeCreateFieldMessage(ser Serializer, b []byte) (*CreateFieldMessage, er
 		return nil, errors.Wrap(err, "unmarshaling")
 	}
 	return &cfm, nil
+}
+
+func (h *Holder) DeleteDataframe(name string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Confirm index exists.
+	idx := h.Index(name)
+	if idx == nil {
+		return newNotFoundError(ErrIndexNotFound, name)
+	}
+
+	path := idx.DataframesPath()
+	// Delete dataframe directory.
+	if err := os.RemoveAll(path); err != nil {
+		// There is a rare edge case here: If a cache flush was happening, RemoveAll
+		// can fail because a file gets created, say in a fragment directory, after
+		// RemoveAll has deleted everything it found in the directory, but before
+		// the actual directory is unlinked. In theory, though, this can't happen
+		// twice; by the time we get here, everything was closed, so at most one
+		// more file should get created.
+		err = os.RemoveAll(path)
+		if err != nil {
+			return errors.Wrap(err, "removing directory")
+		}
+	}
+	if err := os.Mkdir(path, 0o750); err != nil {
+		return errors.Wrap(err, "creating dataframe")
+	}
+
+	return nil
 }

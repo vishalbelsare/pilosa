@@ -13,10 +13,10 @@ import (
 	"time"
 
 	confluent "github.com/confluentinc/confluent-kafka-go/kafka"
-	"github.com/jaffee/commandeer/pflag"
 	pilosaclient "github.com/featurebasedb/featurebase/v3/client"
 	"github.com/featurebasedb/featurebase/v3/idk"
 	"github.com/featurebasedb/featurebase/v3/logger"
+	"github.com/jaffee/commandeer/pflag"
 	"github.com/pkg/errors"
 )
 
@@ -56,6 +56,7 @@ func TestDeleteConsumerCompoundStringKey(t *testing.T) {
 	m.Index = fmt.Sprintf("cmd_del_comp_indexij%s", topic)
 	m.PrimaryKeyFields = []string{"abc", "db", "user_id"}
 	m.Topics = []string{topic}
+	m.PackBools = "bools"
 
 	defer func() {
 		// TODO: for some reason (which I didn't dig into),

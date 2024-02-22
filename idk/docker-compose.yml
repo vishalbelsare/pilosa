@@ -35,7 +35,7 @@ services:
       KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
     volumes:
       - ./docker-sasl/ssl_keys:/etc/kafka/secrets
-      
+
     depends_on:
       - zookeeper
 
@@ -67,20 +67,22 @@ services:
       - kafka
 
   pilosa:
-    image: registry.gitlab.com/molecula/featurebase/featurebase:linux-amd64-${BRANCH_NAME}
+    #image: registry.gitlab.com/molecula/featurebase/featurebase:linux-amd64-${BRANCH_NAME} # (jaffee) I think we should build directly from this tree rather than pulling the image... makes the local dev flow easier
+    build: ..
     environment:
       PILOSA_DATA_DIR: /data
       PILOSA_BIND: 0.0.0.0:10101
       PILOSA_BIND_GRPC: 0.0.0.0:20101
       PILOSA_ADVERTISE: pilosa:10101
       PILOSA_LOOKUP_DB_DSN: "postgresql://postgres:password@postgres:5432/postgres?sslmode=disable"
-    depends_on: 
+    depends_on:
       - postgres
     volumes:
       - ./testenv/certs:/certs
 
   pilosa-tls:
-    image: registry.gitlab.com/molecula/featurebase/featurebase:linux-amd64-${BRANCH_NAME}
+    #image: registry.gitlab.com/molecula/featurebase/featurebase:linux-amd64-${BRANCH_NAME}
+    build: ..
     environment:
       PILOSA_DATA_DIR: /data
       PILOSA_BIND: https://0.0.0.0:10111
@@ -94,7 +96,8 @@ services:
       - ./testenv/certs:/certs
 
   pilosa-auth:
-    image: registry.gitlab.com/molecula/featurebase/featurebase:linux-amd64-${BRANCH_NAME}
+    #image: registry.gitlab.com/molecula/featurebase/featurebase:linux-amd64-${BRANCH_NAME}
+    build: ..
     environment:
       PILOSA_DATA_DIR: /data
       PILOSA_BIND: 0.0.0.0:10105
@@ -117,13 +120,13 @@ services:
       dockerfile: ./idk/Dockerfile-test
     environment:
       IDK_DEFAULT_SHARD_TRANSACTIONAL: ${IDK_DEFAULT_SHARD_TRANSACTIONAL}
+      IDK_FEATUREBASE_HASH: ${IDK_FEATUREBASE_HASH}
+      IDK_FEATUREBASE_TAG: ${IDK_FEATUREBASE_TAG}
     volumes:
       - ./testenv/certs:/certs
       - ./docker-sasl/ssl_keys:/ssl_keys
       - ./testdata:/testdata
     depends_on:
-      - kafka
-      - postgres
       - fakeidp
   wait:
     build:
@@ -132,5 +135,24 @@ services:
     volumes:
       - ./testenv/certs:/certs
 
-
+  dax:
+    build:
+      context: ..
+      dockerfile: Dockerfile-dax
+    environment:
+      FEATUREBASE_BIND: 0.0.0.0:8080
+      FEATUREBASE_VERBOSE: "true"
+      FEATUREBASE_QUERYER_RUN: "true"
+      FEATUREBASE_CONTROLLER_RUN: "true"
+      FEATUREBASE_CONTROLLER_CONFIG_STORAGE_METHOD: "sqldb"
+      FEATUREBASE_CONTROLLER_CONFIG_SQLDB_DATABASE: "postgres"
+      FEATUREBASE_CONTROLLER_CONFIG_SQLDB_USER: "postgres"
+      FEATUREBASE_CONTROLLER_CONFIG_SQLDB_PASSWORD: "password"
+      FEATUREBASE_CONTROLLER_CONFIG_SQLDB_HOST: "postgres"
+      FEATUREBASE_COMPUTER_RUN: "true"
+      FEATUREBASE_COMPUTER_CONFIG_DATA_DIR: /dax-data/computer
+      FEATUREBASE_COMPUTER_CONFIG_WRITELOGGER_DIR: /dax-data/wl
+      FEATUREBASE_COMPUTER_CONFIG_SNAPSHOTTER_DIR: /dax-data/snaps
+    depends_on:
+      - postgres
 

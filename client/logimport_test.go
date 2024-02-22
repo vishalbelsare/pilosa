@@ -5,7 +5,6 @@ package client
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
@@ -93,7 +92,8 @@ func TestEncodeDecode(t *testing.T) {
 
 		})
 	}
-	buf, err := ioutil.TempFile("", "")
+	td := t.TempDir()
+	buf, err := os.CreateTemp(td, "")
 	if err != nil {
 		t.Fatalf("getting temp file: %v", err)
 	}

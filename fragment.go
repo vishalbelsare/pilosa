@@ -7,11 +7,8 @@ import (
 	"bytes"
 	"container/heap"
 	"context"
-	"encoding/binary"
 	"fmt"
-	"hash"
 	"io"
-	"io/ioutil"
 	"math"
 	"math/bits"
 	"os"
@@ -22,19 +19,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cespare/xxhash"
-	"github.com/gogo/protobuf/proto"
-	"github.com/featurebasedb/featurebase/v3/disco"
 	"github.com/featurebasedb/featurebase/v3/logger"
-	pnet "github.com/featurebasedb/featurebase/v3/net"
 	"github.com/featurebasedb/featurebase/v3/pb"
 	"github.com/featurebasedb/featurebase/v3/pql"
 	"github.com/featurebasedb/featurebase/v3/roaring"
 	"github.com/featurebasedb/featurebase/v3/shardwidth"
-	"github.com/featurebasedb/featurebase/v3/stats"
 	"github.com/featurebasedb/featurebase/v3/testhook"
 	"github.com/featurebasedb/featurebase/v3/tracing"
 	"github.com/featurebasedb/featurebase/v3/vprint"
+	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 )
 
@@ -70,33 +63,13 @@ const (
 	bsiExistsBit = 0
 	bsiSignBit   = 1
 	bsiOffsetBit = 2
-
-	// Roaring bitmap flags.
-	roaringFlagBSIv2 = 0x01 // indicates version using low bit for existence
 )
-
-// fragSpec saves a ton of duplicated strings for
-// path, and index, field, view name strings.
-type fragSpec struct {
-	index    *Index
-	field    *Field
-	fieldstr string
-	view     *view
-}
 
 func (f *fragment) index() string {
 	return f.idx.name
 }
 
 func (f *fragment) field() string {
-	// initialization of _field *Field can
-	// go missing during tests that do incomplete setup.
-	// Hence we must keep fieldstr as a backup.
-	if f.fld == nil {
-		return f.fieldstr
-	} else {
-		f.fieldstr = ""
-	}
 	return f.fld.name
 }
 
@@ -114,9 +87,8 @@ type fragment struct {
 	// We save 20GB worth strings on some data sets by not duplicating
 	// the path, index, field, view strings on every fragment.
 	// Instead assemble strings on demand in field(), view(), path(), index().
-	fld      *Field
-	fieldstr string
-	_view    *view
+	fld   *Field
+	_view *view
 
 	shard uint64
 
@@ -147,31 +119,26 @@ type fragment struct {
 	// mutexVector is used for mutex field types. It's checked for an
 	// existing value (to clear) prior to setting a new value.
 	mutexVector vector
-
-	stats stats.StatsClient
 }
 
 // newFragment returns a new instance of fragment.
-func newFragment(holder *Holder, spec fragSpec, shard uint64, flags byte) *fragment {
-	idx := holder.Index(spec.index.name)
+func newFragment(holder *Holder, idx *Index, fld *Field, vw *view, shard uint64) *fragment {
+	checkIdx := holder.Index(idx.name)
 
-	if idx == nil {
-		vprint.PanicOn(fmt.Sprintf("got nil idx back for '%v' from holder!", spec.index))
+	if checkIdx == nil {
+		vprint.PanicOn(fmt.Sprintf("got nil idx back for '%v' from holder!", idx.Name()))
 	}
 
 	f := &fragment{
-		_view:    spec.view,
-		fieldstr: spec.fieldstr,
-		fld:      spec.field,
-		shard:    shard,
-		idx:      idx,
+		_view: vw,
+		fld:   fld,
+		shard: shard,
+		idx:   idx,
 
 		CacheType: DefaultCacheType,
 		CacheSize: DefaultCacheSize,
 
 		holder: holder,
-
-		stats: stats.NopStatsClient,
 	}
 	return f
 }
@@ -200,8 +167,7 @@ func (f *fragment) bitDepth() (uint64, error) {
 }
 
 type FragmentInfo struct {
-	BitmapInfo     roaring.BitmapInfo
-	BlockChecksums []FragmentBlock `json:"BlockChecksums,omitempty"`
+	BitmapInfo roaring.BitmapInfo
 }
 
 func (f *fragment) Index() *Index {
@@ -215,7 +181,6 @@ func (f *fragment) Open() error {
 
 	if err := func() error {
 		// Fill cache with rows persisted to disk.
-		f.holder.Logger.Debugf("open cache for index/field/view/fragment: %s/%s/%s/%d", f.index(), f.field(), f.view(), f.shard)
 		if err := f.openCache(); err != nil {
 			return errors.Wrap(err, "opening cache")
 		}
@@ -229,7 +194,6 @@ func (f *fragment) Open() error {
 	}
 
 	_ = testhook.Opened(f.holder.Auditor, f, nil)
-	f.holder.Logger.Debugf("successfully opened index/field/view/fragment: %s/%s/%s/%d", f.index(), f.field(), f.view(), f.shard)
 	return nil
 }
 
@@ -250,7 +214,7 @@ func (f *fragment) openCache() error {
 
 	// Read cache data from disk.
 	path := f.cachePath()
-	buf, err := ioutil.ReadFile(path)
+	buf, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
@@ -357,7 +321,7 @@ func (f *fragment) rowFromStorage(tx Tx, rowID uint64) (*Row, error) {
 	}
 
 	row := &Row{
-		segments: []rowSegment{{
+		Segments: []RowSegment{{
 			data:     data,
 			shard:    f.shard,
 			writable: true,
@@ -436,7 +400,7 @@ func (f *fragment) unprotectedSetBit(tx Tx, rowID, columnID uint64) (changed boo
 		f.cache.Add(rowID, n)
 	}
 
-	f.stats.Count(MetricSetBit, 1, 1.0)
+	CounterSetBit.Inc()
 
 	return changed, nil
 }
@@ -452,7 +416,6 @@ func (f *fragment) clearBit(tx Tx, rowID, columnID uint64) (changed bool, err er
 // unprotectedClearBit TODO should be replaced by an invocation of
 // importPositions with a single bit to clear.
 func (f *fragment) unprotectedClearBit(tx Tx, rowID, columnID uint64) (changed bool, err error) {
-	changed = false
 	// Determine the position of the bit in the storage.
 	pos, err := f.pos(rowID, columnID)
 	if err != nil {
@@ -485,7 +448,7 @@ func (f *fragment) unprotectedClearBit(tx Tx, rowID, columnID uint64) (changed b
 		f.cache.Add(rowID, n)
 	}
 
-	f.stats.Count(MetricClearBit, 1, 1.0)
+	CounterClearBit.Inc()
 
 	return changed, nil
 }
@@ -541,7 +504,7 @@ func (f *fragment) unprotectedSetRow(tx Tx, row *Row, rowID uint64) (changed boo
 		}
 	}
 
-	f.stats.Count("setRow", 1, 1.0)
+	CounterSetRow.Inc()
 
 	return changed, nil
 }
@@ -694,20 +657,9 @@ func (f *fragment) positionsForValue(columnID uint64, bitDepth uint64, value int
 }
 
 // TODO get rid of this and use positionsForValue to generate a single write op, and set that with importPositions.
-func (f *fragment) setValueBase(txOrig Tx, columnID uint64, bitDepth uint64, value int64, clear bool) (changed bool, err error) {
+func (f *fragment) setValueBase(tx Tx, columnID uint64, bitDepth uint64, value int64, clear bool) (changed bool, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	tx := txOrig
-	if NilInside(tx) {
-		tx = f.idx.holder.txf.NewTx(Txo{Write: writable, Index: f.idx, Fragment: f, Shard: f.shard})
-		defer func() {
-			if err == nil {
-				vprint.PanicOn(tx.Commit())
-			} else {
-				tx.Rollback()
-			}
-		}()
-	}
 
 	err = func() error {
 		// Convert value to an unsigned representation.
@@ -775,7 +727,7 @@ func (f *fragment) sum(tx Tx, filter *Row, bitDepth uint64) (sum int64, count ui
 	// though, we want to run with no-filter, as opposed to an empty filter.
 	var filterData *roaring.Bitmap
 	if filter != nil {
-		for _, seg := range filter.segments {
+		for _, seg := range filter.Segments {
 			if seg.shard == f.shard {
 				filterData = seg.data
 				break
@@ -1360,16 +1312,6 @@ func (f *fragment) pos(rowID, columnID uint64) (uint64, error) {
 	return pos(rowID, columnID), nil
 }
 
-// forEachBit executes fn for every bit set in the fragment.
-// Errors returned from fn are passed through.
-func (f *fragment) forEachBit(tx Tx, fn func(rowID, columnID uint64) error) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return tx.ForEach(f.index(), f.field(), f.view(), f.shard, func(i uint64) error {
-		return fn(i/ShardWidth, (f.shard*ShardWidth)+(i%ShardWidth))
-	})
-}
-
 // top returns the top rows from the fragment.
 // If opt.Src is specified then only rows which intersect src are returned.
 func (f *fragment) top(tx Tx, opt topOptions) ([]Pair, error) {
@@ -1551,270 +1493,6 @@ type topOptions struct {
 	TanimotoThreshold uint64
 }
 
-// Checksum returns a checksum for the entire fragment.
-// If two fragments have the same checksum then they have the same data.
-func (f *fragment) Checksum() ([]byte, error) {
-	h := xxhash.New()
-
-	blocks, err := f.Blocks()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, block := range blocks {
-		_, _ = h.Write(block.Checksum)
-	}
-	return h.Sum(nil), nil
-}
-
-// InvalidateChecksums clears all cached block checksums.
-func (f *fragment) InvalidateChecksums() {
-	f.mu.Lock()
-	f.checksums = make(map[int][]byte)
-	f.mu.Unlock()
-}
-
-// Blocks returns info for all blocks containing data.
-func (f *fragment) Blocks() ([]FragmentBlock, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	var a []FragmentBlock
-
-	idx := f.holder.Index(f.index())
-	if idx == nil {
-		err := fmt.Errorf("index() was nil in fragment.Blocks(): f.index()='%v'", f.index())
-		vprint.PanicOn(err)
-		return nil, err
-	}
-	tx := idx.holder.txf.NewTx(Txo{Write: !writable, Index: idx, Fragment: f, Shard: f.shard})
-	defer tx.Rollback()
-	// no Commit below, b/c is read-only.
-
-	itr := tx.NewTxIterator(f.index(), f.field(), f.view(), f.shard)
-	defer itr.Close()
-
-	itr.Seek(0)
-
-	// Initialize block hasher.
-	h := newBlockHasher()
-
-	// Iterate over each value in the fragment.
-	v, eof := itr.Next()
-	if eof {
-		return nil, nil
-	}
-	blockID := int(v / (HashBlockSize * ShardWidth))
-	for {
-		// Check for multiple block checksums in a row.
-		if n := f.readContiguousChecksums(&a, blockID); n > 0 {
-			itr.Seek(uint64(blockID+n) * HashBlockSize * ShardWidth)
-			v, eof = itr.Next()
-			if eof {
-				break
-			}
-			blockID = int(v / (HashBlockSize * ShardWidth))
-			continue
-		}
-
-		// Reset hasher.
-		h.blockID = blockID
-		h.Reset()
-
-		// Read all values for the block.
-		for ; ; v, eof = itr.Next() {
-			// Once we hit the next block, save the value for the next iteration.
-			blockID = int(v / (HashBlockSize * ShardWidth))
-			if blockID != h.blockID || eof {
-				break
-			}
-
-			h.WriteValue(v)
-		}
-
-		// Cache checksum.
-		chksum := h.Sum()
-		f.checksums[h.blockID] = chksum // the only place checksums is added to.
-
-		// Append block.
-		a = append(a, FragmentBlock{
-			ID:       h.blockID,
-			Checksum: chksum,
-		})
-
-		// Exit if we're at the end.
-		if eof {
-			break
-		}
-	}
-
-	return a, nil
-}
-
-// readContiguousChecksums appends multiple checksums in a row and returns the count added.
-func (f *fragment) readContiguousChecksums(a *[]FragmentBlock, blockID int) (n int) {
-	for i := 0; ; i++ {
-		chksum := f.checksums[blockID+i]
-		if chksum == nil {
-			return i
-		}
-
-		*a = append(*a, FragmentBlock{
-			ID:       blockID + i,
-			Checksum: chksum,
-		})
-	}
-}
-
-// blockData returns bits in a block as row & column ID pairs.
-func (f *fragment) blockData(id int) (rowIDs, columnIDs []uint64, err error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	idx := f.holder.Index(f.index())
-	tx := idx.holder.txf.NewTx(Txo{Write: !writable, Index: idx, Shard: f.shard})
-	defer tx.Rollback()
-	// readonly, so no Commit()
-
-	if err := tx.ForEachRange(f.index(), f.field(), f.view(), f.shard, uint64(id)*HashBlockSize*ShardWidth, (uint64(id)+1)*HashBlockSize*ShardWidth, func(i uint64) error {
-		rowIDs = append(rowIDs, i/ShardWidth)
-		columnIDs = append(columnIDs, i%ShardWidth)
-		return nil
-	}); err != nil {
-		return nil, nil, err
-	}
-	return rowIDs, columnIDs, nil
-}
-
-// mergeBlock compares the block's bits and computes a diff with another set of block bits.
-// The state of a bit is determined by consensus from all blocks being considered.
-//
-// For example, if 3 blocks are compared and two have a set bit and one has a
-// cleared bit then the bit is considered set. The function returns the
-// diff per incoming block so that all can be in sync.
-func (f *fragment) mergeBlock(tx Tx, id int, data []pairSet) (sets, clears []pairSet, err error) {
-	// Ensure that all pair sets are of equal length.
-	for i := range data {
-		if len(data[i].rowIDs) != len(data[i].columnIDs) {
-			return nil, nil, fmt.Errorf("pair set mismatch(idx=%d): %d != %d", i, len(data[i].rowIDs), len(data[i].columnIDs))
-		}
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	// Track sets and clears for all blocks (including local).
-	sets = make([]pairSet, len(data)+1)
-	clears = make([]pairSet, len(data)+1)
-
-	// Limit upper row/column pair.
-	maxRowID := (uint64(id+1) * HashBlockSize) - 1
-	maxColumnID := uint64(ShardWidth) - 1
-
-	// Create buffered iterator for local block.
-	bm, err := tx.RoaringBitmap(f.index(), f.field(), f.view(), f.shard)
-	if err != nil {
-		return nil, nil, err
-	}
-	itrs := make([]*bufIterator, 1, len(data)+1)
-	itrs[0] = newBufIterator(
-		newLimitIterator(
-			newRoaringIterator(bm.Iterator()), maxRowID, maxColumnID,
-		),
-	)
-
-	// Append buffered iterators for each incoming block.
-	for i := range data {
-		var itr iterator = newSliceIterator(data[i].rowIDs, data[i].columnIDs)
-		itr = newLimitIterator(itr, maxRowID, maxColumnID)
-		itrs = append(itrs, newBufIterator(itr))
-	}
-
-	// Seek to initial pair.
-	for _, itr := range itrs {
-		itr.Seek(uint64(id)*HashBlockSize, 0)
-	}
-
-	// Determine the number of blocks needed to meet consensus.
-	// If there is an even split then a set is used.
-	majorityN := (len(itrs) + 1) / 2
-
-	// Iterate over all values in all iterators to determine differences.
-	values := make([]bool, len(itrs))
-	for {
-		var min struct {
-			rowID    uint64
-			columnID uint64
-		}
-
-		// Find the lowest pair.
-		var hasData bool
-		for _, itr := range itrs {
-			bid, pid, eof := itr.Peek()
-			if eof { // no more data
-				continue
-			} else if !hasData { // first pair
-				min.rowID, min.columnID, hasData = bid, pid, true
-			} else if bid < min.rowID || (bid == min.rowID && pid < min.columnID) { // lower pair
-				min.rowID, min.columnID = bid, pid
-			}
-		}
-
-		// If all iterators are EOF then exit.
-		if !hasData {
-			break
-		}
-
-		// Determine consensus of point.
-		var setN int
-		for i, itr := range itrs {
-			bid, pid, eof := itr.Next()
-
-			values[i] = !eof && bid == min.rowID && pid == min.columnID
-			if values[i] {
-				setN++ // set
-			} else {
-				itr.Unread() // clear
-			}
-		}
-
-		// Determine consensus value.
-		newValue := setN >= majorityN
-
-		// Add a diff for any node with a different value.
-		for i := range itrs {
-			// Value matches, ignore.
-			if values[i] == newValue {
-				continue
-			}
-
-			// Append to either the set or clear diff.
-			if newValue {
-				sets[i].rowIDs = append(sets[i].rowIDs, min.rowID)
-				sets[i].columnIDs = append(sets[i].columnIDs, min.columnID)
-			} else {
-				clears[i].rowIDs = append(clears[i].rowIDs, min.rowID)
-				clears[i].columnIDs = append(clears[i].columnIDs, min.columnID)
-			}
-		}
-	}
-
-	rowSet := make(map[uint64]struct{}, len(sets[0].columnIDs))
-	// compute positions directly, replacing columnIDs with the computed
-	// positions
-	for i := range sets[0].columnIDs {
-		rowSet[sets[0].rowIDs[i]] = struct{}{}
-		sets[0].columnIDs[i] += sets[0].rowIDs[i] * ShardWidth
-	}
-	for i := range clears[0].columnIDs {
-		rowSet[clears[0].rowIDs[i]] = struct{}{}
-		clears[0].columnIDs[i] += clears[0].rowIDs[i] * ShardWidth
-	}
-	err = f.importPositions(tx, sets[0].columnIDs, clears[0].columnIDs, rowSet)
-
-	return sets[1:], clears[1:], err
-}
-
 // bulkImport bulk imports a set of bits.
 // The cache is updated to reflect the new data.
 func (f *fragment) bulkImport(tx Tx, rowIDs, columnIDs []uint64, options *ImportOptions) error {
@@ -1829,32 +1507,60 @@ func (f *fragment) bulkImport(tx Tx, rowIDs, columnIDs []uint64, options *Import
 	return f.bulkImportStandard(tx, rowIDs, columnIDs, options)
 }
 
-// rowColumnSet is a sortable set of row and column IDs which
-// correspond, allowing us to ensure that we produce values in
-// a predictable order
-type rowColumnSet struct {
-	r []uint64
-	c []uint64
-}
-
-func (r rowColumnSet) Len() int {
-	return len(r.r)
-}
-
-func (r rowColumnSet) Swap(i, j int) {
-	r.r[i], r.r[j] = r.r[j], r.r[i]
-	r.c[i], r.c[j] = r.c[j], r.c[i]
-}
-
-// Sort by row ID first, column second, to sort by fragment position
-func (r rowColumnSet) Less(i, j int) bool {
-	if r.r[i] < r.r[j] {
-		return true
+// clearBitsReportingChanges is a special fancy case. For existence-tracking,
+// if we're clearing bits in a mutex, *successfully* cleared bits become null
+// records, so we have to report, not how many records we cleared, but which
+// records specifically became clear. The returned set of bits is the column
+// IDs that actually got a bit cleared from them.
+//
+// This is basically following the logic of bulkImportStandard and
+// importPositions, except that it combines them and drops some of the
+// no longer needed branches.
+func (f *fragment) clearBitsReportingChanges(tx Tx, rowIDs, columnIDs []uint64) ([]uint64, error) {
+	// Verify that there are an equal number of row ids and column ids.
+	if len(rowIDs) != len(columnIDs) {
+		return nil, fmt.Errorf("mismatch of row/column len: %d != %d", len(rowIDs), len(columnIDs))
 	}
-	if r.r[i] > r.r[j] {
-		return false
+
+	// rowSet maintains the set of rowIDs present in this import. It allows the
+	// cache to be updated once per row, instead of once per bit. TODO: consider
+	// sorting by rowID/columnID first and avoiding the map allocation here. (we
+	// could reuse rowIDs to store the list of unique row IDs)
+	rowSet := make(map[uint64]struct{})
+	lastRowID := uint64(1 << 63)
+
+	// replace columnIDs with calculated positions to avoid allocation.
+	prevRow, prevCol := ^uint64(0), ^uint64(0)
+	next := 0
+	for i := 0; i < len(columnIDs); i++ {
+		rowID, columnID := rowIDs[i], columnIDs[i]
+		if rowID == prevRow && columnID == prevCol {
+			continue
+		}
+		prevRow, prevCol = rowID, columnID
+		pos, err := f.pos(rowID, columnID)
+		if err != nil {
+			return nil, err
+		}
+		columnIDs[next] = pos
+		next++
+
+		// Add row to rowSet.
+		if rowID != lastRowID {
+			lastRowID = rowID
+			rowSet[rowID] = struct{}{}
+		}
 	}
-	return r.c[i] < r.c[j]
+	clear := columnIDs[:next]
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	CounterClearingingN.Add(float64(len(clear)))
+	changed, err := tx.Removed(f.index(), f.field(), f.view(), f.shard, clear...)
+	if err != nil {
+		return nil, errors.Wrap(err, "clearing positions")
+	}
+	CounterClearedN.Add(float64(len(changed)))
+	return changed, f.updateCaching(tx, rowSet)
 }
 
 // bulkImportStandard performs a bulk import on a standard fragment. May mutate
@@ -1867,11 +1573,6 @@ func (f *fragment) bulkImportStandard(tx Tx, rowIDs, columnIDs []uint64, options
 	rowSet := make(map[uint64]struct{})
 	lastRowID := uint64(1 << 63)
 
-	// It's possible for the ingest API to have already sorted things in
-	// the row-first order we want for this import.
-	if !options.fullySorted {
-		sort.Sort(rowColumnSet{r: rowIDs, c: columnIDs})
-	}
 	// replace columnIDs with calculated positions to avoid allocation.
 	prevRow, prevCol := ^uint64(0), ^uint64(0)
 	next := 0
@@ -2029,23 +1730,23 @@ func (p parallelSlices) Swap(i, j int) {
 // operations to the op log.
 func (f *fragment) importPositions(tx Tx, set, clear []uint64, rowSet map[uint64]struct{}) error {
 	if len(set) > 0 {
-		f.stats.Count(MetricImportingN, int64(len(set)), 1)
+		CounterImportingN.Add(float64(len(set)))
 
 		// TODO benchmark Add/RemoveN behavior with sorted/unsorted positions
 		changedN, err := tx.Add(f.index(), f.field(), f.view(), f.shard, set...)
 		if err != nil {
 			return errors.Wrap(err, "adding positions")
 		}
-		f.stats.Count(MetricImportedN, int64(changedN), 1)
+		CounterImportedN.Add(float64(changedN))
 	}
 
 	if len(clear) > 0 {
-		f.stats.Count(MetricClearingN, int64(len(clear)), 1)
+		CounterClearingingN.Add(float64(len(clear)))
 		changedN, err := tx.Remove(f.index(), f.field(), f.view(), f.shard, clear...)
 		if err != nil {
 			return errors.Wrap(err, "clearing positions")
 		}
-		f.stats.Count(MetricClearedN, int64(changedN), 1)
+		CounterClearedN.Add(float64(changedN))
 	}
 	return f.updateCaching(tx, rowSet)
 }
@@ -2079,35 +1780,6 @@ func (f *fragment) updateCaching(tx Tx, rowSet map[uint64]struct{}) error {
 	return nil
 }
 
-// sliceDifference removes everything from original that's found in remove,
-// updating the slice in place, and returns the compacted slice. The input
-// sets should be sorted.
-func sliceDifference(original, remove []uint64) []uint64 {
-	if len(remove) == 0 {
-		return original
-	}
-	rn := 0
-	rv := remove[rn]
-	on := 0
-	ov := uint64(0)
-	n := 0
-
-	for on, ov = range original {
-		for rv < ov {
-			rn++
-			if rn >= len(remove) {
-				return append(original[:n], original[on:]...)
-			}
-			rv = remove[rn]
-		}
-		if rv != ov {
-			original[n] = ov
-			n++
-		}
-	}
-	return original[:n]
-}
-
 // bulkImportMutex performs a bulk import on a fragment while ensuring
 // mutex restrictions. Because the mutex requirements must be checked
 // against storage, this method must acquire a write lock on the fragment
@@ -2116,16 +1788,10 @@ func (f *fragment) bulkImportMutex(tx Tx, rowIDs, columnIDs []uint64, options *I
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// if ingest promises that this is "fully sorted", then we have been
-	// promised that (1) there's no duplicate entries that need to be
-	// pruned, (2) the input is sorted by row IDs and then column IDs,
-	// meaning that we will generate positions in strictly sequential order.
-	if !options.fullySorted {
-		p := parallelSlices{cols: columnIDs, rows: rowIDs}
-		p.fullPrune()
-		columnIDs = p.cols
-		rowIDs = p.rows
-	}
+	p := parallelSlices{cols: columnIDs, rows: rowIDs}
+	p.fullPrune()
+	columnIDs = p.cols
+	rowIDs = p.rows
 
 	// create a mask of columns we care about
 	columns := roaring.NewSliceBitmap(columnIDs...)
@@ -2144,10 +1810,6 @@ func (f *fragment) bulkImportMutex(tx Tx, rowIDs, columnIDs []uint64, options *I
 		// positions are sorted by columns, but not by absolute
 		// position. we might want them sorted, though.
 		if pos < prev {
-			if options.fullySorted {
-				fmt.Printf("HELP! was promised fully sorted input, but previous position was %d, now generated %d\n",
-					prev, pos)
-			}
 			unsorted = true
 		}
 		prev = pos
@@ -2405,7 +2067,7 @@ func (f *fragment) ImportRoaringClearAndSet(ctx context.Context, tx Tx, clear, s
 
 	err = tx.ApplyRewriter(f.index(), f.field(), f.view(), f.shard, 0, rewriter)
 	if err != nil {
-		errors.Wrap(err, "applying rewriter")
+		return fmt.Errorf("pilosa.ImportRoaringClearAndSet: %s", err)
 	}
 	if f.CacheType != CacheTypeNone {
 		// TODO this may be quite a bit slower than the way
@@ -2448,7 +2110,7 @@ func (f *fragment) ImportRoaringBSI(ctx context.Context, tx Tx, clear, set []byt
 	}
 
 	err = tx.ApplyRewriter(f.index(), f.field(), f.view(), f.shard, 0, rewriter)
-	return errors.Wrap(err, "applying rewriter")
+	return errors.Wrap(err, "pilosa.ImportRoaringBSI: ")
 }
 
 // ImportRoaringSingleValued treats "clear" as a single row and clears
@@ -2472,7 +2134,7 @@ func (f *fragment) ImportRoaringSingleValued(ctx context.Context, tx Tx, clear, 
 	}
 
 	err = tx.ApplyRewriter(f.index(), f.field(), f.view(), f.shard, 0, rewriter)
-	return errors.Wrap(err, "applying rewriter")
+	return errors.Wrap(err, "pilosa.ImportRoaringSingleValued: ")
 }
 
 func (f *fragment) doImportRoaring(ctx context.Context, tx Tx, data []byte, clear bool) (map[uint64]int, bool, error) {
@@ -2612,7 +2274,7 @@ func (f *fragment) flushCache() error {
 		return errors.Wrap(err, "mkdir")
 	}
 	// Write to disk.
-	if err := ioutil.WriteFile(f.cachePath(), buf, 0600); err != nil {
+	if err := os.WriteFile(f.cachePath(), buf, 0600); err != nil {
 		return errors.Wrap(err, "writing")
 	}
 
@@ -2675,7 +2337,7 @@ func (f *fragment) writeCacheToArchive(tw *tar.Writer) error {
 	defer f.mu.Unlock()
 
 	// Read cache into buffer.
-	buf, err := ioutil.ReadFile(f.cachePath())
+	buf, err := os.ReadFile(f.cachePath())
 	if os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
@@ -2744,9 +2406,9 @@ func (f *fragment) fillFragmentFromArchive(tx Tx, r io.Reader) error {
 
 	// this is reading from inside a tarball, so definitely no need
 	// to close it here.
-	data, err := ioutil.ReadAll(r)
+	data, err := io.ReadAll(r)
 	if err != nil {
-		return errors.Wrap(err, "fillFragmentFromArchive ioutil.ReadAll(r)")
+		return errors.Wrap(err, "fillFragmentFromArchive io.ReadAll(r)")
 	}
 	if len(data) == 0 {
 		return nil
@@ -2771,10 +2433,10 @@ func (f *fragment) fillFragmentFromArchive(tx Tx, r io.Reader) error {
 
 func (f *fragment) readCacheFromArchive(r io.Reader) error {
 	// Slurp data from reader and write to disk.
-	buf, err := ioutil.ReadAll(r)
+	buf, err := io.ReadAll(r)
 	if err != nil {
 		return errors.Wrap(err, "reading")
-	} else if err := ioutil.WriteFile(f.cachePath(), buf, 0600); err != nil {
+	} else if err := os.WriteFile(f.cachePath(), buf, 0600); err != nil {
 		return errors.Wrap(err, "writing")
 	}
 
@@ -2838,7 +2500,7 @@ func (f *fragment) unprotectedUnionRows(ctx context.Context, tx Tx, rows []uint6
 		return nil, err
 	} else {
 		row := &Row{
-			segments: []rowSegment{{
+			Segments: []RowSegment{{
 				data:     filter.Results(f.shard),
 				shard:    f.shard,
 				writable: true,
@@ -2847,22 +2509,6 @@ func (f *fragment) unprotectedUnionRows(ctx context.Context, tx Tx, rows []uint6
 		row.invalidateCount()
 		return row, nil
 	}
-}
-
-// blockToRoaringData converts a fragment block into a roaring.Bitmap
-// which represents a portion of the data within a single shard.
-// TODO: it seems like we should be able to get the
-// block data as roaring without having to go through
-// this rows/columns step.
-func (f *fragment) blockToRoaringData(block int) ([]byte, error) {
-	rowIDs, columnIDs, err := f.blockData(block)
-	if err != nil {
-		return nil, err
-	}
-	return bitsToRoaringData(pairSet{
-		columnIDs: columnIDs,
-		rowIDs:    rowIDs,
-	})
 }
 
 type rowIterator interface {
@@ -3054,7 +2700,8 @@ func (f *fragment) intRowIterator(tx Tx, wrap bool, filters ...roaring.BitmapFil
 
 func (f *fragment) foreachRow(tx Tx, filters []roaring.BitmapFilter, fn func(rid uint64) error) error {
 	filter := roaring.NewBitmapRowFilter(fn, filters...)
-	return tx.ApplyFilter(f.index(), f.field(), f.view(), f.shard, 0, filter)
+	err := tx.ApplyFilter(f.index(), f.field(), f.view(), f.shard, 0, filter)
+	return errors.Wrap(err, "pilosa.foreachRow: ")
 }
 
 func (it *intRowIterator) Seek(rowID uint64) {
@@ -3127,389 +2774,6 @@ func (it *setRowIterator) Next() (r *Row, rowID uint64, _ *int64, wrapped bool, 
 
 	it.cur++
 	return r, rowID, nil, wrapped, nil
-}
-
-// FragmentBlock represents info about a subsection of the rows in a block.
-// This is used for comparing data in remote blocks for active anti-entropy.
-type FragmentBlock struct {
-	ID       int    `json:"id"`
-	Checksum []byte `json:"checksum"`
-}
-
-type blockHasher struct {
-	blockID int
-	buf     [8]byte
-	hash    hash.Hash
-}
-
-func newBlockHasher() blockHasher {
-	return blockHasher{
-		blockID: -1,
-		hash:    xxhash.New(),
-	}
-}
-func (h *blockHasher) Reset() {
-	h.hash.Reset()
-}
-
-func (h *blockHasher) Sum() []byte {
-	return h.hash.Sum(nil)[:]
-}
-
-func (h *blockHasher) WriteValue(v uint64) {
-	binary.BigEndian.PutUint64(h.buf[:], v)
-	_, _ = h.hash.Write(h.buf[:])
-}
-
-// fragmentSyncer syncs a local fragment to one on a remote host.
-type fragmentSyncer struct {
-	Fragment *fragment
-
-	Node    *disco.Node
-	Cluster *cluster
-
-	// FieldType helps determine which method of syncing to use.
-	FieldType string
-
-	Closing <-chan struct{}
-}
-
-// isClosing returns true if the closing channel is closed.
-func (s *fragmentSyncer) isClosing() bool {
-	select {
-	case <-s.Closing:
-		return true
-	default:
-		return false
-	}
-}
-
-// syncFragment compares checksums for the local and remote fragments and
-// then merges any blocks which have differences.
-func (s *fragmentSyncer) syncFragment() error {
-	span, ctx := tracing.StartSpanFromContext(context.Background(), "FragmentSyncer.syncFragment")
-	defer span.Finish()
-
-	// Create a snapshot of the cluster to use for node/partition calculations.
-	snap := s.Cluster.NewSnapshot()
-
-	// Determine replica set.
-	nodes := snap.ShardNodes(s.Fragment.index(), s.Fragment.shard)
-	if len(nodes) == 1 {
-		return nil
-	}
-
-	// This is here solely to prevent unnecessary work;
-	// if this node isn't the primary replica, there's no need
-	// to continue processing int/decimal fields.
-	if nodes[0].ID != s.Node.ID {
-		switch s.FieldType {
-		case FieldTypeInt, FieldTypeDecimal, FieldTypeTimestamp:
-			return nil
-		}
-	}
-
-	// Create a set of blocks.
-	blockSets := make([][]FragmentBlock, 0, len(nodes))
-	for _, node := range nodes {
-		// Read local blocks.
-		if node.ID == s.Node.ID {
-			b, err := s.Fragment.Blocks() // comes from Tx store, creates its own Tx.
-			if err != nil {
-				return err
-			}
-			blockSets = append(blockSets, b)
-			continue
-		}
-
-		// Retrieve remote blocks.
-		blocks, err := s.Cluster.InternalClient.FragmentBlocks(ctx, &node.URI, s.Fragment.index(), s.Fragment.field(), s.Fragment.view(), s.Fragment.shard)
-		if err != nil && err != ErrFragmentNotFound {
-			return errors.Wrap(err, "getting blocks")
-		}
-		blockSets = append(blockSets, blocks)
-
-		// Verify sync is not prematurely closing.
-		if s.isClosing() {
-			return nil
-		}
-	}
-
-	// Iterate over all blocks and find differences.
-	checksums := make([][]byte, len(nodes))
-	for {
-		// Find min block id.
-		blockID := -1
-		for _, blocks := range blockSets {
-			if len(blocks) == 0 {
-				continue
-			} else if blockID == -1 || blocks[0].ID < blockID {
-				blockID = blocks[0].ID
-			}
-		}
-
-		// Exit loop if no blocks are left.
-		if blockID == -1 {
-			break
-		}
-
-		// Read the checksum for the current block.
-		for i, blocks := range blockSets {
-			// Clear checksum if the next block for the node doesn't match current ID.
-			if len(blocks) == 0 || blocks[0].ID != blockID {
-				checksums[i] = nil
-				continue
-			}
-
-			// Otherwise set checksum and move forward.
-			checksums[i] = blocks[0].Checksum
-			blockSets[i] = blockSets[i][1:]
-		}
-
-		// Ignore if all the blocks on each node match.
-		if byteSlicesEqual(checksums) {
-			continue
-		}
-
-		// If we've gotten here, it means that the block differs
-		// between nodes. If this particular fragment is part of an
-		// `int` or `decimal` field, then instead of using a consensus
-		// to determine which bits to update, we consider the primary
-		// replica to be correct, and overwrite the non-primary replicas
-		// with the primary's data.
-
-		s.Fragment.holder.Logger.Debugf("sync block from primary: index='%v' field='%v' view='%v' shard='%v' id=%d", s.Fragment.index(), s.Fragment.field(), s.Fragment.view(), s.Fragment.shard, blockID)
-
-		switch s.FieldType {
-		case FieldTypeInt, FieldTypeDecimal, FieldTypeTimestamp:
-			// Synchronize block from the primary replica.
-			if err := s.syncBlockFromPrimary(blockID); err != nil {
-				return fmt.Errorf("sync block from primary: id=%d, err=%s", blockID, err)
-			}
-			s.Fragment.stats.CountWithCustomTags(MetricBlockRepair, 1, 1.0, []string{"primary:true"})
-		default:
-			// Synchronize block.
-			if err := s.syncBlock(blockID); err != nil {
-				return fmt.Errorf("sync block: id=%d, err=%s", blockID, err)
-			}
-			s.Fragment.stats.CountWithCustomTags(MetricBlockRepair, 1, 1.0, []string{"primary:false"})
-		}
-	}
-
-	return nil
-}
-
-// syncBlockFromPrimary sends all rows for a given block
-// from the primary replica to non-primary replicas.
-// Since this is pushing updates out to replicas, it only
-// runs on the primary replica.
-// Returns an error if any remote hosts are unreachable.
-func (s *fragmentSyncer) syncBlockFromPrimary(id int) error {
-	span, ctx := tracing.StartSpanFromContext(context.Background(), "FragmentSyncer.syncBlockFromPrimary")
-	defer span.Finish()
-
-	f := s.Fragment
-
-	// Create a snapshot of the cluster to use for node/partition calculations.
-	snap := s.Cluster.NewSnapshot()
-
-	// Determine replica set. Return early if this is not
-	// the primary node.
-	nodes := snap.ShardNodes(f.index(), f.shard)
-	if s.Node.ID != nodes[0].ID {
-		f.holder.Logger.Debugf("non-primary replica expecting sync from primary: %s, index=%s, field=%s, shard=%d", nodes[0].ID, f.index(), f.field(), f.shard)
-		return nil
-	}
-
-	// Get the local block represented as roaring data.
-	localData, err := f.blockToRoaringData(id)
-	if err != nil {
-		return errors.Wrap(err, "converting block to roaring data")
-	}
-
-	// Verify sync is not prematurely closing.
-	if s.isClosing() {
-		return nil
-	}
-
-	// Create the overwrite request to be sent to non-primary replicas.
-	overwriteReq := &ImportRoaringRequest{
-		Action: RequestActionOverwrite,
-		Block:  id,
-		Views:  map[string][]byte{cleanViewName(f.view()): localData},
-	}
-
-	// Write updates to remote blocks.
-	for _, node := range nodes {
-		if s.Node.ID == node.ID {
-			continue
-		}
-
-		uri := &node.URI
-		if err := s.Cluster.InternalClient.ImportRoaring(ctx, uri, f.index(), f.field(), f.shard, true, overwriteReq); err != nil {
-			return errors.Wrap(err, "sending roaring data (overwrite)")
-		}
-	}
-
-	return nil
-}
-
-// syncBlock sends and receives all rows for a given block.
-// Returns an error if any remote hosts are unreachable.
-func (s *fragmentSyncer) syncBlock(id int) error {
-	span, ctx := tracing.StartSpanFromContext(context.Background(), "FragmentSyncer.syncBlock")
-	defer span.Finish()
-
-	f := s.Fragment
-
-	// Create a snapshot of the cluster to use for node/partition calculations.
-	snap := s.Cluster.NewSnapshot()
-
-	// Read pairs from each remote block.
-	var uris []*pnet.URI
-	var pairSets []pairSet
-	for _, node := range snap.ShardNodes(f.index(), f.shard) {
-		if s.Node.ID == node.ID {
-			continue
-		}
-
-		// Verify sync is not prematurely closing.
-		if s.isClosing() {
-			return nil
-		}
-
-		uri := &node.URI
-		uris = append(uris, uri)
-
-		// Only sync the standard block.
-		// Does a remote fetch
-		rowIDs, columnIDs, err := s.Cluster.InternalClient.BlockData(ctx, &node.URI, f.index(), f.field(), f.view(), f.shard, id)
-		if err != nil {
-			return errors.Wrap(err, "getting block")
-		}
-
-		pairSets = append(pairSets, pairSet{
-			columnIDs: columnIDs,
-			rowIDs:    rowIDs,
-		})
-	}
-
-	// Verify sync is not prematurely closing.
-	if s.isClosing() {
-		return nil
-	}
-
-	idx := f.holder.Index(f.index())
-	tx := idx.holder.txf.NewTx(Txo{Write: writable, Index: idx, Shard: f.shard})
-	defer tx.Rollback()
-
-	// Merge blocks together.
-	sets, clears, err := f.mergeBlock(tx, id, pairSets)
-	if err != nil {
-		return errors.Wrap(err, "merging")
-	}
-
-	// no safeCopy needed here. We are not leaking data outside the tx, because
-	// sets and clears only contain columnIDs.
-
-	err = tx.Commit()
-	if err != nil {
-		return err
-	}
-
-	// Write updates to remote blocks.
-	for i := 0; i < len(uris); i++ {
-		set, clear := sets[i], clears[i]
-
-		// Handle Sets.
-		if len(set.columnIDs) > 0 {
-			setData, err := bitsToRoaringData(set)
-			if err != nil {
-				return errors.Wrap(err, "converting bits to roaring data (set)")
-			}
-
-			setReq := &ImportRoaringRequest{
-				Action: RequestActionSet,
-				Views:  map[string][]byte{cleanViewName(f.view()): setData},
-			}
-
-			if err := s.Cluster.InternalClient.ImportRoaring(ctx, uris[i], f.index(), f.field(), f.shard, true, setReq); err != nil {
-				return errors.Wrap(err, "sending roaring data (set)")
-			}
-		}
-
-		// Handle Clears.
-		if len(clear.columnIDs) > 0 {
-			clearData, err := bitsToRoaringData(clear)
-			if err != nil {
-				return errors.Wrap(err, "converting bits to roaring data (clear)")
-			}
-
-			clearReq := &ImportRoaringRequest{
-				Action: RequestActionClear,
-				Views:  map[string][]byte{cleanViewName(f.view()): clearData},
-			}
-
-			if err := s.Cluster.InternalClient.ImportRoaring(ctx, uris[i], f.index(), f.field(), f.shard, true, clearReq); err != nil {
-				return errors.Wrap(err, "sending roaring data (clear)")
-			}
-		}
-	}
-
-	return nil
-}
-
-// cleanViewName converts a view name into the equivalent
-// string required by the external api. Because views are
-// not exposed externally, the conversion looks like this:
-// "standard" -> ""
-// "standard_YYYYMMDD" -> "YYYYMMDD"
-// "other" -> "other" (there is currently not a use for this)
-func cleanViewName(v string) string {
-	viewPrefix := viewStandard + "_"
-	if strings.HasPrefix(v, viewPrefix) {
-		return v[len(viewPrefix):]
-	} else if v == viewStandard {
-		return ""
-	}
-	return v
-}
-
-// bitsToRoaringData converts a pairSet into a roaring.Bitmap
-// which represents the data within a single shard.
-func bitsToRoaringData(ps pairSet) ([]byte, error) {
-	bmp := roaring.NewBitmap()
-	for j := 0; j < len(ps.columnIDs); j++ {
-		bmp.DirectAdd(ps.rowIDs[j]*ShardWidth + (ps.columnIDs[j] % ShardWidth))
-	}
-
-	var buf bytes.Buffer
-	_, err := bmp.WriteTo(&buf)
-	if err != nil {
-		return nil, errors.Wrap(err, "writing to buffer")
-	}
-
-	return buf.Bytes(), nil
-}
-
-// pairSet is a list of equal length row and column id lists.
-type pairSet struct {
-	rowIDs    []uint64
-	columnIDs []uint64
-}
-
-// byteSlicesEqual returns true if all slices are equal.
-func byteSlicesEqual(a [][]byte) bool {
-	if len(a) == 0 {
-		return true
-	}
-
-	for _, v := range a[1:] {
-		if !bytes.Equal(a[0], v) {
-			return false
-		}
-	}
-	return true
 }
 
 // pos returns the row position of a row/column pair.
@@ -3652,10 +2916,6 @@ func (f *fragment) sortBsiData(tx Tx, filter *Row, bitDepth uint64, sort_desc bo
 		return nil, err
 	}
 	pos := consider.Difference(row)
-	row, err = f.row(tx, 0)
-	if err != nil {
-		return nil, err
-	}
 	neg := consider.Difference(pos)
 
 	var sortedRowIds []RowKV

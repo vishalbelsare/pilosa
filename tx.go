@@ -51,11 +51,6 @@ type Tx interface {
 	// Commit makes the updates in the Tx visible to subsequent transactions.
 	Commit() error
 
-	// NewTxIterator returns a *roaring.Iterator whose Next() method will
-	// successively return each uint64 stored in the conceptual roaring.Bitmap
-	// for the specified fragment.
-	NewTxIterator(index, field, view string, shard uint64) *roaring.Iterator
-
 	// ContainerIterator loops over the containers in the conceptual
 	// roaring.Bitmap for the specified fragment.
 	// Calling Next() on the returned roaring.ContainerIterator gives
@@ -106,16 +101,12 @@ type Tx interface {
 	// Remove removes the 'a' values from the Bitmap for the fragment.
 	Remove(index, field, view string, shard uint64, a ...uint64) (changeCount int, err error)
 
+	// Removed removes values, returning the set of values it removed.
+	// It may overwrite the slice passed to it.
+	Removed(index, field, view string, shard uint64, a ...uint64) (changed []uint64, err error)
+
 	// Contains tests if the uint64 v is stored in the fragment's Bitmap.
 	Contains(index, field, view string, shard uint64, v uint64) (exists bool, err error)
-
-	// ForEach calls function `fn` on every value (bit set) in the Bitmap for
-	// the fragment.
-	ForEach(index, field, view string, shard uint64, fn func(i uint64) error) error
-
-	// ForEachRange calls function `fn` on every value (bit set) in the Bitmap for
-	// the fragment, limited to the [start, end) range.
-	ForEachRange(index, field, view string, shard uint64, start, end uint64, fn func(uint64) error) error
 
 	// Count returns the count of hot bits on the fragment.
 	Count(index, field, view string, shard uint64) (uint64, error)

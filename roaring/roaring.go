@@ -1364,31 +1364,49 @@ func (b *Bitmap) unionIntoTargetSingle(target *Bitmap, other *Bitmap) {
 // the bitmap at a specific key,  ^ symbol represents the bitmaps current container iteration position,
 // and the - symbol represents a container that is at the current iteration position, but has been marked as "handled".
 //
-//          ----------------------------      |      ----------------------------      |      ----------------------------
+//	----------------------------      |      ----------------------------      |      ----------------------------
+//
 // Bitmap 1 |___X____________X__________|     |      |___X____________X__________|     |      |___X____________X__________|
-//              ^                             |          _                             |
-//          ----------------------------      |      ----------------------------      |      ----------------------------
+//
+//	    ^                             |          _                             |
+//	----------------------------      |      ----------------------------      |      ----------------------------
+//
 // Bitmap 2 |_______X________X______X___|     |      |_______X_______________X___|     |      |_______X_______________X___|
-//                  ^                         |              ^                         |
-//          ----------------------------      |      ----------------------------      |      ----------------------------
+//
+//	        ^                         |              ^                         |
+//	----------------------------      |      ----------------------------      |      ----------------------------
+//
 // Bitmap 3 |_______X___________________|     |      |_______X___________________|     |      |_______X___________________|
-//                  ^                         |              ^                         |
-//          ----------------------------      |      ----------------------------      |      ----------------------------
+//
+//	        ^                         |              ^                         |
+//	----------------------------      |      ----------------------------      |      ----------------------------
+//
 // Bitmap 4 |___X_______________________|     |      |___X_______________________|     |      |___X_______________________|
-//              ^                             |          _                             |
+//
+//	^                             |          _                             |
+//
 // ------------------------------------------------------------------------------------------------------------------------
-//          ----------------------------      |      ----------------------------      |      ----------------------------
+//
+//	----------------------------      |      ----------------------------      |      ----------------------------
+//
 // Bitmap 1 |___X____________X__________|     |      |___X____________X__________|     |      |___X____________X__________|
-//              _                             |                       ^                |                       _
-//          ----------------------------      |      ----------------------------      |      ----------------------------
+//
+//	    _                             |                       ^                |                       _
+//	----------------------------      |      ----------------------------      |      ----------------------------
+//
 // Bitmap 2 |_______X_______________X___|     |      |_______X_______________X___|     |      |_______X_______________X___|
-//                  _                         |                              ^         |                              ^
-//          ----------------------------      |      ----------------------------      |      ----------------------------
+//
+//	        _                         |                              ^         |                              ^
+//	----------------------------      |      ----------------------------      |      ----------------------------
+//
 // Bitmap 3 |_______X___________________|     |      |_______X___________________|     |      |_______X___________________|
-//                  _                         |                                        |
-//          ----------------------------      |      ----------------------------      |      ----------------------------
+//
+//	        _                         |                                        |
+//	----------------------------      |      ----------------------------      |      ----------------------------
+//
 // Bitmap 4 |___X_______________________|     |      |___X_______________________|     |      |___X_______________________|
-//              _
+//
+//	_
 func (b *Bitmap) unionInPlace(others ...*Bitmap) {
 	const staticSize = 20
 	var (
@@ -1823,10 +1841,7 @@ type containerIteratorRoaringIteratorWrapper struct {
 
 func (c *containerIteratorRoaringIteratorWrapper) Next() bool {
 	c.nextKey, c.nextCont = c.r.NextContainer()
-	if c.nextCont == nil {
-		return false
-	}
-	return true
+	return c.nextCont != nil
 }
 
 func (c *containerIteratorRoaringIteratorWrapper) Value() (uint64, *Container) {
@@ -4392,7 +4407,7 @@ func intersectionAnyBitmapBitmap(a, b *Container) bool {
 	return false
 }
 
-func containerCallback(a *Container, fn func(uint16)) {
+func ContainerCallback(a *Container, fn func(uint16)) {
 	if a.N() == 0 {
 		return
 	}
@@ -4422,11 +4437,11 @@ func containerCallback(a *Container, fn func(uint16)) {
 
 func intersectionCallback(a, b *Container, fn func(uint16)) {
 	if a.N() == MaxContainerVal+1 {
-		containerCallback(b, fn)
+		ContainerCallback(b, fn)
 		return
 	}
 	if b.N() == MaxContainerVal+1 {
-		containerCallback(a, fn)
+		ContainerCallback(a, fn)
 		return
 	}
 	if a.N() == 0 || b.N() == 0 {
@@ -4502,7 +4517,7 @@ func intersectionCountArrayArray(a, b *Container) (n int32) {
 	na, nb := len(ca), len(cb)
 	if na > nb {
 		ca, cb = cb, ca
-		na, nb = nb, na // nolint: staticcheck, ineffassign
+		na, nb = nb, na //nolint: staticcheck, ineffassign
 	}
 	j := 0
 	for _, va := range ca {
@@ -4604,7 +4619,7 @@ func intersectionCallbackArrayArray(a, b *Container, fn func(uint16)) {
 	na, nb := len(ca), len(cb)
 	if na > nb {
 		ca, cb = cb, ca
-		na, nb = nb, na // nolint: staticcheck, ineffassign
+		na, nb = nb, na //nolint: staticcheck, ineffassign
 	}
 	if (na << 2) < nb {
 		for _, va := range ca {
@@ -6554,7 +6569,7 @@ func trailingZeroN(v uint64) int {
 }
 
 // ErrorList represents a list of errors.
-type ErrorList []error
+type ErrorList []error //nolint:errname
 
 func (a ErrorList) Error() string {
 	switch len(a) {
@@ -6744,7 +6759,7 @@ func xorCompare(x *xorstm) (r1 Interval16, hasData bool) {
 	return r1, hasData
 }
 
-//stm  is state machine used to "xor" iterate over runs.
+// stm  is state machine used to "xor" iterate over runs.
 type xorstm struct {
 	vaValid, vbValid bool
 	va, vb           Interval16

@@ -7,51 +7,65 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/featurebasedb/featurebase/v3/pql"
-	"github.com/featurebasedb/featurebase/v3/testhook"
 )
 
+// AssertEqual checks a given RowIdentifiers against expected values.
+func (r *RowIdentifiers) AssertEqual(tb testing.TB, other *RowIdentifiers) {
+	sort.Slice(r.Rows, func(i, j int) bool { return r.Rows[i] < r.Rows[j] })
+	sort.Slice(other.Rows, func(i, j int) bool { return other.Rows[i] < other.Rows[j] })
+	if len(r.Rows) != len(other.Rows) {
+		tb.Fatalf("row ID mismatch: got %d, expected %d", r.Rows, other.Rows)
+	}
+	for i := range r.Rows {
+		if r.Rows[i] != other.Rows[i] {
+			tb.Fatalf("row ID mismatch: got %d, expected %d", r.Rows, other.Rows)
+		}
+	}
+	sort.Strings(r.Keys)
+	sort.Strings(other.Keys)
+	if len(r.Keys) != len(other.Keys) {
+		tb.Fatalf("row keys mismatch: got %s, expected %s", r.Keys, other.Keys)
+	}
+	for i := range r.Keys {
+		if r.Keys[i] != other.Keys[i] {
+			tb.Fatalf("row keys mismatch: got %s, expected %s", r.Keys, other.Keys)
+		}
+	}
+}
+
 func TestExecutor_TranslateRowsOnBool(t *testing.T) {
-	path, _ := testhook.TempDirInDir(t, *TempDir, "pilosa-executor-")
-	holder := NewHolder(path, mustHolderConfig())
-	defer holder.Close()
+	holder := newTestHolder(t)
 
 	e := &executor{
 		Holder:  holder,
 		Cluster: NewTestCluster(t, 1),
 	}
-	if err := e.Holder.Open(); err != nil {
-		t.Fatalf("opening holder: %v", err)
-	}
 
-	idx, err := e.Holder.CreateIndex("i", IndexOptions{})
+	idx, err := e.Holder.CreateIndex("i", "", IndexOptions{})
 	if err != nil {
 		t.Fatalf("creating index: %v", err)
 	}
 
-	shard := uint64(0)
-	tx := idx.holder.txf.NewTx(Txo{Write: writable, Index: idx, Shard: shard})
-	defer tx.Rollback()
+	qcx := holder.Txf().NewWritableQcx()
+	defer qcx.Abort()
 
-	fb, errb := idx.CreateField("b", OptFieldTypeBool())
-	_, errbk := idx.CreateField("bk", OptFieldTypeBool(), OptFieldKeys())
+	fb, errb := idx.CreateField("b", "", OptFieldTypeBool())
+	_, errbk := idx.CreateField("bk", "", OptFieldTypeBool(), OptFieldKeys())
 	if errb != nil || errbk != nil {
 		t.Fatalf("creating fields %v, %v", errb, errbk)
 	}
 
-	_, err1 := fb.SetBit(tx, 1, 1, nil)
-	_, err2 := fb.SetBit(tx, 2, 2, nil)
-	_, err3 := fb.SetBit(tx, 3, 3, nil)
+	_, err1 := fb.SetBit(qcx, 1, 1, nil)
+	_, err2 := fb.SetBit(qcx, 2, 2, nil)
+	_, err3 := fb.SetBit(qcx, 3, 3, nil)
 	if err1 != nil || err2 != nil || err3 != nil {
 		t.Fatalf("setting bit %v, %v, %v", err1, err2, err3)
-	}
-
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
 	}
 
 	tests := []struct {
@@ -221,7 +235,6 @@ func TestExecutor_GroupCountCondition(t *testing.T) {
 			t.Run(fmt.Sprintf("test (#%d):", i), func(t *testing.T) {
 				for j, check := range test.checks {
 					t.Run(fmt.Sprintf("check (#%d):", j), func(t *testing.T) {
-
 						query, err := pql.ParseString(fmt.Sprintf("GroupBy(Rows(a), having=Condition(%s))", check.cond))
 						if err != nil {
 							t.Fatalf("parsing query: %v", err)
@@ -308,12 +321,12 @@ func TestValCountComparisons(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(test.name+strconv.Itoa(i), func(t *testing.T) {
-			gotLarger := test.vc.larger(test.other)
+			gotLarger := test.vc.Larger(test.other)
 			if gotLarger != test.expLarger {
 				t.Fatalf("larger failed, expected:\n%+v\ngot:\n%+v", test.expLarger, gotLarger)
 			}
 
-			gotSmaller := test.vc.smaller(test.other)
+			gotSmaller := test.vc.Smaller(test.other)
 			if gotSmaller != test.expSmaller {
 				t.Fatalf("smaller failed, expected:\n%+v\ngot:\n%+v", test.expSmaller, gotSmaller)
 			}
@@ -474,7 +487,6 @@ func TestGetSorter(t *testing.T) {
 			if !reflect.DeepEqual(gcs, tst.expGCS) {
 				t.Errorf("exp:\n%+v\ngot:\n%v\n", tst.expGCS, gcs)
 			}
-
 		})
 	}
 }
@@ -492,17 +504,16 @@ func TestExecutorSafeCopyDistinctTimestamp(t *testing.T) {
 }
 
 func TestGetScaledInt(t *testing.T) {
-	f := OpenField(t, OptFieldTypeTimestamp(time.Now(), "ms"))
+	_, _, f := newTestField(t, OptFieldTypeTimestamp(time.Now(), "ms"))
 	// check that fields with type timestamp return the int64 passed in to getScaledInt with nil err
 	v := time.Now().Unix()
-	res, err := getScaledInt(f.Field, v)
+	res, err := getScaledInt(f, v)
 	if err != nil {
 		t.Errorf("got error %v, expected nil", err)
 	}
 	if !reflect.DeepEqual(res, v) {
 		t.Errorf("expected %v, got %v", v, res)
 	}
-
 }
 
 func TestDistinctTimestampUnion(t *testing.T) {
@@ -547,51 +558,40 @@ func TestDistinctTimestampUnion(t *testing.T) {
 }
 
 func TestExecutor_DeleteRows(t *testing.T) {
-	path, _ := testhook.TempDir(t, "pilosa-executor-")
-	holder := NewHolder(path, mustHolderConfig())
-	defer holder.Close()
+	holder := newTestHolder(t)
 
-	if err := holder.Open(); err != nil {
-		t.Fatalf("opening holder: %v", err)
-	}
-
-	idx, err := holder.CreateIndex("i", IndexOptions{TrackExistence: true})
+	idx, err := holder.CreateIndex("i", "", IndexOptions{TrackExistence: true})
 	if err != nil {
 		t.Fatalf("creating index: %v", err)
 	}
 
-	f, err := idx.CreateField("f", OptFieldTypeDefault())
+	f, err := idx.CreateField("f", "")
 	if err != nil {
 		t.Fatalf("creating field: %v", err)
 	}
 
-	shard := uint64(0)
-	tx := idx.holder.txf.NewTx(Txo{Write: writable, Index: idx, Shard: shard})
-	defer tx.Rollback()
-
-	if _, err = f.SetBit(tx, 1, 1, nil); err != nil {
+	qcx := holder.Txf().NewWritableQcx()
+	defer qcx.Abort()
+	if _, err = f.SetBit(qcx, 1, 1, nil); err != nil {
 		t.Fatalf("setting bit: %v", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("failed to commit transaction: %v", err)
-	}
-
-	tx = idx.holder.txf.NewTx(Txo{Write: !writable, Index: idx, Shard: shard})
-	defer tx.Rollback()
-
-	row, err := f.Row(tx, 1)
+	// We rely here on the fact that write Qcx autocommit constantly.
+	row, err := f.Row(qcx, 1)
 	if err != nil {
 		t.Fatalf("failed to read row: %v", err)
 	}
 
 	ctx := context.Background()
-	changed, err := DeleteRows(ctx, row, idx, shard)
+	changed, err := DeleteRows(ctx, row, idx, 0)
 	if !changed || err != nil {
 		t.Fatalf("failed to delete row: %v", err)
 	}
 
-	changed, err = DeleteRows(ctx, row, idx, shard)
+	changed, err = DeleteRows(ctx, row, idx, 0)
+	if err != nil {
+		t.Fatalf("deleting rows: %v", err)
+	}
 	if changed {
 		t.Fatalf("expected delete to not clear bit but it did")
 	}

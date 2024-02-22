@@ -8,13 +8,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"testing/quick"
@@ -33,13 +32,11 @@ var (
 	// In order to generate the sample fragment file,
 	// run an import and copy PILOSA_DATA_DIR/INDEX_NAME/FRAME_NAME/0 to testdata/sample_view
 	FragmentPath = flag.String("fragment", "testdata/sample_view/0", "fragment path")
-
-	TempDir = flag.String("temp-dir", "", "Directory in which to place temporary data (e.g. for benchmarking). Useful if you are trying to benchmark different storage configurations.")
 )
 
 // Ensure a fragment can set a bit and retrieve it.
 func TestFragment_SetBit(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+	f, idx, tx := mustOpenFragment(t)
 	defer f.Clean(t)
 
 	// Set bits on the fragment.
@@ -79,7 +76,7 @@ func TestFragment_SetBit(t *testing.T) {
 
 // Ensure a fragment can clear a set bit.
 func TestFragment_ClearBit(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+	f, idx, tx := mustOpenFragment(t)
 	_ = idx
 	defer f.Clean(t)
 
@@ -113,7 +110,7 @@ func TestFragment_ClearBit(t *testing.T) {
 
 // Ensure a fragment can clear a row.
 func TestFragment_ClearRow(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+	f, idx, tx := mustOpenFragment(t)
 	_ = idx
 	defer f.Clean(t)
 
@@ -144,7 +141,7 @@ func TestFragment_ClearRow(t *testing.T) {
 
 // Ensure a fragment can set a row.
 func TestFragment_SetRow(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 7, "")
+	f, idx, tx := mustOpenFragment(t)
 	_ = idx
 	defer f.Clean(t)
 
@@ -153,14 +150,14 @@ func TestFragment_SetRow(t *testing.T) {
 	rowID := uint64(1000)
 
 	// Set bits on the fragment.
-	if _, err := f.setBit(tx, rowID, 7*ShardWidth+1); err != nil {
+	if _, err := f.setBit(tx, rowID, 1); err != nil {
 		t.Fatal(err)
-	} else if _, err := f.setBit(tx, rowID, 7*ShardWidth+65536); err != nil {
+	} else if _, err := f.setBit(tx, rowID, 65536); err != nil {
 		t.Fatal(err)
 	}
 
 	// Verify data on row.
-	if cols := f.mustRow(tx, rowID).Columns(); !reflect.DeepEqual(cols, []uint64{7*ShardWidth + 1, 7*ShardWidth + 65536}) {
+	if cols := f.mustRow(tx, rowID).Columns(); !reflect.DeepEqual(cols, []uint64{1, 65536}) {
 		t.Fatalf("unexpected columns: %+v", cols)
 	}
 	// Verify count on row.
@@ -169,7 +166,7 @@ func TestFragment_SetRow(t *testing.T) {
 	}
 
 	// Set row (overwrite existing data).
-	row := NewRow(7*ShardWidth+1, 7*ShardWidth+65537, 7*ShardWidth+140000)
+	row := NewRow(1, 65537, 140000)
 	if changed, err := f.unprotectedSetRow(tx, row, rowID); err != nil {
 		t.Fatal(err)
 	} else if !changed {
@@ -181,7 +178,7 @@ func TestFragment_SetRow(t *testing.T) {
 	defer tx.Rollback()
 
 	// Verify data on row.
-	if cols := f.mustRow(tx, rowID).Columns(); !reflect.DeepEqual(cols, []uint64{7*ShardWidth + 1, 7*ShardWidth + 65537, 7*ShardWidth + 140000}) {
+	if cols := f.mustRow(tx, rowID).Columns(); !reflect.DeepEqual(cols, []uint64{1, 65537, 140000}) {
 		t.Fatalf("unexpected columns after set row: %+v", cols)
 	}
 	// Verify count on row.
@@ -220,7 +217,7 @@ func TestFragment_SetRow(t *testing.T) {
 // Ensure a fragment can set & read a value.
 func TestFragment_SetValue(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -272,7 +269,7 @@ func TestFragment_SetValue(t *testing.T) {
 	})
 
 	t.Run("Overwrite", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -317,7 +314,7 @@ func TestFragment_SetValue(t *testing.T) {
 	})
 
 	t.Run("Clear", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -361,7 +358,7 @@ func TestFragment_SetValue(t *testing.T) {
 	})
 
 	t.Run("NotExists", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 		defer tx.Rollback()
@@ -385,18 +382,21 @@ func TestFragment_SetValue(t *testing.T) {
 	})
 
 	t.Run("QuickCheck", func(t *testing.T) {
+		f, idx, tx := mustOpenFragment(t)
+		_ = idx
+		defer f.Clean(t)
+		tx.Rollback()
+
 		if err := quick.Check(func(bitDepth uint64, bitN uint64, values []uint64) bool {
+			tx = idx.holder.txf.NewTx(Txo{Write: true, Index: idx, Fragment: f, Shard: f.shard})
+			defer tx.Rollback()
 			// Limit bit depth & maximum values.
-			bitDepth = (bitDepth % 62) + 1
+			bitDepth = (bitDepth % 8) + 1
 			bitN = (bitN % 99) + 1
 
 			for i := range values {
 				values[i] = values[i] % (1 << bitDepth)
 			}
-
-			f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
-			_ = idx
-			defer f.Clean(t)
 
 			// Set values.
 			m := make(map[uint64]int64)
@@ -426,7 +426,7 @@ func TestFragment_SetValue(t *testing.T) {
 			if err := tx.Commit(); err != nil {
 				t.Fatal(err)
 			}
-			tx = idx.holder.txf.NewTx(Txo{Write: writable, Index: idx, Fragment: f, Shard: f.shard})
+			tx = idx.holder.txf.NewTx(Txo{Write: false, Index: idx, Fragment: f, Shard: f.shard})
 			defer tx.Rollback()
 
 			// Ensure values are set.
@@ -452,7 +452,7 @@ func TestFragment_SetValue(t *testing.T) {
 func TestFragment_Sum(t *testing.T) {
 	const bitDepth = 16
 
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+	f, idx, tx := mustOpenFragment(t)
 	defer f.Clean(t)
 
 	// Set values.
@@ -524,7 +524,7 @@ func TestFragment_Sum(t *testing.T) {
 func TestFragment_MinMax(t *testing.T) {
 	const bitDepth = 16
 
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+	f, idx, tx := mustOpenFragment(t)
 	defer f.Clean(t)
 
 	// Set values.
@@ -607,7 +607,7 @@ func TestFragment_Range(t *testing.T) {
 	const bitDepth = 16
 
 	t.Run("EQ", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -631,7 +631,7 @@ func TestFragment_Range(t *testing.T) {
 	})
 
 	t.Run("EQOversizeRegression", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -656,7 +656,7 @@ func TestFragment_Range(t *testing.T) {
 	})
 
 	t.Run("NEQ", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -680,7 +680,7 @@ func TestFragment_Range(t *testing.T) {
 	})
 
 	t.Run("LT", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -729,7 +729,7 @@ func TestFragment_Range(t *testing.T) {
 	})
 
 	t.Run("LTRegression", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -745,7 +745,7 @@ func TestFragment_Range(t *testing.T) {
 	})
 
 	t.Run("LTMaxRegression", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -763,7 +763,7 @@ func TestFragment_Range(t *testing.T) {
 	})
 
 	t.Run("GT", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -812,7 +812,7 @@ func TestFragment_Range(t *testing.T) {
 	})
 
 	t.Run("GTMinRegression", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -830,7 +830,7 @@ func TestFragment_Range(t *testing.T) {
 	})
 
 	t.Run("GTOversizeRegression", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -848,7 +848,7 @@ func TestFragment_Range(t *testing.T) {
 	})
 
 	t.Run("BETWEEN", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -897,7 +897,7 @@ func TestFragment_Range(t *testing.T) {
 	})
 
 	t.Run("BetweenCommonBitsRegression", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -932,14 +932,14 @@ func BenchmarkFragment_SetValue(b *testing.B) {
 	depths := []uint64{4, 8, 16}
 	for _, bitDepth := range depths {
 		name := fmt.Sprintf("Depth%d", bitDepth)
-		f, idx, tx := mustOpenFragment(b, "i", "f", viewBSIGroupPrefix+"foo", 0, "none")
+		f, idx, tx := mustOpenFragment(b, OptFieldTypeSet("none", 0))
 		_ = idx
 
 		b.Run(name+"_Sparse", func(b *testing.B) {
 			benchmarkSetValues(b, tx, bitDepth, f, func(u uint64) uint64 { return (u + 70000) & (ShardWidth - 1) })
 		})
 		f.Clean(b)
-		f, idx, tx = mustOpenFragment(b, "i", "f", viewBSIGroupPrefix+"foo", 0, "none")
+		f, idx, tx = mustOpenFragment(b, OptFieldTypeSet("none", 0))
 		_ = idx
 		b.Run(name+"_Dense", func(b *testing.B) {
 			benchmarkSetValues(b, tx, bitDepth, f, func(u uint64) uint64 { return (u + 1) & (ShardWidth - 1) })
@@ -1000,13 +1000,13 @@ func BenchmarkFragment_ImportValue(b *testing.B) {
 	depths := []uint64{4, 8, 16, 32}
 	for _, bitDepth := range depths {
 		name := fmt.Sprintf("Depth%d", bitDepth)
-		f, idx, tx := mustOpenBSIFragment(b, "i", "f", viewBSIGroupPrefix+"foo", 0)
+		f, idx, tx := mustOpenFragment(b)
 		_ = idx
 		b.Run(name+"_Sparse", func(b *testing.B) {
 			benchmarkImportValues(b, tx, bitDepth, f, func(u uint64) uint64 { return (u + 19) & (ShardWidth - 1) })
 		})
 		f.Clean(b)
-		f, idx, tx = mustOpenBSIFragment(b, "i", "f", viewBSIGroupPrefix+"foo", 0)
+		f, idx, tx = mustOpenFragment(b)
 		_ = idx
 		b.Run(name+"_Dense", func(b *testing.B) {
 			benchmarkImportValues(b, tx, bitDepth, f, func(u uint64) uint64 { return (u + 1) & (ShardWidth - 1) })
@@ -1037,7 +1037,7 @@ func BenchmarkFragment_RepeatedSmallImports(b *testing.B) {
 							updateRows[i] = uint64(rand.Int63n(int64(numRows))) // row id
 							updateCols[i] = uint64(rand.Int63n(ShardWidth))     // column id
 						}
-						f, idx, tx := mustOpenFragment(b, "i", "f", viewStandard, 0, "")
+						f, idx, tx := mustOpenFragment(b)
 						_ = idx
 						defer f.Clean(b)
 
@@ -1073,7 +1073,7 @@ func BenchmarkFragment_RepeatedSmallImportsRoaring(b *testing.B) {
 						b.StopTimer()
 						// build the update data set all at once - this will get applied
 						// to a fragment in numUpdates batches
-						f, idx, tx := mustOpenFragment(b, "i", "f", viewStandard, 0, "")
+						f, idx, tx := mustOpenFragment(b)
 						_ = idx
 						defer f.Clean(b)
 
@@ -1121,7 +1121,7 @@ func BenchmarkFragment_RepeatedSmallValueImports(b *testing.B) {
 			b.Run(fmt.Sprintf("Updates%dVals%d", numUpdates, valsPerUpdate), func(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					b.StopTimer()
-					f, _, tx := mustOpenBSIFragment(b, "i", "f", viewBSIGroupPrefix+"foo", 0)
+					f, _, tx := mustOpenFragment(b)
 
 					err := f.importValue(tx, initialCols, initialVals, 21, false)
 					if err != nil {
@@ -1146,39 +1146,9 @@ func BenchmarkFragment_RepeatedSmallValueImports(b *testing.B) {
 	}
 }
 
-// Ensure a fragment can iterate over all bits in order.
-func TestFragment_ForEachBit(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
-	_ = idx
-	defer f.Clean(t)
-
-	// Set bits on the fragment.
-	if _, err := f.setBit(tx, 100, 20); err != nil {
-		t.Fatal(err)
-	} else if _, err := f.setBit(tx, 2, 38); err != nil {
-		t.Fatal(err)
-	} else if _, err := f.setBit(tx, 2, 37); err != nil {
-		t.Fatal(err)
-	}
-
-	// Iterate over bits.
-	var result [][2]uint64
-	if err := f.forEachBit(tx, func(rowID, columnID uint64) error {
-		result = append(result, [2]uint64{rowID, columnID})
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Verify bits are correct.
-	if !reflect.DeepEqual(result, [][2]uint64{{2, 37}, {2, 38}, {100, 20}}) {
-		t.Fatalf("unexpected result: %#v", result)
-	}
-}
-
 // Ensure a fragment can return the top n results.
 func TestFragment_Top(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, CacheTypeRanked)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 	_ = idx
 	defer f.Clean(t)
 
@@ -1202,7 +1172,7 @@ func TestFragment_Top(t *testing.T) {
 
 // Ensure a fragment can return top rows that intersect with an input row.
 func TestFragment_TopN_Intersect(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, CacheTypeRanked)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 	_ = idx
 	defer f.Clean(t)
 
@@ -1234,7 +1204,7 @@ func TestFragment_TopN_Intersect_Large(t *testing.T) {
 		t.Skip("short mode")
 	}
 
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, CacheTypeRanked)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 	_ = idx
 	defer f.Clean(t)
 
@@ -1283,7 +1253,7 @@ func TestFragment_TopN_Intersect_Large(t *testing.T) {
 
 // Ensure a fragment can return top rows when specified by ID.
 func TestFragment_TopN_IDs(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, CacheTypeRanked)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 	_ = idx
 	defer f.Clean(t)
 
@@ -1305,7 +1275,7 @@ func TestFragment_TopN_IDs(t *testing.T) {
 
 // Ensure a fragment return none if CacheTypeNone is set
 func TestFragment_TopN_NopCache(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, CacheTypeNone)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeNone, 0))
 	_ = idx
 	defer f.Clean(t)
 
@@ -1331,7 +1301,7 @@ func TestFragment_TopN_CacheSize(t *testing.T) {
 	index := mustOpenIndex(t, IndexOptions{})
 
 	// Create field.
-	field, err := index.CreateFieldIfNotExists("f", OptFieldTypeSet(CacheTypeRanked, cacheSize))
+	field, err := index.CreateFieldIfNotExists("f", "", OptFieldTypeSet(CacheTypeRanked, cacheSize))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1388,113 +1358,9 @@ func TestFragment_TopN_CacheSize(t *testing.T) {
 	}
 }
 
-// Ensure fragment can return a checksum for its blocks.
-func TestFragment_Checksum(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
-	_ = idx
-	defer f.Clean(t)
-	tx.Rollback() // allow f.Checksum to make its read tx.
-
-	// Retrieve checksum and set bits.
-	orig, err := f.Checksum()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tx = idx.holder.txf.NewTx(Txo{Write: writable, Index: idx, Fragment: f, Shard: f.shard})
-	defer tx.Rollback()
-
-	if _, err := f.setBit(tx, 1, 200); err != nil {
-		t.Fatal(err)
-	} else if _, err := f.setBit(tx, HashBlockSize*2, 200); err != nil {
-		t.Fatal(err)
-	}
-	PanicOn(tx.Commit())
-
-	// Ensure new checksum is different.
-	if chksum, err := f.Checksum(); err != nil {
-		t.Fatal(err)
-	} else if bytes.Equal(chksum, orig) {
-		t.Fatalf("expected checksum to change: %x - %x", chksum, orig)
-	}
-}
-
-// Ensure fragment can return a checksum for a given block.
-func TestFragment_Blocks(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
-	_ = idx
-	defer f.Clean(t)
-
-	// Retrieve initial checksum.
-	var prev []FragmentBlock
-
-	// Set first bit.
-	if _, err := f.setBit(tx, 0, 0); err != nil {
-		t.Fatal(err)
-	}
-	PanicOn(tx.Commit())
-	blocks, err := f.Blocks() // FAIL: TestFragment_Blocks b/c 0 blocks back
-	if err != nil {
-		t.Fatal(err)
-	} else if blocks[0].Checksum == nil {
-		t.Fatalf("expected checksum: %x", blocks[0].Checksum)
-	}
-	prev = blocks
-
-	tx = idx.holder.txf.NewTx(Txo{Write: true, Index: idx, Fragment: f, Shard: f.shard})
-	// Set bit on different row.
-	if _, err := f.setBit(tx, 20, 0); err != nil {
-		t.Fatal(err)
-	}
-	PanicOn(tx.Commit())
-	blocks, err = f.Blocks()
-	if err != nil {
-		t.Fatal(err)
-	} else if bytes.Equal(blocks[0].Checksum, prev[0].Checksum) {
-		t.Fatalf("expected checksum to change: %x", blocks[0].Checksum)
-	}
-	prev = blocks
-
-	// Set bit on different column.
-	tx = idx.holder.txf.NewTx(Txo{Write: true, Index: idx, Fragment: f, Shard: f.shard})
-	defer tx.Rollback()
-	if _, err := f.setBit(tx, 20, 100); err != nil {
-		t.Fatal(err)
-	}
-	PanicOn(tx.Commit())
-	blocks, err = f.Blocks()
-	if err != nil {
-		t.Fatal(err)
-	} else if bytes.Equal(blocks[0].Checksum, prev[0].Checksum) {
-		t.Fatalf("expected checksum to change: %x", blocks[0].Checksum)
-	}
-}
-
-// Ensure fragment returns an empty checksum if no data exists for a block.
-func TestFragment_Blocks_Empty(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
-	_ = idx
-	defer f.Clean(t)
-
-	// Set bits on a different block.
-	if _, err := f.setBit(tx, 100, 1); err != nil {
-		t.Fatal(err)
-	}
-	PanicOn(tx.Commit()) // f.Blocks() will start a new Tx, so the SetBit needs to be visible before that.
-
-	// Ensure checksum for block 1 is blank.
-	if blocks, err := f.Blocks(); err != nil {
-		t.Fatal(err)
-	} else if len(blocks) != 1 {
-		t.Fatalf("unexpected block count: %d", len(blocks))
-	} else if blocks[0].ID != 1 {
-		t.Fatalf("unexpected block id: %d", blocks[0].ID)
-	}
-}
-
 // Ensure a fragment's cache can be persisted between restarts.
 func TestFragment_LRUCache_Persistence(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, CacheTypeLRU)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeLRU, 0))
 	_ = idx
 	defer f.Clean(t)
 
@@ -1529,7 +1395,7 @@ func TestFragment_LRUCache_Persistence(t *testing.T) {
 
 // Ensure a fragment can be copied to another fragment.
 func TestFragment_WriteTo_ReadFrom(t *testing.T) {
-	f0, _, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+	f0, _, tx := mustOpenFragment(t)
 	defer f0.Clean(t)
 
 	// Set and then clear bits on the fragment.
@@ -1558,7 +1424,7 @@ func TestFragment_WriteTo_ReadFrom(t *testing.T) {
 	}
 
 	// Read into another fragment.
-	f1, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+	f1, idx, tx := mustOpenFragment(t)
 	tx.Rollback()
 
 	defer f1.Clean(t)
@@ -1592,33 +1458,8 @@ func TestFragment_WriteTo_ReadFrom(t *testing.T) {
 	}
 }
 
-func BenchmarkFragment_Blocks(b *testing.B) {
-	if *FragmentPath == "" {
-		b.Skip("no fragment specified")
-	}
-	th := newTestHolder(b)
-
-	// Open the fragment specified by the path. Note that newFragment
-	// is overriding the usual holder-to-fragment path logic...
-	f := newFragment(th, makeTestFragSpec(*FragmentPath, "i", "f", viewStandard), 0, 0)
-	if err := f.Open(); err != nil {
-		b.Fatal(err)
-	}
-	defer f.Clean(b)
-
-	// Reset timer and execute benchmark.
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if a, err := f.Blocks(); err != nil {
-			b.Fatal(err)
-		} else if len(a) == 0 {
-			b.Fatal("no blocks in fragment")
-		}
-	}
-}
-
 func BenchmarkFragment_IntersectionCount(b *testing.B) {
-	f, idx, tx := mustOpenFragment(b, "i", "f", viewStandard, 0, "")
+	f, idx, tx := mustOpenFragment(b)
 	defer f.Clean(b)
 
 	// Generate some intersecting data.
@@ -1647,7 +1488,7 @@ func BenchmarkFragment_IntersectionCount(b *testing.B) {
 }
 
 func TestFragment_Tanimoto(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, CacheTypeRanked)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 	_ = idx
 	defer f.Clean(t)
 
@@ -1671,7 +1512,7 @@ func TestFragment_Tanimoto(t *testing.T) {
 }
 
 func TestFragment_Zero_Tanimoto(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, CacheTypeRanked)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 	_ = idx
 	defer f.Clean(t)
 
@@ -1698,7 +1539,7 @@ func TestFragment_Zero_Tanimoto(t *testing.T) {
 
 // Ensure a fragment can set mutually exclusive values.
 func TestFragment_SetMutex(t *testing.T) {
-	f, _, tx := mustOpenMutexFragment(t, "i", "f", viewStandard, 0, "")
+	f, _, tx := mustOpenFragment(t, OptFieldTypeMutex(DefaultCacheType, DefaultCacheSize))
 	defer f.Clean(t)
 
 	var cols []uint64
@@ -1812,7 +1653,7 @@ func TestFragment_ImportSet(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("importset%d", i), func(t *testing.T) {
-			f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+			f, idx, tx := mustOpenFragment(t)
 			_ = idx
 			defer f.Clean(t)
 
@@ -1930,7 +1771,7 @@ func TestFragment_ImportSet_WithTxCommit(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("importset%d", i), func(t *testing.T) {
-			f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+			f, idx, tx := mustOpenFragment(t)
 			_ = idx
 			defer f.Clean(t)
 
@@ -1980,7 +1821,7 @@ func TestFragment_ImportSet_WithTxCommit(t *testing.T) {
 func TestFragment_ConcurrentImport(t *testing.T) {
 	t.Run("bulkImportStandard", func(t *testing.T) {
 		shard := uint64(0)
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, shard, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 		// note: write Tx must be used on the same goroutine that created them.
@@ -2091,7 +1932,7 @@ func TestFragment_ImportMutex(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("importmutex%d", i), func(t *testing.T) {
-			f, _, tx := mustOpenMutexFragment(t, "i", "f", viewStandard, 0, "")
+			f, _, tx := mustOpenFragment(t, OptFieldTypeMutex(DefaultCacheType, DefaultCacheSize))
 			defer f.Clean(t)
 
 			// Set import.
@@ -2210,7 +2051,7 @@ func TestFragment_ImportMutex_WithTxCommit(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("importmutex%d", i), func(t *testing.T) {
-			f, idx, tx := mustOpenMutexFragment(t, "i", "f", viewStandard, 0, "")
+			f, idx, tx := mustOpenFragment(t, OptFieldTypeMutex(DefaultCacheType, DefaultCacheSize))
 			defer f.Clean(t)
 
 			// Set import.
@@ -2341,7 +2182,7 @@ func TestFragment_ImportBool(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("importmutex%d", i), func(t *testing.T) {
-			f, _, tx := mustOpenBoolFragment(t, "i", "f", viewStandard, 0, "")
+			f, _, tx := mustOpenFragment(t, OptFieldTypeBool())
 			defer f.Clean(t)
 
 			// Set import.
@@ -2460,7 +2301,7 @@ func TestFragment_ImportBool_WithTxCommit(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("importmutex%d", i), func(t *testing.T) {
-			f, idx, tx := mustOpenBoolFragment(t, "i", "f", viewStandard, 0, "")
+			f, idx, tx := mustOpenFragment(t, OptFieldTypeBool())
 			defer f.Clean(t)
 
 			// Set import.
@@ -2506,17 +2347,6 @@ func TestFragment_ImportBool_WithTxCommit(t *testing.T) {
 	}
 }
 
-func makeTestFragSpec(path, index, field, view0 string) fragSpec {
-
-	// /tmp/holder-dir199550572/i/f/views/standard/fragments/0 -> /tmp/holder-dir199550572/i/f/views/standard
-	splt := strings.Split(path, sep+"fragments"+sep)
-	return fragSpec{
-		index: &Index{path: splt[0], name: index},
-		field: &Field{name: field},
-		view:  &view{path: splt[0], name: view0},
-	}
-}
-
 func BenchmarkFragment_Import(b *testing.B) {
 	b.StopTimer()
 	maxX := ShardWidth * 5 * 2
@@ -2543,7 +2373,7 @@ func BenchmarkFragment_Import(b *testing.B) {
 		// since bulkImport modifies the input slices, we make new copies for each round
 		copy(rowsUse, rows)
 		copy(colsUse, cols)
-		f, idx, tx := mustOpenFragment(b, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(b)
 		_ = idx
 		b.StartTimer()
 		if err := f.bulkImport(tx, rowsUse, colsUse, options); err != nil {
@@ -2570,7 +2400,7 @@ func BenchmarkImportRoaring(b *testing.B) {
 			b.Run(fmt.Sprintf("Rows%dCache_%s", numRows, cacheType), func(b *testing.B) {
 				b.StopTimer()
 				for i := 0; i < b.N; i++ {
-					f, _, tx := mustOpenFragment(b, "i", fmt.Sprintf("r%dc%s", numRows, cacheType), viewStandard, 0, cacheType)
+					f, _, tx := mustOpenFragment(b, OptFieldTypeSet(cacheType, 0))
 					b.StartTimer()
 
 					err := f.importRoaringT(tx, data, false)
@@ -2606,7 +2436,7 @@ func BenchmarkImportRoaringConcurrent(b *testing.B) {
 					txs := make([]Tx, concurrency)
 					for i := 0; i < b.N; i++ {
 						for j := 0; j < concurrency; j++ {
-							frags[j], _, txs[j] = mustOpenFragment(b, "i", "f", viewStandard, uint64(j), cacheType)
+							frags[j], _, txs[j] = mustOpenFragment(b, OptFieldTypeSet(cacheType, 0))
 						}
 						eg := errgroup.Group{}
 						b.StartTimer()
@@ -2644,7 +2474,7 @@ func BenchmarkImportStandard(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					copy(rowIDs, rowIDsOrig)
 					copy(columnIDs, columnIDsOrig)
-					f, idx, tx := mustOpenFragment(b, "i", fmt.Sprintf("r%dc%s", numRows, cacheType), viewStandard, 0, cacheType)
+					f, idx, tx := mustOpenFragment(b, OptFieldTypeSet(cacheType, 0))
 					_ = idx
 					b.StartTimer()
 					err := f.bulkImport(tx, rowIDs, columnIDs, &ImportOptions{})
@@ -2673,7 +2503,7 @@ func BenchmarkImportRoaringUpdate(b *testing.B) {
 				b.Run(name, func(b *testing.B) {
 					b.StopTimer()
 					for i := 0; i < b.N; i++ {
-						f, idx, tx := mustOpenFragment(b, "i", fmt.Sprintf("r%dc%dcache_%s", numRows, numCols, cacheType), viewStandard, 0, cacheType)
+						f, idx, tx := mustOpenFragment(b, OptFieldTypeSet(cacheType, 0))
 						_ = idx
 
 						itr, err := roaring.NewRoaringIterator(data)
@@ -2726,7 +2556,7 @@ func BenchmarkUpdatePathological(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		f, idx, tx := mustOpenFragment(b, "i", "f", viewStandard, 0, DefaultCacheType)
+		f, idx, tx := mustOpenFragment(b, OptFieldTypeSet(DefaultCacheType, 0))
 		_ = idx
 
 		err := f.importRoaringT(tx, exists, false)
@@ -2747,7 +2577,7 @@ var bigFrag string
 
 func initBigFrag(tb testing.TB) {
 	if bigFrag == "" {
-		f, _, tx := mustOpenFragment(tb, "i", "f", viewStandard, 0, DefaultCacheType)
+		f, _, tx := mustOpenFragment(tb, OptFieldTypeSet(DefaultCacheType, 0))
 		for i := int64(0); i < 10; i++ {
 			// 10 million rows, 1 bit per column, random seeded by i
 			data := getZipfRowsSliceRoaring(10000000, i, 0, ShardWidth)
@@ -2776,7 +2606,7 @@ func BenchmarkImportIntoLargeFragment(b *testing.B) {
 		if err != nil {
 			b.Fatalf("opening frag file: %v", err)
 		}
-		fi, err := testhook.TempFileInDir(b, *TempDir, "")
+		fi, err := testhook.TempFile(b, "")
 		if err != nil {
 			b.Fatalf("getting temp file: %v", err)
 		}
@@ -2787,19 +2617,15 @@ func BenchmarkImportIntoLargeFragment(b *testing.B) {
 		origF.Close()
 		fi.Close()
 
-		h := NewHolder(fi.Name(), mustHolderConfig())
-		PanicOn(h.Open())
-		idx, err := h.CreateIndex("i", IndexOptions{})
-		PanicOn(err)
+		h, idx, _, _, f := newTestFragment(b)
 
-		f := newFragment(h, makeTestFragSpec(fi.Name(), "i", "f", viewStandard), 0, 0)
 		err = f.Open()
 		if err != nil {
 			b.Fatalf("opening fragment: %v", err)
 		}
 
 		// Obtain transaction.
-		tx := idx.holder.txf.NewTx(Txo{Write: writable, Index: idx, Fragment: f, Shard: f.shard})
+		tx := h.txf.NewTx(Txo{Write: writable, Index: idx, Fragment: f, Shard: f.shard})
 		defer tx.Rollback()
 
 		copy(rows, rowsOrig)
@@ -2812,7 +2638,6 @@ func BenchmarkImportIntoLargeFragment(b *testing.B) {
 		}
 		PanicOn(tx.Commit())
 		f.Clean(b)
-		h.Close()
 	}
 }
 
@@ -2820,13 +2645,12 @@ func BenchmarkImportRoaringIntoLargeFragment(b *testing.B) {
 	b.StopTimer()
 	initBigFrag(b)
 	updata := getUpdataRoaring(10000000, 11000, 0)
-	th := newTestHolder(b)
 	for i := 0; i < b.N; i++ {
 		origF, err := os.Open(bigFrag)
 		if err != nil {
 			b.Fatalf("opening frag file: %v", err)
 		}
-		fi, err := testhook.TempFileInDir(b, *TempDir, "")
+		fi, err := testhook.TempFile(b, "")
 		if err != nil {
 			b.Fatalf("getting temp file: %v", err)
 		}
@@ -2837,15 +2661,11 @@ func BenchmarkImportRoaringIntoLargeFragment(b *testing.B) {
 		origF.Close()
 		fi.Close()
 
-		// want to do this, but no path argument.
-		//nf, idx, tx := mustOpenFragmentFlags(index, field, view string, shard uint64, cacheType string, flags byte)
+		h, idx, _, _, f := newTestFragment(b)
 
-		idx := fragTestMustOpenIndex("i", th, IndexOptions{})
-		// XXX TODO: newFragment is using the wrong path here, we should fix that someday.
-		f := newFragment(th, makeTestFragSpec(fi.Name(), "i", "f", viewStandard), 0, 0)
 		defer f.Clean(b)
 
-		tx := idx.holder.txf.NewTx(Txo{Write: writable, Index: idx, Fragment: f, Shard: f.shard})
+		tx := h.txf.NewTx(Txo{Write: writable, Index: idx, Fragment: f, Shard: f.shard})
 		defer tx.Rollback()
 
 		err = f.Open()
@@ -2862,7 +2682,7 @@ func BenchmarkImportRoaringIntoLargeFragment(b *testing.B) {
 }
 
 func TestGetZipfRowsSliceRoaring(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, DefaultCacheType)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(DefaultCacheType, 0))
 	_ = idx
 
 	data := getZipfRowsSliceRoaring(10, 1, 0, ShardWidth)
@@ -2885,7 +2705,7 @@ func TestGetZipfRowsSliceRoaring(t *testing.T) {
 }
 
 func prepareSampleRowData(b *testing.B, bits int, rows uint64, width uint64) (*fragment, *Index, Tx) {
-	f, idx, tx := mustOpenFragment(b, "i", "f", viewStandard, 0, "none")
+	f, idx, tx := mustOpenFragment(b, OptFieldTypeSet("none", 0))
 	for i := 0; i < bits; i++ {
 		data := getUniformRowsSliceRoaring(rows, int64(rows)+int64(i), 0, width)
 		err := f.importRoaringT(tx, data, false)
@@ -3073,44 +2893,6 @@ func getZipfRowsSliceStandard(numRows uint64, seed int64, startCol, endCol uint6
 	return rowIDs, columnIDs
 }
 
-func BenchmarkFileWrite(b *testing.B) {
-	for _, numRows := range rowCases {
-		data := getZipfRowsSliceRoaring(numRows, 1, 0, ShardWidth)
-		b.Run(fmt.Sprintf("Rows%d", numRows), func(b *testing.B) {
-			b.StopTimer()
-			for i := 0; i < b.N; i++ {
-				// DO NOT CONVERT THIS ONE TO USE TESTHOOK.
-				// We're deleting these files as we go because
-				// otherwise the benchmark could fill up
-				// $TMPDIR before it finishes running.
-				f, err := ioutil.TempFile(*TempDir, "")
-				if err != nil {
-					b.Fatalf("getting temp file: %v", err)
-				}
-				b.StartTimer()
-				_, err = f.Write(data)
-				if err != nil {
-					os.Remove(f.Name())
-					b.Fatal(err)
-				}
-				err = f.Sync()
-				if err != nil {
-					os.Remove(f.Name())
-					b.Fatal(err)
-				}
-				err = f.Close()
-				if err != nil {
-					os.Remove(f.Name())
-					b.Fatal(err)
-				}
-				b.StopTimer()
-				os.Remove(f.Name())
-			}
-		})
-	}
-
-}
-
 // Clean used to delete fragments, but doesn't anymore -- deleting is
 // handled by the testhook.TempDir when appropriate.
 // TODO(jaffee): this can likely go away entirely... it was doing snapshot/source/generation stuff that it no longer needs to.
@@ -3127,19 +2909,13 @@ func (f *fragment) importRoaringT(tx Tx, data []byte, clear bool) error {
 	return f.importRoaring(context.Background(), tx, data, clear)
 }
 
-// mustOpenFragment returns a new instance of Fragment with a temporary path.
-func mustOpenFragment(tb testing.TB, index, field, view string, shard uint64, cacheType string) (*fragment, *Index, Tx) {
-	return mustOpenFragmentFlags(tb, index, field, view, shard, cacheType, 0)
-}
-
-func mustOpenBSIFragment(tb testing.TB, index, field, view string, shard uint64) (*fragment, *Index, Tx) {
-	return mustOpenFragmentFlags(tb, index, field, view, shard, "", 1)
-}
-
 func newTestHolder(tb testing.TB) *Holder {
-	path, _ := testhook.TempDirInDir(tb, *TempDir, "holder-dir")
-	h := NewHolder(path, mustHolderConfig())
-	PanicOn(h.Open())
+	path := tb.TempDir()
+	h := NewHolder(path, TestHolderConfig())
+	err := h.Open()
+	if err != nil {
+		tb.Fatalf("opening test holder: %v", err)
+	}
 	testhook.Cleanup(tb, func() {
 		h.Close()
 	})
@@ -3147,68 +2923,65 @@ func newTestHolder(tb testing.TB) *Holder {
 	return h
 }
 
-// fragTestMustOpenIndex returns a new, opened index at a temporary path. Panic on error.
-func fragTestMustOpenIndex(index string, holder *Holder, opt IndexOptions) *Index {
-	cim := &CreateIndexMessage{
-		Index:     index,
-		CreatedAt: 0,
-		Meta:      opt,
+// newTestField creates a field with the specified field options
+func newTestField(tb testing.TB, fieldOpts ...FieldOption) (*Holder, *Index, *Field) {
+	if len(fieldOpts) == 0 {
+		fieldOpts = []FieldOption{OptFieldTypeDefault()}
 	}
-
-	holder.mu.Lock()
-	idx, err := holder.createIndex(cim, false)
-	holder.mu.Unlock()
-	PanicOn(err)
-
-	idx.keys = opt.Keys
-	idx.trackExistence = opt.TrackExistence
-
-	if err := idx.Open(); err != nil {
-		PanicOn(err)
+	h := newTestHolder(tb)
+	idx, err := h.CreateIndex("i", "", IndexOptions{})
+	if err != nil {
+		tb.Fatalf("creating test index: %v", err)
 	}
-	return idx
+	fld, err := idx.CreateField("f", "", fieldOpts...)
+	if err != nil {
+		tb.Fatalf("creating test field: %v", err)
+	}
+	return h, idx, fld
+}
+
+// newTestView creates a view with the specified options.
+func newTestView(tb testing.TB, fieldOpts ...FieldOption) (*Holder, *Index, *Field, *view) {
+	h, idx, fld := newTestField(tb, fieldOpts...)
+	v, _, err := fld.createViewIfNotExistsBase(&CreateViewMessage{Index: "i", Field: "f", View: "v"})
+	if err != nil {
+		tb.Fatalf("creating test view: %v", err)
+	}
+	return h, idx, fld, v
+}
+
+// newTestFragment makes the default /i/f/v/0 fragment, and returns the
+// things. the test holder will be deleted automatically in test cleanup.
+func newTestFragment(tb testing.TB, fieldOpts ...FieldOption) (*Holder, *Index, *Field, *view, *fragment) {
+	h, idx, fld, v := newTestView(tb, fieldOpts...)
+	f := v.newFragment(0)
+	return h, idx, fld, v, f
 }
 
 // mustOpenFragment returns a new instance of Fragment with a temporary path.
-func mustOpenFragmentFlags(tb testing.TB, index, field, view string, shard uint64, cacheType string, flags byte) (*fragment, *Index, Tx) {
-	if cacheType == "" {
-		cacheType = DefaultCacheType
+func mustOpenFragment(tb testing.TB, fieldOpts ...FieldOption) (*fragment, *Index, Tx) {
+	th, idx, fld, v, f := newTestFragment(tb, fieldOpts...)
+	fragDir := filepath.Join(idx.path, fld.name, "views", v.name, "fragments")
+	err := os.MkdirAll(fragDir, 0700)
+	if err != nil {
+		tb.Fatalf("creating fragment directory: %v", err)
 	}
 
-	th := newTestHolder(tb)
-	idx := fragTestMustOpenIndex(index, th, IndexOptions{})
-
-	fragDir := fmt.Sprintf("%v/%v/views/%v/fragments/", idx.path, field, view)
-	PanicOn(os.MkdirAll(fragDir, 0750))
-	fragPath := fragDir + fmt.Sprintf("%v", shard)
-	f := newFragment(th, makeTestFragSpec(fragPath, index, field, view), shard, flags)
-
-	tx := idx.holder.txf.NewTx(Txo{Write: writable, Index: idx, Fragment: f, Shard: shard})
+	tx := th.txf.NewTx(Txo{Write: writable, Index: idx, Fragment: f, Shard: 0})
 	testhook.Cleanup(tb, func() {
 		tx.Rollback()
-		PanicOn(idx.holder.txf.CloseIndex(idx))
+
+		if err := th.txf.CloseIndex(idx); err != nil {
+			tb.Fatalf("closing index after test: %v", err)
+		}
 	})
 
-	f.CacheType = cacheType
+	f.CacheType = fld.options.CacheType
 
 	if err := f.Open(); err != nil {
-		PanicOn(err)
+		tb.Fatalf("opening fragment: %v", err)
 	}
 	return f, idx, tx
-}
-
-// mustOpenMutexFragment returns a new instance of Fragment for a mutex field.
-func mustOpenMutexFragment(tb testing.TB, index, field, view string, shard uint64, cacheType string) (*fragment, *Index, Tx) {
-	frag, idx, tx := mustOpenFragment(tb, index, field, view, shard, cacheType)
-	frag.mutexVector = newRowsVector(frag)
-	return frag, idx, tx
-}
-
-// mustOpenBoolFragment returns a new instance of Fragment for a bool field.
-func mustOpenBoolFragment(tb testing.TB, index, field, view string, shard uint64, cacheType string) (*fragment, *Index, Tx) {
-	frag, idx, tx := mustOpenFragment(tb, index, field, view, shard, cacheType)
-	frag.mutexVector = newBoolVector(frag)
-	return frag, idx, tx
 }
 
 // Reopen closes the fragment and reopens it as a new instance.
@@ -3243,7 +3016,7 @@ func addToBitmap(bm *roaring.Bitmap, rowID uint64, columnIDs ...uint64) {
 // Test Various methods of retrieving RowIDs
 func TestFragment_RowsIteration(t *testing.T) {
 	t.Run("firstContainer", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 		defer f.Clean(t)
 
@@ -3275,7 +3048,7 @@ func TestFragment_RowsIteration(t *testing.T) {
 	})
 
 	t.Run("secondRow", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 
 		defer f.Clean(t)
@@ -3309,7 +3082,7 @@ func TestFragment_RowsIteration(t *testing.T) {
 	})
 
 	t.Run("combinations", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+		f, idx, tx := mustOpenFragment(t)
 		_ = idx
 
 		defer f.Clean(t)
@@ -3362,7 +3135,7 @@ func TestFragment_RoaringImport(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("importroaring%d", i), func(t *testing.T) {
-			f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+			f, idx, tx := mustOpenFragment(t)
 			_ = idx
 			defer f.Clean(t)
 
@@ -3411,7 +3184,7 @@ func TestFragment_RoaringImportTopN(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("importroaring%d", i), func(t *testing.T) {
-			f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, CacheTypeRanked)
+			f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 			_ = idx
 			defer f.Clean(t)
 
@@ -3550,7 +3323,7 @@ func calcExpected(inputs ...[]uint64) [][]uint64 {
 
 func TestFragmentRowIterator(t *testing.T) {
 	t.Run("basic", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeRanked)
+		f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 		_ = idx
 
 		defer f.Clean(t)
@@ -3595,7 +3368,7 @@ func TestFragmentRowIterator(t *testing.T) {
 	})
 
 	t.Run("skipped rows", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeRanked)
+		f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 		_ = idx
 		defer f.Clean(t)
 
@@ -3639,7 +3412,7 @@ func TestFragmentRowIterator(t *testing.T) {
 	})
 
 	t.Run("basic wrapped", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeRanked)
+		f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 		_ = idx
 		defer f.Clean(t)
 
@@ -3672,7 +3445,7 @@ func TestFragmentRowIterator(t *testing.T) {
 	})
 
 	t.Run("skipped rows wrapped", func(t *testing.T) {
-		f, _, tx := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeRanked)
+		f, _, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 		defer f.Clean(t)
 
 		f.mustSetBits(tx, 1, 0)
@@ -3707,7 +3480,7 @@ func TestFragmentRowIterator(t *testing.T) {
 // same, with commits
 func TestFragmentRowIterator_WithTxCommit(t *testing.T) {
 	t.Run("basic", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeRanked)
+		f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 		_ = idx
 
 		defer f.Clean(t)
@@ -3756,7 +3529,7 @@ func TestFragmentRowIterator_WithTxCommit(t *testing.T) {
 	})
 
 	t.Run("skipped rows", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeRanked)
+		f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 		_ = idx
 		defer f.Clean(t)
 
@@ -3804,7 +3577,7 @@ func TestFragmentRowIterator_WithTxCommit(t *testing.T) {
 	})
 
 	t.Run("basic wrapped", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeRanked)
+		f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 		_ = idx
 		defer f.Clean(t)
 
@@ -3841,7 +3614,7 @@ func TestFragmentRowIterator_WithTxCommit(t *testing.T) {
 	})
 
 	t.Run("skipped rows wrapped", func(t *testing.T) {
-		f, idx, tx := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeRanked)
+		f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 		_ = idx
 		defer f.Clean(t)
 
@@ -3881,7 +3654,7 @@ func TestFragmentRowIterator_WithTxCommit(t *testing.T) {
 }
 
 func TestFragmentPositionsForValue(t *testing.T) {
-	f, _, _ := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeNone)
+	f, _, _ := mustOpenFragment(t, OptFieldTypeSet(CacheTypeNone, 0))
 	defer f.Clean(t)
 
 	tests := []struct {
@@ -3963,7 +3736,7 @@ func TestFragmentPositionsForValue(t *testing.T) {
 }
 
 func TestIntLTRegression(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeNone)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeNone, 0))
 	_ = idx
 	defer f.Clean(t)
 
@@ -3994,7 +3767,7 @@ func sliceEq(x, y []uint64) bool {
 
 func TestFragmentBSIUnsigned(t *testing.T) {
 	shard := uint64(0)
-	f, idx, tx := mustOpenFragment(t, "i", "f", "v", shard, CacheTypeNone)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeNone, 0))
 	defer f.Clean(t)
 
 	// Number of bits to test.
@@ -4176,7 +3949,7 @@ func TestFragmentBSIUnsigned(t *testing.T) {
 
 // same, WithTxCommit version
 func TestFragmentBSIUnsigned_WithTxCommit(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeNone)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeNone, 0))
 	_ = idx
 	defer f.Clean(t)
 
@@ -4338,7 +4111,7 @@ func TestFragmentBSIUnsigned_WithTxCommit(t *testing.T) {
 }
 
 func TestFragmentBSISigned(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", "v", 0, CacheTypeNone)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeNone, 0))
 	_ = idx
 	defer f.Clean(t)
 
@@ -4501,7 +4274,7 @@ func TestFragmentBSISigned(t *testing.T) {
 }
 
 func TestImportValueConcurrent(t *testing.T) {
-	f, idx, tx := mustOpenBSIFragment(t, "i", "f", viewBSIGroupPrefix+"foo", 0)
+	f, idx, tx := mustOpenFragment(t)
 	defer f.Clean(t)
 	// we will be making a new Tx each time, so we can rollback the default provided one.
 	tx.Rollback()
@@ -4546,7 +4319,7 @@ func TestImportMultipleValues(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			f, _, tx := mustOpenBSIFragment(t, "i", "f", viewBSIGroupPrefix+"foo", 0)
+			f, _, tx := mustOpenFragment(t)
 			defer f.Clean(t)
 
 			err := f.importValue(tx, test.cols, test.vals, test.depth, false)
@@ -4600,7 +4373,7 @@ func TestImportValueRowCache(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			f, _, tx := mustOpenBSIFragment(t, "i", "f", viewBSIGroupPrefix+"foo", 0)
+			f, _, tx := mustOpenFragment(t)
 			defer f.Clean(t)
 
 			// First import (tc1)
@@ -4632,7 +4405,7 @@ func TestImportValueRowCache(t *testing.T) {
 // do we see races/corruption around concurrent read/write.
 // especially on writes to the row cache.
 func TestFragmentConcurrentReadWrite(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, CacheTypeRanked)
+	f, idx, tx := mustOpenFragment(t, OptFieldTypeSet(CacheTypeRanked, DefaultCacheSize))
 	defer f.Clean(t)
 	tx.Rollback()
 
@@ -4668,7 +4441,7 @@ func TestFragmentConcurrentReadWrite(t *testing.T) {
 }
 
 func TestFragment_Bug_Q2DoubleDelete(t *testing.T) {
-	f, idx, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+	f, idx, tx := mustOpenFragment(t)
 	_ = idx
 	// byShardWidth is a map of the same roaring (fragment) data generated
 	// with different shard widths.
@@ -4920,7 +4693,7 @@ func TestImportMutexSampleData(t *testing.T) {
 		seen := make(map[uint64]struct{})
 		t.Run(data.name, func(t *testing.T) {
 			batchSize := 16384
-			f, _, tx := mustOpenMutexFragment(t, "i", "f", viewStandard, 0, "")
+			f, _, tx := mustOpenFragment(t, OptFieldTypeMutex(DefaultCacheType, DefaultCacheSize))
 			defer f.Clean(t)
 			// Set import.
 			var err error
@@ -4998,7 +4771,7 @@ func BenchmarkImportMutexSampleData(b *testing.B) {
 		}
 	}
 	benchmarkFragmentImports := func(b *testing.B) {
-		frag, idx, tx = mustOpenMutexFragment(b, "i", "f", viewStandard, 0, cache)
+		frag, idx, tx = mustOpenFragment(b, OptFieldTypeMutex(cache, DefaultCacheSize))
 		defer frag.Clean(b)
 		for i := range data.colIDs {
 			b.Run(fmt.Sprintf("write-%d", i), func(b *testing.B) {
@@ -5222,71 +4995,8 @@ func TestParallelSlicesFullPrune(t *testing.T) {
 	})
 }
 
-func compareSlices(tb testing.TB, name string, s1, s2 []uint64) {
-	if len(s1) != len(s2) {
-		tb.Fatalf("slice length mismatch %q: expected %d items %d, got %d items %d",
-			name, len(s1), s1, len(s2), s2)
-	}
-	for i, v := range s1 {
-		if s2[i] != v {
-			tb.Fatalf("row mismatch %q: expected item %d to be %d, got %d",
-				name, i, s1[i], s2[i])
-		}
-	}
-}
-
-type sliceDifferenceTestCase struct {
-	original, remove, expected []uint64
-}
-
-func TestSliceDifference(t *testing.T) {
-	testCases := map[string]sliceDifferenceTestCase{
-		"noOverlap": {
-			original: []uint64{1, 2, 3},
-			remove:   []uint64{0, 5},
-			expected: []uint64{1, 2, 3},
-		},
-		"before": {
-			original: []uint64{3, 5, 7},
-			remove:   []uint64{0, 6},
-			expected: []uint64{3, 5, 7},
-		},
-		"after": {
-			original: []uint64{3, 5, 7},
-			remove:   []uint64{8, 10},
-			expected: []uint64{3, 5, 7},
-		},
-		"all": {
-			original: []uint64{3, 5, 7},
-			remove:   []uint64{3, 5, 7},
-			expected: []uint64{},
-		},
-		"first": {
-			original: []uint64{3, 5, 7},
-			remove:   []uint64{3},
-			expected: []uint64{5, 7},
-		},
-		"last": {
-			original: []uint64{3, 5, 7},
-			remove:   []uint64{7},
-			expected: []uint64{3, 5},
-		},
-		"middle": {
-			original: []uint64{3, 5, 7},
-			remove:   []uint64{5},
-			expected: []uint64{3, 7},
-		},
-	}
-	var scratch []uint64
-	for name, tc := range testCases {
-		scratch = append(scratch[:0], tc.original...)
-		result := sliceDifference(scratch, tc.remove)
-		compareSlices(t, name, tc.expected, result)
-	}
-}
-
 func TestImportRoaringSingleValued(t *testing.T) {
-	f, _, tx := mustOpenFragment(t, "i", "f", viewStandard, 0, "")
+	f, _, tx := mustOpenFragment(t)
 	defer f.Clean(t)
 
 	clear := roaring.NewBitmap(0, 1, ShardWidth-1)
@@ -5322,7 +5032,7 @@ func TestImportRoaringSingleValued(t *testing.T) {
 		t.Fatalf("importing: %v", err)
 	}
 
-	result, err := tx.RoaringBitmap("i", "f", viewStandard, 0)
+	result, err := tx.RoaringBitmap("i", "f", "v", 0)
 	if err != nil {
 		t.Fatalf("getting bitmap: %v", err)
 	}

@@ -29,7 +29,6 @@ const (
 // with -2 when the Tx completes.
 //
 // Should be false for production.
-//
 const DetectMemAccessPastTx = false
 
 var sep = string(os.PathSeparator)
@@ -43,11 +42,11 @@ var sep = string(os.PathSeparator)
 // The most common use of Qcx is to call GetTx() to obtain a Tx locally,
 // once the index/shard pair is known:
 //
-//   someFunc(qcx Qcx, idx *Index, shard uint64) (err0 error) {
-//		tx, finisher := qcx.GetTx(Txo{Write: true, Index:idx, Shard:shard, ...})
-//		defer finisher(&err0)
-//      ...
-//   }
+//	  someFunc(qcx Qcx, idx *Index, shard uint64) (err0 error) {
+//			tx, finisher := qcx.GetTx(Txo{Write: true, Index:idx, Shard:shard, ...})
+//			defer finisher(&err0)
+//	     ...
+//	  }
 //
 // Qcx reuses read-only Tx on the same index/shard pair. See
 // the Qcx.GetTx() for further discussion. The caveat is of
@@ -82,7 +81,6 @@ var sep = string(os.PathSeparator)
 // This is then committed at the final, top-level, Qcx.Finish() call.
 //
 // See also the Qcx.GetTx() example and the TxGroup description below.
-//
 type Qcx struct {
 	Grp     *TxGroup
 	Txf     *TxFactory
@@ -169,10 +167,29 @@ func (q *Qcx) unprotected_reset() {
 	q.done = false
 }
 
-// NewQcxWithGroup allocates a freshly allocated and empty Grp.
-// The top-level executor will set qcx.write = true manually
-// if the overall query is a write.
+// NewQcx allocates a freshly allocated and empty Grp.
+// The top-level Qcx is not marked writable. Non-writable
+// Qcx should not be used to request write Tx.
 func (f *TxFactory) NewQcx() (qcx *Qcx) {
+	qcx = &Qcx{
+		Grp: f.NewTxGroup(),
+		Txf: f,
+	}
+	if f.typeOfTx == "roaring" {
+		qcx.isRoaring = true
+	}
+	if f.holder != nil {
+		if f.holder.executor != nil {
+			qcx.workers = f.holder.executor.workers
+		}
+		_ = testhook.Opened(f.holder.Auditor, qcx, nil)
+	}
+	return
+}
+
+// NewWritableQcx allocates a freshly allocated and empty Grp.
+// The resulting Qcx is marked writable.
+func (f *TxFactory) NewWritableQcx() (qcx *Qcx) {
 	qcx = &Qcx{
 		Grp: f.NewTxGroup(),
 		Txf: f,
@@ -184,6 +201,7 @@ func (f *TxFactory) NewQcx() (qcx *Qcx) {
 		qcx.isRoaring = true
 	}
 	_ = testhook.Opened(f.holder.Auditor, qcx, nil)
+	qcx.write = true
 	return
 }
 
@@ -203,12 +221,12 @@ var ErrQcxDone = fmt.Errorf("Qcx already Aborted or Finished, so must call reset
 //
 // Note we are tracking the returned err0 error value of someFunc(). An option instead is to say
 //
-//     defer finisher(nil)
+//	defer finisher(nil)
 //
 // This means always Commit writes, ignoring if there were errors. This style
 // is expected to be rare compared to the typical
 //
-//     defer finisher(&err0)
+//	defer finisher(&err0)
 //
 // invocation, where err0 is your return from the enclosing function error.
 // If the Tx is local and not a part of a group, then the finisher
@@ -223,7 +241,6 @@ var ErrQcxDone = fmt.Errorf("Qcx already Aborted or Finished, so must call reset
 // locally by another _, err := f() call. For this reason, it can
 // be clearer (and much safer) to rename the enclosing functions 'err' to 'err0',
 // to make it clear we are referring to the first and final error.
-//
 func (qcx *Qcx) GetTx(o Txo) (tx Tx, finisher func(perr *error), err error) {
 	if qcx.workers != nil {
 		qcx.workers.Block()
@@ -556,9 +573,6 @@ func (g *TxGroup) AddTx(tx Tx, o Txo) {
 	if g.finished {
 		vprint.PanicOn("in TxGroup.Finish(): TxGroup already finished")
 	}
-	if NilInside(tx) {
-		vprint.PanicOn("Cannot add nil Tx to TxGroup")
-	}
 
 	g.reads = append(g.reads, tx)
 
@@ -663,14 +677,6 @@ func dirExists(name string) bool {
 		return true
 	}
 	return false
-}
-
-func fileSize(name string) (int64, error) {
-	fi, err := os.Stat(name)
-	if err != nil {
-		return -1, err
-	}
-	return fi.Size(), nil
 }
 
 var _ = anyGlobalDBWrappersStillOpen // happy linter

@@ -11,10 +11,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/glycerine/vprint"
 	pilosaclient "github.com/featurebasedb/featurebase/v3/client"
+	"github.com/featurebasedb/featurebase/v3/dax"
 	"github.com/featurebasedb/featurebase/v3/idk"
 	"github.com/featurebasedb/featurebase/v3/logger"
+	"github.com/glycerine/vprint"
 	"github.com/pkg/errors"
 
 	"github.com/featurebasedb/featurebase/v3/idk/common"
@@ -25,6 +26,7 @@ const (
 	TargetFeaturebase = "featurebase"
 	TargetKafka       = "kafka"
 	TargetKafkaStatic = "kafkastatic"
+	TargetServerless  = "serverless"
 )
 
 // Main is the top-level datagen struct. It represents datagen-specific
@@ -41,7 +43,7 @@ type Main struct {
 	cfg SourceGeneratorConfig
 
 	Source string `short:"s" flag:"source" help:"Source generator type. Running datagen with no arguments will list the available source types."`
-	Target string `short:"t" flag:"target" help:"Destination for the generated data: [kafka, featurebase]."`
+	Target string `short:"t" flag:"target" help:"Destination for the generated data: [featurebase, kafka, kafkastatic, mds]."`
 
 	Concurrency int `short:"c" flag:"concurrency" help:"Number of concurrent sources and indexing routines to launch."`
 
@@ -51,15 +53,16 @@ type Main struct {
 	Seed int64 `short:"" help:"Seed to use for any random number generation."`
 
 	TrackProgress bool `short:"" help:"Periodically print status updates on how many records have been sourced."`
-	UseIngestAPI  bool `help:"Experimental: use new HTTP/JSON ingest API instead of low-level import API. Probably slow, does not support packed bools."`
 
 	UseShardTransactionalEndpoint bool `flag:"use-shard-transactional-endpoint" help:"Use experimental transactional endpoint"`
 
 	CustomConfig string `short:"" help:"File from which to pull configuration for 'custom' source."`
 
 	// Used strictly for configuration of the targets.
-	Pilosa PilosaConfig
-	Kafka  KafkaConfig
+	Pilosa      PilosaConfig
+	Kafka       KafkaConfig
+	Serverless  ServerlessConfig
+	FeatureBase FeatureBaseConfig `flag:"featurebase" help:"qualified featurebase table"`
 
 	DryRun bool `help:"Dry run - just flag parsing."`
 
@@ -78,6 +81,16 @@ type PilosaConfig struct {
 	CacheLength uint64   `help:"Number of batches of ID mappings to cache."`
 }
 
+// FeatureBaseConfig is meant to represent the scoped (featurebase.*)
+// configuration options to be used when target = mds. These are really just a
+// sub-set of idk.Main, containing only those arguments that really apply to
+// datagen.
+type FeatureBaseConfig struct {
+	OrganizationID string `flag:"org-id" short:"" help:"auto-assigned organization ID"`
+	DatabaseID     string `flag:"db-id" short:"" help:"auto-assigned database ID"`
+	TableName      string `flag:"table-name" short:"" help:"human friendly table name"`
+}
+
 // KafkaConfig is meant to represent the scoped (pilosa.*) configuration options
 // to be used when target = kafka. These are really just a sub-set of kafka.PutSource,
 // containing only those arguments that really apply to datagen.
@@ -88,6 +101,13 @@ type KafkaConfig struct {
 	BatchSize         int    `short:"" help:"Number of records to generate before sending them to Kafka all at once. Generally, larger means better throughput and more memory usage."`
 	ReplicationFactor int    `short:"" help:"set replication factor for kafka cluster"`
 	NumPartitions     int    `short:"" help:"set partition for kafka cluster"`
+}
+
+// ServerlessConfig represents the configuration options to be used when target
+// = serverless. These are really just a sub-set of idk.Main, containing only
+// those arguments that really apply to datagen.
+type ServerlessConfig struct {
+	Address string `short:"" help:"Controller host:port to connect to"`
 }
 
 // NewMain returns a new instance of Main.
@@ -266,13 +286,31 @@ func (m *Main) Preload() error {
 		m.KafkaPut.FBIDField = m.idkMain.IDField
 		m.KafkaPut.FBIndexName = m.Pilosa.Index
 
+	case TargetServerless:
+		m.idkMain.Namespace = "ingester_datagen"
+		m.idkMain.Concurrency = m.Concurrency
+		m.idkMain.CacheLength = m.Pilosa.CacheLength
+		m.idkMain.NewSource = m.newSource
+		m.idkMain.TrackProgress = m.TrackProgress
+		m.idkMain.AuthToken = m.AuthToken
+		m.idkMain.UseShardTransactionalEndpoint = m.UseShardTransactionalEndpoint
+		if m.Pilosa.BatchSize > 0 {
+			m.idkMain.BatchSize = m.Pilosa.BatchSize
+		}
+
+		// Serverless-specific
+		m.idkMain.ControllerAddress = m.Serverless.Address
+		m.idkMain.OrganizationID = dax.OrganizationID(m.FeatureBase.OrganizationID)
+		m.idkMain.DatabaseID = dax.DatabaseID(m.FeatureBase.DatabaseID)
+		m.idkMain.TableName = dax.TableName(m.FeatureBase.TableName)
+		m.idkMain.PackBools = ""
+
 	default:
 		m.idkMain.Namespace = "ingester_datagen"
 		m.idkMain.Concurrency = m.Concurrency
 		m.idkMain.CacheLength = m.Pilosa.CacheLength
 		m.idkMain.NewSource = m.newSource
 		m.idkMain.TrackProgress = m.TrackProgress
-		m.idkMain.UseIngestAPI = m.UseIngestAPI
 		m.idkMain.AuthToken = m.AuthToken
 		m.idkMain.UseShardTransactionalEndpoint = m.UseShardTransactionalEndpoint
 		if len(m.Pilosa.Hosts) > 0 {
@@ -398,14 +436,15 @@ func (m *Main) PrintPlan() {
 			m.Pilosa.Index = "(not specified)"
 		}
 		fmt.Printf(`Datagen config:
-		hosts:			%s
-		index:			%s
-		start id:		%s
-		end id:			%s
-		total generated:	%s
-		concurrency:            %d
-		batch size:		%s
-		total batches:		%s
+		hosts:           %s
+		index:           %s
+		start id:        %s
+		end id:          %s
+		total generated: %s
+		concurrency:     %d
+		batch size:      %s
+		total batches:   %s
+		use shard trans: %v
 `,
 			strings.Join(Hosts, ", "),
 			m.Pilosa.Index,
@@ -415,6 +454,7 @@ func (m *Main) PrintPlan() {
 			concurrency,
 			AddThousandSep(uint64(BatchSize)),
 			AddThousandSep(BatchCount),
+			m.UseShardTransactionalEndpoint,
 		)
 
 		fmt.Println("Schema:")
@@ -538,9 +578,9 @@ func (m *Main) makeSources(key string, cfg SourceGeneratorConfig) ([]string, []i
 // (in case it had to be adjusted).
 // returns (concurrency, startEnds, total)
 func startEnds(cfg SourceGeneratorConfig) (int, []startEnd, uint64) {
-	var startFrom uint64 = cfg.StartFrom
-	var endAt uint64 = cfg.EndAt
-	var concurrency int = cfg.Concurrency
+	var startFrom = cfg.StartFrom
+	var endAt = cfg.EndAt
+	var concurrency = cfg.Concurrency
 
 	if concurrency == 0 {
 		return 0, []startEnd{}, 0
@@ -564,7 +604,7 @@ func startEnds(cfg SourceGeneratorConfig) (int, []startEnd, uint64) {
 	// Distribute the total range of records over a number of
 	// Sources equal to the concurrency.
 	for i := 0; i < concurrency; i++ {
-		var start uint64 = current
+		var start = current
 		var end uint64
 		current += interval
 		// Include one of the leftovers in each iteration until there
@@ -591,6 +631,8 @@ func (r record) Commit(ctx context.Context) error { return nil }
 func (r record) Data() []interface{} {
 	return r
 }
+
+func (r record) Schema() interface{} { return nil }
 
 type startEnd struct {
 	start uint64

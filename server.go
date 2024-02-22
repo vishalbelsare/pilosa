@@ -5,6 +5,7 @@ package pilosa
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -17,13 +18,15 @@ import (
 
 	uuid "github.com/satori/go.uuid"
 
+	daxstorage "github.com/featurebasedb/featurebase/v3/dax/storage"
 	"github.com/featurebasedb/featurebase/v3/disco"
 	"github.com/featurebasedb/featurebase/v3/logger"
 	pnet "github.com/featurebasedb/featurebase/v3/net"
 	rbfcfg "github.com/featurebasedb/featurebase/v3/rbf/cfg"
 	"github.com/featurebasedb/featurebase/v3/roaring"
-	"github.com/featurebasedb/featurebase/v3/sql2"
-	"github.com/featurebasedb/featurebase/v3/stats"
+	"github.com/featurebasedb/featurebase/v3/sql3"
+	"github.com/featurebasedb/featurebase/v3/sql3/parser"
+	planner_types "github.com/featurebasedb/featurebase/v3/sql3/planner/types"
 	"github.com/featurebasedb/featurebase/v3/storage"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -54,11 +57,12 @@ type Server struct { // nolint: maligned
 	executorPoolSize int
 	serializer       Serializer
 
+	SystemLayer SystemLayerAPI
+
 	// Distributed Consensus
-	disCo     disco.DisCo
-	noder     disco.Noder
-	sharder   disco.Sharder
-	schemator disco.Schemator
+	disCo   disco.DisCo
+	noder   disco.Noder
+	sharder disco.Sharder
 
 	// External
 	systemInfo  SystemInfo
@@ -69,7 +73,6 @@ type Server struct { // nolint: maligned
 	nodeID               string
 	uri                  pnet.URI
 	grpcURI              pnet.URI
-	antiEntropyInterval  time.Duration
 	metricInterval       time.Duration
 	diagnosticInterval   time.Duration
 	viewsRemovalInterval time.Duration
@@ -86,11 +89,22 @@ type Server struct { // nolint: maligned
 
 	defaultClient *InternalClient
 	dataDir       string
+	verChkAddress string
+	uuidFile      string
 
 	// Threshold for logging long-running queries
 	longQueryTime      time.Duration
 	queryHistoryLength int
+
+	executionPlannerFn ExecutionPlannerFn
+
+	serverlessStorage *daxstorage.ResourceManager
+
+	dataframeEnabled    bool
+	dataframeUseParquet bool
 }
+
+type ExecutionPlannerFn func(executor Executor, api *API, sql string) sql3.CompilePlanner
 
 // Holder returns the holder for server.
 func (s *Server) Holder() *Holder {
@@ -155,11 +169,20 @@ func OptServerDataDir(dir string) ServerOption {
 	}
 }
 
-// OptServerAntiEntropyInterval is a functional option on Server
-// used to set the anti-entropy interval.
-func OptServerAntiEntropyInterval(interval time.Duration) ServerOption {
+// OptServerVerChkAddress is a functional option on Server
+// used to set the address to check for the current version.
+func OptServerVerChkAddress(addr string) ServerOption {
 	return func(s *Server) error {
-		s.antiEntropyInterval = interval
+		s.verChkAddress = addr
+		return nil
+	}
+}
+
+// OptServerUUIDFile is a functional option on Server
+// used to set the file name for storing the checkin UUID.
+func OptServerUUIDFile(uf string) ServerOption {
+	return func(s *Server) error {
+		s.uuidFile = uf
 		return nil
 	}
 }
@@ -239,15 +262,6 @@ func OptServerExecutorPoolSize(size int) ServerOption {
 func OptServerPrimaryTranslateStore(store TranslateStore) ServerOption {
 	return func(s *Server) error {
 		s.logger.Infof("DEPRECATED: OptServerPrimaryTranslateStore")
-		return nil
-	}
-}
-
-// OptServerStatsClient is a functional option on Server
-// used to specify the stats client.
-func OptServerStatsClient(sc stats.StatsClient) ServerOption {
-	return func(s *Server) error {
-		s.holderConfig.StatsClient = sc
 		return nil
 	}
 }
@@ -398,13 +412,13 @@ func OptServerMaxQueryMemory(v int64) ServerOption {
 func OptServerDisCo(disCo disco.DisCo,
 	noder disco.Noder,
 	sharder disco.Sharder,
-	schemator disco.Schemator) ServerOption {
-
+	schemator disco.Schemator,
+) ServerOption {
 	return func(s *Server) error {
 		s.disCo = disCo
 		s.noder = noder
 		s.sharder = sharder
-		s.schemator = schemator
+		s.holderConfig.Schemator = schemator
 		return nil
 	}
 }
@@ -424,6 +438,43 @@ func OptServerPartitionAssigner(p string) ServerOption {
 	}
 }
 
+func OptServerExecutionPlannerFn(fn ExecutionPlannerFn) ServerOption {
+	return func(s *Server) error {
+		s.executionPlannerFn = fn
+		return nil
+	}
+}
+
+func OptServerServerlessStorage(mm *daxstorage.ResourceManager) ServerOption {
+	return func(s *Server) error {
+		s.serverlessStorage = mm
+		return nil
+	}
+}
+
+// OptServerIsComputeNode specifies that this node is running as a DAX compute node.
+func OptServerIsComputeNode(is bool) ServerOption {
+	return func(s *Server) error {
+		s.cluster.isComputeNode = is
+		return nil
+	}
+}
+
+// OptServerIsDataframeEnabled specifies if experimental dataframe support available
+func OptServerIsDataframeEnabled(is bool) ServerOption {
+	return func(s *Server) error {
+		s.dataframeEnabled = is
+		return nil
+	}
+}
+
+func OptServerDataframeUseParquet(is bool) ServerOption {
+	return func(s *Server) error {
+		s.dataframeUseParquet = is
+		return nil
+	}
+}
+
 // NewServer returns a new instance of Server.
 func NewServer(opts ...ServerOption) (*Server, error) {
 	cluster := newCluster()
@@ -437,7 +488,6 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 
 		gcNotifier: NopGCNotifier,
 
-		antiEntropyInterval:  0,
 		metricInterval:       0,
 		diagnosticInterval:   0,
 		viewsRemovalInterval: time.Hour,
@@ -445,7 +495,6 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 		disCo:      disco.NopDisCo,
 		noder:      disco.NewEmptyLocalNoder(),
 		sharder:    disco.NopSharder,
-		schemator:  disco.NopSchemator,
 		serializer: NopSerializer,
 
 		confirmDownRetries: defaultConfirmDownRetries,
@@ -454,6 +503,10 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 		resetTranslationSyncCh: make(chan struct{}, 1),
 
 		logger: logger.NopLogger,
+
+		executionPlannerFn: func(e Executor, a *API, s string) sql3.CompilePlanner {
+			return sql3.NewNopCompilePlanner()
+		},
 	}
 	s.cluster.InternalClient = s.defaultClient
 
@@ -471,7 +524,6 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 			return nil, errors.Wrap(err, "applying option")
 		}
 	}
-	s.holderConfig.AntiEntropyInterval = s.antiEntropyInterval
 
 	memTotal, err := s.systemInfo.MemTotal()
 	if err != nil {
@@ -493,13 +545,14 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 		executorOpts = append(executorOpts, optExecutorWorkerPoolSize(s.executorPoolSize))
 	}
 	s.executor = newExecutor(executorOpts...)
+	s.executor.dataframeEnabled = s.dataframeEnabled
+	s.executor.datafameUseParquet = s.dataframeUseParquet
 
 	path, err := expandDirName(s.dataDir)
 	if err != nil {
 		return nil, err
 	}
 	s.holder = NewHolder(path, s.holderConfig)
-	s.holder.Stats.SetLogger(s.logger)
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, err
@@ -513,9 +566,7 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 	s.cluster.disCo = s.disCo
 	s.cluster.noder = s.noder
 	s.cluster.sharder = s.sharder
-
-	// Append the NodeID tag to stats.
-	s.holder.Stats = s.holder.Stats.WithTags(fmt.Sprintf("node_id:%s", s.nodeID))
+	s.cluster.serverlessStorage = s.serverlessStorage
 
 	s.executor.Holder = s.holder
 	s.holder.executor = s.executor
@@ -526,7 +577,6 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 	s.cluster.confirmDownRetries = s.confirmDownRetries
 	s.cluster.confirmDownSleep = s.confirmDownSleep
 	s.holder.broadcaster = s
-	s.holder.schemator = s.schemator
 	s.holder.sharder = s.sharder
 	s.holder.serializer = s.serializer
 
@@ -574,6 +624,23 @@ func (s *Server) Open() error {
 		log.Println(errors.Wrap(err, "logging startup"))
 	}
 
+	// Do version check in. This is in a goroutine so that we don't block server
+	// startup if the server endpoint is down/having issues.
+	go func() {
+		s.logger.Printf("Beginning featurebase version check-in")
+		vc := newVersionChecker(s.cluster.Path, s.verChkAddress, s.uuidFile)
+		resp, err := vc.checkIn()
+		if err != nil {
+			s.logger.Errorf("doing version checkin. Error was %s", err)
+			return
+		}
+		if resp.Error != "" {
+			s.logger.Printf("Version check-in failed, endpoint response was %s", resp.Error)
+		} else {
+			s.logger.Printf("Version check-in complete. Latest version is %s", resp.Version)
+		}
+	}()
+
 	// Start DisCo.
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -590,11 +657,16 @@ func (s *Server) Open() error {
 	// Set node ID.
 	s.nodeID = s.disCo.ID()
 
+	nodeState := disco.NodeStateUnknown
+	if s.cluster.isComputeNode {
+		nodeState = disco.NodeStateStarted
+	}
+
 	node := &disco.Node{
 		ID:        s.nodeID,
 		URI:       s.uri,
 		GRPCURI:   s.grpcURI,
-		State:     disco.NodeStateUnknown,
+		State:     nodeState,
 		IsPrimary: s.IsPrimary(),
 	}
 
@@ -610,7 +682,6 @@ func (s *Server) Open() error {
 	s.syncer.Node = node
 	s.syncer.Cluster = s.cluster
 	s.syncer.Closing = s.closing
-	s.syncer.Stats = s.holder.Stats.WithTags("component:HolderSyncer")
 
 	// Start background process listening for translation
 	// sync resets.
@@ -638,10 +709,9 @@ func (s *Server) Open() error {
 		return errors.Wrap(err, "setting nodeState")
 	}
 
-	if ok := s.addToWaitGroup(4); !ok {
+	if ok := s.addToWaitGroup(3); !ok {
 		return fmt.Errorf("closing server while opening server is NOT allowed")
 	}
-	go func() { defer s.wg.Done(); s.monitorAntiEntropy() }()
 	go func() { defer s.wg.Done(); s.monitorRuntime() }()
 	go func() { defer s.wg.Done(); s.monitorDiagnostics() }()
 	go func() { defer s.wg.Done(); s.monitorViewsRemoval() }()
@@ -681,29 +751,29 @@ func (s *Server) Open() error {
 		if !timer.Stop() {
 			<-timer.C
 		}
+		// wait for cluster to achieve Normal state
+		//
+		// This used to loop as long as the cluster was Starting, Down,
+		// or Unknown. It would come up in a Degraded state, except
+		// that during startup, as long as at least one node was Starting,
+		// we'd stay in Starting rather than Degraded. We've dropped the
+		// special case of Starting state, so now we just want to wait
+		// for Normal.
 		for {
 			state, err := s.noder.ClusterState(ctx)
 			if err != nil {
 				s.logger.Printf("failed to check cluster state: %v", err)
-				timer.Reset(time.Second)
-				select {
-				case <-s.closing:
-					return
-				case <-timer.C:
-					continue
-				}
 			}
-			switch state {
-			case disco.ClusterStateStarting, disco.ClusterStateUnknown, disco.ClusterStateDown:
-				timer.Reset(time.Second)
-				select {
-				case <-s.closing:
-					return
-				case <-timer.C:
-					continue
-				}
+			if state == disco.ClusterStateNormal {
+				break
 			}
-			break
+			timer.Reset(time.Second)
+			select {
+			case <-s.closing:
+				return
+			case <-timer.C:
+				continue
+			}
 		}
 
 		start := time.Now()
@@ -756,6 +826,7 @@ func (s *Server) Close() error {
 		var errh, errd error
 		var errhs error
 		var errc error
+		var errSS error
 
 		if s.cluster != nil {
 			errc = s.cluster.close()
@@ -766,6 +837,9 @@ func (s *Server) Close() error {
 		}
 		if s.holder != nil {
 			errh = s.holder.Close()
+		}
+		if s.serverlessStorage != nil {
+			errSS = s.serverlessStorage.RemoveAll()
 		}
 
 		// prefer to return holder error over cluster
@@ -784,18 +858,15 @@ func (s *Server) Close() error {
 		if errd != nil {
 			return errors.Wrap(errd, "closing disco")
 		}
-		return errors.Wrap(errE, "closing executor")
+		if errE != nil {
+			return errors.Wrap(errE, "closing executor")
+		}
+		return errors.Wrap(errSS, "unlocking all serverless storage")
 	}
 }
 
 // NodeID returns the server's node id.
 func (s *Server) NodeID() string { return s.nodeID }
-
-// SyncData manually invokes the anti entropy process which makes sure that this
-// node has the data from all replicas across the cluster.
-func (s *Server) SyncData() error {
-	return errors.Wrap(s.syncer.SyncHolder(), "syncing holder")
-}
 
 // monitorResetTranslationSync is a background process which
 // listens for events indicating the need to reset the translation
@@ -883,91 +954,41 @@ func (s *Server) ViewsRemoval(ctx context.Context) {
 						}
 					}
 				}
-				if field.Options().NoStandardView && field.view(viewStandard) != nil {
-					// delete view "standard" if NoStandardView is true and view "standard" exists
-					for _, shard := range field.AvailableShards(true).Slice() {
-						err := s.holder.txf.DeleteFragmentFromStore(index.Name(), field.Name(), viewStandard, shard, nil)
-						if err != nil {
-							s.logger.Errorf("delete view %s from shard %d: %s", viewStandard, shard, err)
+				if field.Options().NoStandardView {
+					if field.view(viewStandard) != nil {
+						// delete view "standard" if NoStandardView is true and view "standard" exists
+						for _, shard := range field.AvailableShards(true).Slice() {
+							err := s.holder.txf.DeleteFragmentFromStore(index.Name(), field.Name(), viewStandard, shard, nil)
+							if err != nil {
+								s.logger.Errorf("delete view %s from shard %d: %s", viewStandard, shard, err)
+							}
 						}
-					}
 
-					err := s.defaultClient.api.DeleteView(ctx, index.Name(), field.Name(), viewStandard)
-					if err != nil {
-						s.logger.Errorf("view: %s, delete view: %s", viewStandard, err)
+						err := s.defaultClient.api.DeleteView(ctx, index.Name(), field.Name(), viewStandard)
+						if err != nil {
+							s.logger.Errorf("view: %s, delete view: %s", viewStandard, err)
+						}
+						s.logger.Infof("view %s deleted - index: %s, field: %s ", viewStandard, index.name, field.name)
 					}
-					s.logger.Infof("view %s deleted - index: %s, field: %s ", viewStandard, index.name, field.name)
+					if field.view(viewExistence) != nil {
+						// delete view "existence" if NoStandardView is true and view "existence" exists
+						for _, shard := range field.AvailableShards(true).Slice() {
+							err := s.holder.txf.DeleteFragmentFromStore(index.Name(), field.Name(), viewExistence, shard, nil)
+							if err != nil {
+								s.logger.Errorf("delete view %s from shard %d: %s", viewExistence, shard, err)
+							}
+						}
+
+						err := s.defaultClient.api.DeleteView(ctx, index.Name(), field.Name(), viewExistence)
+						if err != nil {
+							s.logger.Errorf("view: %s, delete view: %s", viewExistence, err)
+						}
+						s.logger.Infof("view %s deleted - index: %s, field: %s ", viewExistence, index.name, field.name)
+					}
 				}
 			}
 		}
 	}
-}
-
-func (s *Server) monitorAntiEntropy() {
-	// %% begin sonarcloud ignore %%
-	// This code isn't really used anymore because of problems with the design,
-	// but we haven't taken it out yet. But there's no code coverage of it.
-	if s.antiEntropyInterval == 0 || s.cluster.ReplicaN <= 1 {
-		return // anti entropy disabled
-	}
-	s.cluster.initializeAntiEntropy()
-
-	ticker := time.NewTicker(s.antiEntropyInterval)
-	defer ticker.Stop()
-
-	s.logger.Infof("holder sync monitor initializing (%s interval)", s.antiEntropyInterval)
-
-	// Initialize syncer with local holder and remote client.
-	for {
-		// Wait for tick or a close.
-		select {
-		case <-s.closing:
-			return
-		case <-s.cluster.abortAntiEntropyCh:
-			// receive here so we don't block resizing
-			// ... note that resizing is gone now, but I don't know whether we still need this.
-			continue
-		case <-ticker.C:
-			s.holder.Stats.Count(MetricAntiEntropy, 1, 1.0)
-		}
-		t := time.Now()
-
-		// We used to check for resizing before doing anti-entropy, but resizing is out
-		// so we don't otherwise care about state.
-		_, err := s.cluster.State()
-		if err != nil {
-			s.logger.Printf("cluster state error: err=%s", err)
-			continue
-		}
-
-		// Sync holders.
-		s.logger.Infof("holder sync beginning")
-		s.cluster.muAntiEntropy.Lock()
-		if err := s.syncer.SyncHolder(); err != nil {
-			s.cluster.muAntiEntropy.Unlock()
-			s.logger.Errorf("holder sync error: err=%s", err)
-			continue
-		}
-		s.cluster.muAntiEntropy.Unlock()
-
-		// Record successful sync in log.
-		s.logger.Infof("holder sync complete")
-		dif := time.Since(t)
-		s.holder.Stats.Timing(MetricAntiEntropyDurationSeconds, dif, 1.0)
-
-		// Drain tick channel since we just finished anti-entropy. If the AE
-		// process took a long time, we don't want them to pile up on each
-		// other.
-		for {
-			select {
-			case <-ticker.C:
-				continue
-			default:
-			}
-			break
-		}
-	}
-	// %% end sonarcloud ignore %%
 }
 
 // receiveMessage represents an implementation of BroadcastHandler.
@@ -1002,6 +1023,7 @@ func (s *Server) receiveMessage(m Message) error {
 		if err := idx.UpdateFieldLocal(&obj.CreateFieldMessage, obj.Update); err != nil {
 			return err
 		}
+
 	case *DeleteFieldMessage:
 		idx := s.holder.Index(obj.Index)
 		if err := idx.DeleteField(obj.Field); err != nil {
@@ -1047,6 +1069,10 @@ func (s *Server) receiveMessage(m Message) error {
 		err := s.handleTransactionMessage(obj)
 		if err != nil {
 			return errors.Wrapf(err, "handling transaction message: %v", obj)
+		}
+	case *DeleteDataframeMessage:
+		if err := s.holder.DeleteDataframe(obj.Index); err != nil {
+			return err
 		}
 	}
 
@@ -1264,26 +1290,26 @@ func (s *Server) monitorRuntime() {
 			return
 		case <-s.gcNotifier.AfterGC():
 			// GC just ran.
-			s.holder.Stats.Count(MetricGarbageCollection, 1, 1.0)
+			CounterGarbageCollection.Inc()
 		case <-ticker.C:
 		}
 
 		// Record the number of go routines.
-		s.holder.Stats.Gauge(MetricGoroutines, float64(runtime.NumGoroutine()), 1.0)
+		GaugeGoroutines.Set(float64(runtime.NumGoroutine()))
 
 		openFiles, err := countOpenFiles()
 		// Open File handles.
 		if err == nil {
-			s.holder.Stats.Gauge(MetricOpenFiles, float64(openFiles), 1.0)
+			GaugeOpenFiles.Set(float64(openFiles))
 		}
 
 		// Runtime memory metrics.
 		runtime.ReadMemStats(&m)
-		s.holder.Stats.Gauge(MetricHeapAlloc, float64(m.HeapAlloc), 1.0)
-		s.holder.Stats.Gauge(MetricHeapInuse, float64(m.HeapInuse), 1.0)
-		s.holder.Stats.Gauge(MetricStackInuse, float64(m.StackInuse), 1.0)
-		s.holder.Stats.Gauge(MetricMallocs, float64(m.Mallocs), 1.0)
-		s.holder.Stats.Gauge(MetricFrees, float64(m.Frees), 1.0)
+		GaugeHeapAlloc.Set(float64(m.HeapAlloc))
+		GaugeHeapInUse.Set(float64(m.HeapInuse))
+		GaugeStackInUse.Set(float64(m.StackInuse))
+		GaugeMallocs.Set(float64(m.Mallocs))
+		GaugeFrees.Set(float64(m.Frees))
 	}
 }
 
@@ -1303,7 +1329,11 @@ func (srv *Server) StartTransaction(ctx context.Context, id string, timeout time
 
 	// empty string id should generate an id
 	if id == "" {
-		id = uuid.NewV4().String()
+		uid, err := uuid.NewV4()
+		if err != nil {
+			return nil, errors.Wrap(err, "creating id")
+		}
+		id = uid.String()
 	}
 	trns, err := srv.holder.StartTransaction(ctx, id, timeout, exclusive)
 	if err != nil {
@@ -1413,13 +1443,18 @@ func (srv *Server) GetTransaction(ctx context.Context, id string, remote bool) (
 	return trns, nil
 }
 
-// PlanSQL parses and prepares a SQL statement.
-func (s *Server) PlanSQL(ctx context.Context, q string) (*Stmt, error) {
-	st, err := sql2.NewParser(strings.NewReader(q)).ParseStatement()
+// CompileExecutionPlan parses and compiles an execution plan from a SQL
+// statement using a new parser and planner.
+func (s *Server) CompileExecutionPlan(ctx context.Context, q string) (planner_types.PlanOperator, error) {
+	st, err := parser.NewParser(strings.NewReader(q)).ParseStatement()
 	if err != nil {
 		return nil, err
 	}
-	return NewPlanner(s.executor).PlanStatement(ctx, st)
+	return s.executionPlannerFn(s.executor, s.executor.client.api, q).CompilePlan(ctx, st)
+}
+
+func (s *Server) RehydratePlanOperator(ctx context.Context, reader io.Reader) (planner_types.PlanOperator, error) {
+	return s.executionPlannerFn(s.executor, s.executor.client.api, "").RehydratePlanOp(ctx, reader)
 }
 
 // countOpenFiles on operating systems that support lsof.

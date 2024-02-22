@@ -6,7 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	gohttp "net/http"
 	"os"
 	"reflect"
@@ -18,10 +18,8 @@ import (
 	"github.com/featurebasedb/featurebase/v3/disco"
 	"github.com/featurebasedb/featurebase/v3/encoding/proto"
 	"github.com/featurebasedb/featurebase/v3/server"
-	"github.com/featurebasedb/featurebase/v3/testhook"
 )
 
-////////////////////////////////////////////////////////////////////////////////////
 // Command represents a test wrapper for server.Command.
 type Command struct {
 	*server.Command
@@ -37,11 +35,8 @@ func OptAllowedOrigins(origins []string) server.CommandOption {
 }
 
 // newCommand returns a new instance of Main with a temporary data directory and random port.
-func newCommand(tb testing.TB, opts ...server.CommandOption) *Command {
-	path, err := testhook.TempDir(tb, "pilosa-command-")
-	if err != nil {
-		panic(err)
-	}
+func newCommand(tb DirCleaner, opts ...server.CommandOption) *Command {
+	path := tb.TempDir()
 
 	// Set aggressive close timeout by default to avoid hanging tests. This was
 	// a problem with PDK tests which used pilosa/client as well. We put it at the
@@ -52,9 +47,13 @@ func newCommand(tb testing.TB, opts ...server.CommandOption) *Command {
 	}, opts...)
 
 	m := &Command{commandOptions: opts}
-	m.Command = server.NewCommand(bytes.NewReader(nil), ioutil.Discard, ioutil.Discard, opts...)
+	output := io.Discard
+	if testing.Verbose() {
+		output = os.Stderr
+	}
+	m.Command = server.NewCommand(output, opts...)
 	// pick etcd ports using a socket rather than a real port
-	err = GetPortsGenConfigs(tb, []*Command{m})
+	err := GetPortsGenConfigs(tb, []*Command{m})
 	if err != nil {
 		tb.Fatalf("generating config: %v", err)
 	}
@@ -72,16 +71,11 @@ func newCommand(tb testing.TB, opts ...server.CommandOption) *Command {
 	m.Config.Translation.MapSize = 140000
 	m.Config.WorkerPoolSize = 2
 
-	if testing.Verbose() {
-		m.Command.Stdout = os.Stdout
-		m.Command.Stderr = os.Stderr
-	}
-
 	return m
 }
 
 // NewCommandNode returns a new instance of Command with clustering enabled.
-func NewCommandNode(tb testing.TB, opts ...server.CommandOption) *Command {
+func NewCommandNode(tb DirCleaner, opts ...server.CommandOption) *Command {
 	// We want tests to default to using the in-memory translate store, so we
 	// prepend opts with that functional option. If a different translate store
 	// has been specified, it will override this one.
@@ -96,7 +90,7 @@ func RunCommand(t *testing.T) *Command {
 
 	// prefer MustRunCluster since it sets up for using etcd using
 	// the GenDisCoConfig(size) option.
-	return MustRunCluster(t, 1).GetNode(0)
+	return MustRunUnsharedCluster(t, 1).GetNode(0)
 }
 
 // Close closes the program and removes the underlying data directory.
@@ -114,7 +108,11 @@ func (m *Command) Reopen() error {
 
 	// Create new main with the same config.
 	config := m.Command.Config
-	m.Command = server.NewCommand(bytes.NewReader(nil), ioutil.Discard, ioutil.Discard, m.commandOptions...)
+	output := io.Discard
+	if testing.Verbose() {
+		output = os.Stderr
+	}
+	m.Command = server.NewCommand(output, m.commandOptions...)
 	m.Command.Config = config
 
 	// Run new program.
@@ -240,7 +238,7 @@ func (m *Command) QueryProtobuf(indexName string, query string) (*pilosa.QueryRe
 	}
 	defer resp.Body.Close()
 
-	buf, err := ioutil.ReadAll(resp.Body)
+	buf, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -291,12 +289,42 @@ func Do(t testing.TB, method, urlStr string, body string) *httpResponse {
 	}
 	defer resp.Body.Close()
 
-	buf, err := ioutil.ReadAll(resp.Body)
+	buf, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	return &httpResponse{Response: resp, Body: string(buf)}
+}
+
+// Do executes http.Do() with an http.NewRequest().
+func DoProto(t testing.TB, method, urlStr string, body []byte) *gohttp.Response {
+	t.Helper()
+	req, err := gohttp.NewRequest(
+		method,
+		urlStr,
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.Header.Set("Accept", "application/x-protobuf")
+
+	// set a timeout instead of allowing gohttp.Defaultclient to
+	// potentially hang forever.
+	hc := &gohttp.Client{
+		Timeout: time.Second * 30,
+	}
+	resp, err := hc.Do(req)
+
+	if err != nil {
+		fmt.Printf(" hc.Do() err = '%v'\n", err)
+		t.Fatal(err)
+	}
+
+	return resp
 }
 
 func CheckGroupBy(t *testing.T, expected, results []pilosa.GroupCount) {

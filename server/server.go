@@ -1,5 +1,4 @@
-// Copyright 2022 Molecula Corp. (DBA FeatureBase).
-// SPDX-License-Identifier: Apache-2.0
+// Copyright 2021 Molecula Corp. All rights reserved.
 //
 // Package server contains the `pilosa server` subcommand which runs Pilosa
 // itself. The purpose of this package is to define an easily tested Command
@@ -13,10 +12,10 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,26 +26,34 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	pilosa "github.com/featurebasedb/featurebase/v3"
 	"github.com/featurebasedb/featurebase/v3/authn"
 	"github.com/featurebasedb/featurebase/v3/authz"
-	"github.com/featurebasedb/featurebase/v3/boltdb"
+	"github.com/featurebasedb/featurebase/v3/dax"
+	"github.com/featurebasedb/featurebase/v3/dax/computer"
+	"github.com/featurebasedb/featurebase/v3/dax/storage"
+	"github.com/featurebasedb/featurebase/v3/disco"
 	"github.com/featurebasedb/featurebase/v3/encoding/proto"
 	petcd "github.com/featurebasedb/featurebase/v3/etcd"
 	"github.com/featurebasedb/featurebase/v3/gcnotify"
 	"github.com/featurebasedb/featurebase/v3/gopsutil"
 	"github.com/featurebasedb/featurebase/v3/logger"
 	pnet "github.com/featurebasedb/featurebase/v3/net"
-	"github.com/featurebasedb/featurebase/v3/prometheus"
+	"github.com/featurebasedb/featurebase/v3/sql3"
+	"github.com/featurebasedb/featurebase/v3/sql3/planner"
 	"github.com/featurebasedb/featurebase/v3/statik"
-	"github.com/featurebasedb/featurebase/v3/stats"
-	"github.com/featurebasedb/featurebase/v3/statsd"
+	"github.com/featurebasedb/featurebase/v3/systemlayer"
 	"github.com/featurebasedb/featurebase/v3/syswrap"
 	"github.com/featurebasedb/featurebase/v3/testhook"
+	"github.com/featurebasedb/featurebase/v3/tracing"
+	"github.com/featurebasedb/featurebase/v3/tracing/opentracing"
 	"github.com/pelletier/go-toml"
 	"github.com/pkg/errors"
+	jaegercfg "github.com/uber/jaeger-client-go/config"
+	"golang.org/x/sync/errgroup"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/opentracer"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
+	"gopkg.in/DataDog/dd-trace-go.v1/profiler"
 )
 
 type loggerLogger interface {
@@ -61,20 +68,25 @@ type Command struct {
 	// Configuration.
 	Config *Config
 
-	// Standard input/output
-	*pilosa.CmdIO
-
 	// Started will be closed once Command.Start is finished.
 	Started chan struct{}
 	// done will be closed when Command.Close() is called
 	done chan struct{}
+
+	traceCloser io.Closer
 
 	logOutput      io.Writer
 	queryLogOutput io.Writer
 	logger         loggerLogger
 	queryLogger    loggerLogger
 
+	Registrar         computer.Registrar
+	serverlessStorage *storage.ResourceManager
+	writelogService   computer.WritelogService
+	snapshotService   computer.SnapshotService
+
 	Handler      pilosa.HandlerI
+	httpHandler  http.Handler
 	grpcServer   *grpcServer
 	grpcLn       net.Listener
 	API          *pilosa.API
@@ -82,10 +94,18 @@ type Command struct {
 	listenURI    *pnet.URI
 	tlsConfig    *tls.Config
 	closeTimeout time.Duration
-	pgserver     *PostgresServer
 
 	serverOptions []pilosa.ServerOption
 	auth          *authn.Auth
+
+	// isComputeNode is set to true if this node is running as a DAX compute
+	// node.
+	isComputeNode bool
+}
+
+// Logger returns the command's associated Logger to maintain CommandWithTLSSupport interface compatibility
+func (cmd *Command) Logger() logger.Logger {
+	return cmd.logger
 }
 
 type CommandOption func(c *Command) error
@@ -111,6 +131,7 @@ func OptCommandConfig(config *Config) CommandOption {
 			c.Config.Etcd = config.Etcd
 			c.Config.Auth = config.Auth
 			c.Config.TLS = config.TLS
+			c.Config.ControllerAddress = config.ControllerAddress
 			return nil
 		}
 		c.Config = config
@@ -118,12 +139,43 @@ func OptCommandConfig(config *Config) CommandOption {
 	}
 }
 
+// OptCommandSetConfig was added because OptCommandConfig only sets a small
+// sub-set of the config options (it doesn't seem to be used for anything but
+// tests). We need a functional option which sets the full Config.
+func OptCommandSetConfig(config *Config) CommandOption {
+	return func(c *Command) error {
+		defer c.Config.MustValidate()
+		c.Config = config
+		return nil
+	}
+}
+
+// OptCommandInjections injects the interface implementations.
+func OptCommandInjections(inj Injections) CommandOption {
+	return func(c *Command) error {
+		if inj.Writelogger != nil {
+			c.writelogService = inj.Writelogger
+		}
+		if inj.Snapshotter != nil {
+			c.snapshotService = inj.Snapshotter
+		}
+		c.isComputeNode = inj.IsComputeNode
+		return nil
+	}
+}
+
+type Injections struct {
+	Writelogger   computer.WritelogService
+	Snapshotter   computer.SnapshotService
+	IsComputeNode bool
+}
+
 // NewCommand returns a new instance of Main.
-func NewCommand(stdin io.Reader, stdout, stderr io.Writer, opts ...CommandOption) *Command {
+func NewCommand(stderr io.Writer, opts ...CommandOption) *Command {
 	c := &Command{
 		Config: NewConfig(),
 
-		CmdIO: pilosa.NewCmdIO(stdin, stdout, stderr),
+		logOutput: stderr,
 
 		Started: make(chan struct{}),
 		done:    make(chan struct{}),
@@ -147,8 +199,10 @@ const (
 
 // we want to set resource limits *exactly once*, and then be able
 // to report on whether or not that succeeded.
-var setupResourceLimitsOnce sync.Once
-var setupResourceLimitsErr error
+var (
+	setupResourceLimitsOnce sync.Once
+	errSetupResourceLimits  error
+)
 
 // doSetupResourceLimits is the function which actually does the
 // resource limit setup, possibly yielding an error. it's a Command
@@ -183,13 +237,13 @@ func (m *Command) doSetupResourceLimits() error {
 			return fmt.Errorf("checking open file limit: %w", err)
 		} else {
 			if oldLimit.Cur != targetFileLimit {
-				m.logger.Warnf("tried to set open file limit to %d, but it is %d; see https://docs.featurebase.com/reference/hostsystem#operating-system-configuration", targetFileLimit, oldLimit.Cur)
+				m.logger.Warnf("tried to set open file limit to %d, but it is %d; see https://docs.featurebasedb.cloud/reference/hostsystem#operating-system-configuration", targetFileLimit, oldLimit.Cur)
 			}
 		}
 	}
 	// We don't have corresponding options for non-Linux right now, but probably should.
 	if runtime.GOOS == "linux" {
-		result, err := ioutil.ReadFile("/proc/sys/vm/max_map_count")
+		result, err := os.ReadFile("/proc/sys/vm/max_map_count")
 		if err != nil {
 			m.logger.Infof("Tried unsuccessfully to check system mmap limit: %w", err)
 		} else {
@@ -210,17 +264,87 @@ func (m *Command) doSetupResourceLimits() error {
 // denied errors are not that concerning.
 func (m *Command) setupResourceLimits() error {
 	setupResourceLimitsOnce.Do(func() {
-		setupResourceLimitsErr = m.doSetupResourceLimits()
+		errSetupResourceLimits = m.doSetupResourceLimits()
 	})
-	return setupResourceLimitsErr
+	return errSetupResourceLimits
+}
+
+// StartNoServe starts the pilosa server, but doesn't serve on the http handler.
+func (m *Command) StartNoServe(addr dax.Address) (err error) {
+	// setupServer
+	err = m.setupServer()
+	if err != nil {
+		return errors.Wrap(err, "setting up server")
+	}
+	err = m.setupResourceLimits()
+	if err != nil {
+		return errors.Wrap(err, "setting resource limits")
+	}
+
+	// Initialize server.
+	if err = m.Server.Open(); err != nil {
+		return errors.Wrap(err, "opening server")
+	}
+
+	// Start the "check-in" background process which periodically checks in with
+	// the Controller.
+	go m.checkIn(addr)
+
+	return nil
+}
+
+// checkIn calls the CheckIn function set on m.checkInFn every interval period.
+// If the interval period is 0, the check-in is disabled.
+func (m *Command) checkIn(addr dax.Address) {
+	interval := m.Config.CheckInInterval
+	m.logger.Printf("CheckInInterval: %v", interval)
+
+	if interval == 0 {
+		return
+	}
+
+	for {
+		select {
+		case <-m.done:
+			return
+		case <-time.After(interval):
+			m.logger.Debugf("node check-in in last %s, address: %s", interval, m.Config.Advertise)
+
+			if m.Registrar == nil {
+				m.logger.Printf("no Controller implementation with which to check-in on node: %s", m.Config.Advertise)
+			}
+
+			// Determine if this node has received at least one directive from
+			// the controller. This will be true if the server's Holder has a
+			// directive with a non-zero version.
+			var hasDirective bool
+			if holder := m.Server.Holder(); holder != nil {
+				hasDirective = holder.Directive().Version > 0
+			}
+
+			node := &dax.Node{
+				Address: addr,
+				RoleTypes: []dax.RoleType{
+					dax.RoleTypeCompute,
+					dax.RoleTypeTranslate,
+				},
+				HasDirective: hasDirective,
+			}
+
+			if err := m.Registrar.CheckInNode(context.Background(), node); err != nil {
+				m.logger.Errorf("checking in node: %s, %v", node.Address, err)
+			}
+		}
+	}
 }
 
 // Start starts the pilosa server - it returns once the server is running.
 func (m *Command) Start() (err error) {
 	// Seed random number generator
 	rand.Seed(time.Now().UTC().UnixNano())
-	// SetupServer
-	err = m.SetupServer()
+
+	// setupServer
+	err = m.setupServer()
 	if err != nil {
 		return errors.Wrap(err, "setting up server")
 	}
@@ -249,27 +373,8 @@ func (m *Command) Start() (err error) {
 		}
 	}()
 
-	// Initialize postgres.
-	m.pgserver = nil
-	if m.Config.Postgres.Bind != "" {
-		var tlsConf *tls.Config
-		if m.Config.Postgres.TLS.CertificatePath != "" {
-			conf, err := GetTLSConfig(&m.Config.Postgres.TLS, m.logger)
-			if err != nil {
-				return errors.Wrap(err, "setting up postgres TLS")
-			}
-			tlsConf = conf
-		}
-		m.pgserver = NewPostgresServer(m.API, m.logger, tlsConf, SqlVersion(m.Config.Postgres.SqlVersion))
-		m.pgserver.s.StartupTimeout = time.Duration(m.Config.Postgres.StartupTimeout)
-		m.pgserver.s.ReadTimeout = time.Duration(m.Config.Postgres.ReadTimeout)
-		m.pgserver.s.WriteTimeout = time.Duration(m.Config.Postgres.WriteTimeout)
-		m.pgserver.s.MaxStartupSize = m.Config.Postgres.MaxStartupSize
-		m.pgserver.s.ConnectionLimit = m.Config.Postgres.ConnectionLimit
-		err := m.pgserver.Start(m.Config.Postgres.Bind)
-		if err != nil {
-			return errors.Wrap(err, "starting postgres")
-		}
+	if err := m.setupProfilingAndTracing(); err != nil {
+		return errors.Wrap(err, "setting up profiling/tracing")
 	}
 
 	_ = testhook.Opened(pilosa.NewAuditor(), m, nil)
@@ -281,8 +386,8 @@ func (m *Command) UpAndDown() (err error) {
 	// Seed random number generator
 	rand.Seed(time.Now().UTC().UnixNano())
 
-	// SetupServer
-	err = m.SetupServer()
+	// setupServer
+	err = m.setupServer()
 	if err != nil {
 		return errors.Wrap(err, "setting up server")
 	}
@@ -323,8 +428,8 @@ func (m *Command) Wait() error {
 	}
 }
 
-// SetupServer uses the cluster configuration to set up this server.
-func (m *Command) SetupServer() error {
+// setupServer uses the cluster configuration to set up this server.
+func (m *Command) setupServer() error {
 	runtime.SetBlockProfileRate(m.Config.Profile.BlockRate)
 	runtime.SetMutexProfileFraction(m.Config.Profile.MutexFraction)
 
@@ -386,14 +491,13 @@ func (m *Command) SetupServer() error {
 		diagnosticsInterval = defaultDiagnosticsInterval
 	}
 
-	statsClient, err := newStatsClient(m.Config.Metric.Service, m.Config.Metric.Host, m.Config.Namespace())
-	if err != nil {
-		return errors.Wrap(err, "new stats client")
-	}
-
-	m.ln, err = getListener(*uri, m.tlsConfig)
-	if err != nil {
-		return errors.Wrap(err, "getting listener")
+	if m.Config.Listener == nil {
+		m.ln, err = getListener(*uri, m.tlsConfig)
+		if err != nil {
+			return errors.Wrap(err, "getting listener")
+		}
+	} else {
+		m.ln = m.Config.Listener
 	}
 
 	// If port is 0, get auto-allocated port from listener
@@ -428,6 +532,9 @@ func (m *Command) SetupServer() error {
 	if m.Config.Translation.PrimaryURL != "" {
 		m.logger.Infof("DEPRECATED: The primary-url configuration option is no longer used.")
 	}
+	if m.Config.AntiEntropy.Interval != 0 {
+		m.logger.Infof("DEPRECATED: The anti-entropy configuration option is no longer used.")
+	}
 	// Handle renamed and deprecated config parameter
 	longQueryTime := m.Config.LongQueryTime
 	if m.Config.Cluster.LongQueryTime >= 0 {
@@ -459,11 +566,19 @@ func (m *Command) SetupServer() error {
 		m.Config.Etcd.Dir = filepath.Join(path, pilosa.DiscoDir)
 	}
 
-	m.Config.Etcd.Id = m.Config.Name // TODO(twg) rethink this
-	e := petcd.NewEtcd(m.Config.Etcd, m.logger, m.Config.Cluster.ReplicaN, version)
+	if m.writelogService != nil && m.snapshotService != nil {
+		m.serverlessStorage = storage.NewResourceManager(m.snapshotService, m.writelogService, m.logger)
+	}
+
+	executionPlannerFn := func(e pilosa.Executor, api *pilosa.API, sql string) sql3.CompilePlanner {
+		fapi := pilosa.NewOnPremSchema(api)
+		fsapi := &pilosa.FeatureBaseSystemAPI{API: api}
+		imp := pilosa.NewOnPremImporter(api)
+
+		return planner.NewExecutionPlanner(e, fapi, fsapi, m.Server.SystemLayer, imp, m.logger, sql)
+	}
 
 	serverOptions := []pilosa.ServerOption{
-		pilosa.OptServerAntiEntropyInterval(time.Duration(m.Config.AntiEntropy.Interval)),
 		pilosa.OptServerLongQueryTime(time.Duration(longQueryTime)),
 		pilosa.OptServerDataDir(m.Config.DataDir),
 		pilosa.OptServerReplicaN(m.Config.Cluster.ReplicaN),
@@ -471,14 +586,13 @@ func (m *Command) SetupServer() error {
 		pilosa.OptServerMetricInterval(time.Duration(m.Config.Metric.PollInterval)),
 		pilosa.OptServerDiagnosticsInterval(diagnosticsInterval),
 		pilosa.OptServerExecutorPoolSize(m.Config.WorkerPoolSize),
-		pilosa.OptServerOpenTranslateStore(boltdb.OpenTranslateStore),
+		pilosa.OptServerOpenTranslateStore(pilosa.OpenTranslateStore),
 		pilosa.OptServerOpenTranslateReader(pilosa.GetOpenTranslateReaderWithLockerFunc(c, &sync.Mutex{})),
 		pilosa.OptServerOpenIDAllocator(pilosa.OpenIDAllocator),
 		pilosa.OptServerLogger(m.logger),
 		pilosa.OptServerQueryLogger(m.queryLogger),
 		pilosa.OptServerSystemInfo(gopsutil.NewSystemInfo()),
 		pilosa.OptServerGCNotifier(gcnotify.NewActiveGCNotifier()),
-		pilosa.OptServerStatsClient(statsClient),
 		pilosa.OptServerURI(advertiseURI),
 		pilosa.OptServerGRPCURI(advertiseGRPCURI),
 		pilosa.OptServerClusterName(m.Config.Cluster.Name),
@@ -488,7 +602,31 @@ func (m *Command) SetupServer() error {
 		pilosa.OptServerMaxQueryMemory(m.Config.MaxQueryMemory),
 		pilosa.OptServerQueryHistoryLength(m.Config.QueryHistoryLength),
 		pilosa.OptServerPartitionAssigner(m.Config.Cluster.PartitionToNodeAssignment),
-		pilosa.OptServerDisCo(e, e, e, e),
+		pilosa.OptServerExecutionPlannerFn(executionPlannerFn),
+		pilosa.OptServerServerlessStorage(m.serverlessStorage),
+		pilosa.OptServerIsDataframeEnabled(m.Config.Dataframe.Enable),
+		pilosa.OptServerDataframeUseParquet(m.Config.Dataframe.UseParquet),
+		pilosa.OptServerVerChkAddress(m.Config.VerChkAddress),
+		pilosa.OptServerUUIDFile(m.Config.UUIDFile),
+	}
+
+	if m.isComputeNode {
+		nodeID := "localcmd"
+		serverOptions = append(serverOptions,
+			pilosa.OptServerDisCo(
+				disco.NewInMemDisCo(nodeID),
+				disco.NewLocalNoder([]*disco.Node{
+					{ID: nodeID, URI: *advertiseURI, IsPrimary: true, State: disco.NodeStateStarted},
+				}),
+				disco.NewInMemSharder(),
+				disco.NewInMemSchemator(),
+			),
+			pilosa.OptServerNodeID(nodeID),
+		)
+	} else {
+		m.Config.Etcd.Id = m.Config.Name // TODO(twg) rethink this
+		e := petcd.NewEtcd(m.Config.Etcd, m.logger, m.Config.Cluster.ReplicaN, version)
+		serverOptions = append(serverOptions, pilosa.OptServerDisCo(e, e, e, e))
 	}
 
 	if m.Config.LookupDBDSN != "" {
@@ -504,14 +642,18 @@ func (m *Command) SetupServer() error {
 	}
 
 	m.Server, err = pilosa.NewServer(serverOptions...)
-
 	if err != nil {
 		return errors.Wrap(err, "new server")
 	}
 
+	m.Server.SystemLayer = systemlayer.NewSystemLayer()
+
 	m.API, err = pilosa.NewAPI(
 		pilosa.OptAPIServer(m.Server),
 		pilosa.OptAPIImportWorkerPoolSize(m.Config.ImportWorkerPoolSize),
+		pilosa.OptAPIServerlessStorage(m.serverlessStorage),
+		pilosa.OptAPIDirectiveWorkerPoolSize(m.Config.DirectiveWorkerPoolSize),
+		pilosa.OptAPIIsComputeNode(m.isComputeNode),
 	)
 	if err != nil {
 		return errors.Wrap(err, "new api")
@@ -550,9 +692,6 @@ func (m *Command) SetupServer() error {
 			m.queryLogger.Infof("Configured IPs for allowed networks: %v", ac.ConfiguredIPs)
 		}
 
-		// disable postgres binding if auth is enabled
-		m.Config.Postgres.Bind = ""
-
 		// TLS must be enabled if auth is
 		if m.Config.TLS.CertificatePath == "" || m.Config.TLS.CertificateKeyPath == "" {
 			return fmt.Errorf("transport layer security (TLS) is not configured properly. TLS is required when AuthN/Z is enabled, current configuration: %v", m.Config.TLS)
@@ -565,7 +704,6 @@ func (m *Command) SetupServer() error {
 		OptGRPCServerListener(m.grpcLn),
 		OptGRPCServerTLSConfig(m.tlsConfig),
 		OptGRPCServerLogger(m.logger),
-		OptGRPCServerStats(statsClient),
 		OptGRPCServerAuth(m.auth),
 		OptGRPCServerPerm(&p),
 		OptGRPCServerQueryLogger(m.queryLogger),
@@ -574,7 +712,7 @@ func (m *Command) SetupServer() error {
 		return errors.Wrap(err, "getting grpcServer")
 	}
 
-	m.Handler, err = pilosa.NewHandler(
+	hndlr, err := pilosa.NewHandler(
 		pilosa.OptHandlerAllowedOrigins(m.Config.Handler.AllowedOrigins),
 		pilosa.OptHandlerAPI(m.API),
 		pilosa.OptHandlerLogger(m.logger),
@@ -588,17 +726,36 @@ func (m *Command) SetupServer() error {
 		pilosa.OptHandlerSerializer(proto.Serializer{}),
 		pilosa.OptHandlerRoaringSerializer(proto.RoaringSerializer),
 	)
-	return errors.Wrap(err, "new handler")
+	if err != nil {
+		return errors.Wrap(err, "new handler")
+	}
+
+	// ignore http server logs unless verbose logging in enabled
+	if uri.Scheme == "https" {
+		if !m.Config.Verbose {
+			hndlr.DiscardHTTPServerLogs()
+		}
+	}
+
+	m.httpHandler = hndlr
+	m.Handler = hndlr
+
+	return nil
+}
+
+// HTTPHandler was added for the case where we want to get the full
+// http.Handler, and not just those methods which satisfy the pilosa.HandlerI
+// interface.
+func (m *Command) HTTPHandler() http.Handler {
+	return m.httpHandler
 }
 
 // setupLogger sets up the logger based on the configuration.
 func (m *Command) setupLogger() error {
 	var f *logger.FileWriter
 	var err error
-	if m.Config.LogPath == "" {
-		m.logOutput = m.Stderr
-	} else {
-		f, err = logger.NewFileWriter(m.Config.LogPath)
+	if m.Config.LogPath != "" {
+		f, err = logger.NewFileWriterMode(m.Config.LogPath, 0640)
 		if err != nil {
 			return errors.Wrap(err, "opening file")
 		}
@@ -663,6 +820,62 @@ func (m *Command) setupQueryLogger() error {
 	return nil
 }
 
+func (m *Command) setupProfilingAndTracing() error {
+	if m.Config.DataDog.Enable {
+		opts := make([]profiler.ProfileType, 0)
+		if m.Config.DataDog.CPUProfile {
+			opts = append(opts, profiler.CPUProfile)
+		}
+		if m.Config.DataDog.HeapProfile {
+			opts = append(opts, profiler.HeapProfile)
+		}
+		if m.Config.DataDog.BlockProfile {
+			opts = append(opts, profiler.BlockProfile)
+		}
+		if m.Config.DataDog.GoroutineProfile {
+			opts = append(opts, profiler.GoroutineProfile)
+		}
+		if m.Config.DataDog.MutexProfile {
+			opts = append(opts, profiler.MutexProfile)
+		}
+		err := profiler.Start(
+			profiler.WithService(m.Config.DataDog.Service),
+			profiler.WithEnv(m.Config.DataDog.Env),
+			profiler.WithVersion(m.Config.DataDog.Version),
+			profiler.WithTags(m.Config.DataDog.Tags),
+			profiler.WithProfileTypes(
+				opts...,
+			),
+		)
+		if err != nil {
+			return errors.Wrap(err, "starting datadog")
+		}
+	}
+
+	if m.Config.Tracing.SamplerType != "off" {
+		// Initialize tracing in the command since it is global.
+		var cfg jaegercfg.Configuration
+		cfg.ServiceName = "pilosa"
+		cfg.Sampler = &jaegercfg.SamplerConfig{
+			Type:  m.Config.Tracing.SamplerType,
+			Param: m.Config.Tracing.SamplerParam,
+		}
+		cfg.Reporter = &jaegercfg.ReporterConfig{
+			LocalAgentHostPort: m.Config.Tracing.AgentHostPort,
+		}
+		tracer, closer, err := cfg.NewTracer()
+		if err != nil {
+			return errors.Wrap(err, "initializing jaeger tracer")
+		}
+		m.traceCloser = closer
+		tracing.GlobalTracer = opentracing.NewTracer(tracer, m.Logger())
+	} else if m.Config.DataDog.EnableTracing { // Give preference to legacy support of jaeger
+		t := opentracer.New(tracer.WithServiceName(m.Config.DataDog.Service))
+		tracing.GlobalTracer = opentracing.NewTracer(t, m.Logger())
+	}
+	return nil
+}
+
 // Close shuts down the server.
 func (m *Command) Close() error {
 	select {
@@ -674,7 +887,6 @@ func (m *Command) Close() error {
 		eg.Go(m.Handler.Close)
 		eg.Go(m.Server.Close)
 		eg.Go(m.API.Close)
-		eg.Go(m.pgserver.Close)
 		if closer, ok := m.logOutput.(io.Closer); ok {
 			// If closer is os.Stdout or os.Stderr, don't close it.
 			if closer != os.Stdout && closer != os.Stderr {
@@ -684,27 +896,17 @@ func (m *Command) Close() error {
 
 		err := eg.Wait()
 		_ = testhook.Closed(pilosa.NewAuditor(), m, nil)
+		if m.Config.DataDog.Enable {
+			defer profiler.Stop()
+		}
+		if m.traceCloser != nil {
+			defer m.traceCloser.Close()
+		} else if m.Config.DataDog.EnableTracing {
+			defer tracer.Stop()
+		}
 		close(m.done)
 
 		return errors.Wrap(err, "closing everything")
-	}
-}
-
-// newStatsClient creates a stats client from the config
-func newStatsClient(name string, host string, namespace string) (stats.StatsClient, error) {
-	switch name {
-	case "expvar":
-		return stats.NewExpvarStatsClient(), nil
-	case "statsd":
-		return statsd.NewStatsClient(host, namespace)
-	case "prometheus":
-		return prometheus.NewPrometheusClient(
-			prometheus.OptClientNamespace(namespace),
-		)
-	case "nop", "none":
-		return stats.NopStatsClient, nil
-	default:
-		return nil, errors.Errorf("'%v' not a valid stats client, choose from [expvar, statsd, prometheus, none].", name)
 	}
 }
 

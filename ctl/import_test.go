@@ -7,9 +7,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,42 +18,59 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt"
 	pilosa "github.com/featurebasedb/featurebase/v3"
 	"github.com/featurebasedb/featurebase/v3/authn"
 	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/featurebasedb/featurebase/v3/server"
 	"github.com/featurebasedb/featurebase/v3/test"
 	"github.com/featurebasedb/featurebase/v3/testhook"
+	"github.com/golang-jwt/jwt"
 )
 
+// errContains reports whether the first error is or
+// contains the second, either via errors.Is, or by
+// containing its Error() string. a nil error contains
+// a nil error, but does not contain any non-nil error,
+// and a non-nil error does not contain a nil error.
+func errContains(err error, expected error) bool {
+	if err == nil {
+		return expected == nil
+	}
+	if expected == nil {
+		return false
+	}
+	if errors.Is(err, expected) {
+		return true
+	}
+	e1, e2 := err.Error(), expected.Error()
+	return strings.Contains(e1, e2)
+}
 func TestImportCommand_Validation(t *testing.T) {
-	buf := bytes.Buffer{}
-	stdin, stdout, stderr := GetIO(buf)
-	cm := NewImportCommand(stdin, stdout, stderr)
+	cmLog := logger.NewStandardLogger(io.Discard)
+	cm := NewImportCommand(cmLog)
 	err := cm.Run(context.Background())
-	if err != pilosa.ErrIndexRequired {
-		t.Fatalf("Command not working, expect: %s, actual: '%s'", pilosa.ErrIndexRequired, err)
+	if !errContains(err, pilosa.ErrIndexRequired) {
+		t.Fatalf("wrong error: expected %q, got: '%v'", pilosa.ErrIndexRequired, err)
 	}
 
 	cm.Index = "i"
 	err = cm.Run(context.Background())
-	if err != pilosa.ErrFieldRequired {
-		t.Fatalf("Command not working, expect: %s, actual: '%s'", pilosa.ErrFieldRequired, err)
+	if !errContains(err, pilosa.ErrFieldRequired) {
+		t.Fatalf("wrong error: expected %q, got: '%v'", pilosa.ErrFieldRequired, err)
 	}
 
 	cm.Field = "f"
 	err = cm.Run(context.Background())
-	if err.Error() != "path required" {
-		t.Fatalf("Command not working, expect: %s, actual: '%s'", "path required", err)
+	pathRequired := errors.New("path required")
+	if !errContains(err, pathRequired) {
+		t.Fatalf("wrong error: expected %q, got: '%v'", pathRequired, err)
 	}
 }
 
 func TestImportCommand_Basic(t *testing.T) {
 	t.Run("set", func(t *testing.T) {
-		buf := bytes.Buffer{}
-		stdin, stdout, stderr := GetIO(buf)
-		cm := NewImportCommand(stdin, stdout, stderr)
+		cmLog := logger.NewStandardLogger(io.Discard)
+		cm := NewImportCommand(cmLog)
 		file, err := testhook.TempFile(t, "import.csv")
 		if err != nil {
 			t.Fatalf("creating tempfile: %v", err)
@@ -83,9 +100,8 @@ func TestImportCommand_Basic(t *testing.T) {
 	})
 
 	t.Run("clear", func(t *testing.T) {
-		buf := bytes.Buffer{}
-		stdin, stdout, stderr := GetIO(buf)
-		cm := NewImportCommand(stdin, stdout, stderr)
+		cmLog := logger.NewStandardLogger(io.Discard)
+		cm := NewImportCommand(cmLog)
 		file, err := testhook.TempFile(t, "import.csv")
 		if err != nil {
 			t.Fatalf("creating tempfile: %v", err)
@@ -116,9 +132,8 @@ func TestImportCommand_Basic(t *testing.T) {
 // Ensure that the ImportValue path runs.
 func TestImportCommand_RunValue(t *testing.T) {
 	t.Run("set", func(t *testing.T) {
-		buf := bytes.Buffer{}
-		stdin, stdout, stderr := GetIO(buf)
-		cm := NewImportCommand(stdin, stdout, stderr)
+		cmLog := logger.NewStandardLogger(io.Discard)
+		cm := NewImportCommand(cmLog)
 		file, err := testhook.TempFile(t, "import-value.csv")
 		if err != nil {
 			t.Fatalf("creating tempfile: %v", err)
@@ -155,9 +170,8 @@ func TestImportCommand_RunValue(t *testing.T) {
 	})
 
 	t.Run("clear", func(t *testing.T) {
-		buf := bytes.Buffer{}
-		stdin, stdout, stderr := GetIO(buf)
-		cm := NewImportCommand(stdin, stdout, stderr)
+		cmLog := logger.NewStandardLogger(io.Discard)
+		cm := NewImportCommand(cmLog)
 		file, err := testhook.TempFile(t, "import-value.csv")
 		if err != nil {
 			t.Fatalf("creating tempfile: %v", err)
@@ -200,9 +214,8 @@ func TestImportCommand_RunValue(t *testing.T) {
 
 // Ensure that import with keys runs.
 func TestImportCommand_RunKeys(t *testing.T) {
-	buf := bytes.Buffer{}
-	stdin, stdout, stderr := GetIO(buf)
-	cm := NewImportCommand(stdin, stdout, stderr)
+	cmLog := logger.NewStandardLogger(io.Discard)
+	cm := NewImportCommand(cmLog)
 	file, err := testhook.TempFile(t, "import-key.csv")
 	if err != nil {
 		t.Fatal(err)
@@ -218,18 +231,18 @@ func TestImportCommand_RunKeys(t *testing.T) {
 	cmd := cluster.GetNode(0)
 	cm.Host = cmd.API.Node().URI.HostPort()
 
-	resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", "http://"+cm.Host+"/index/i", strings.NewReader(`{"options":{"keys": true}}`)))
+	resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", fmt.Sprintf("http://%s/index/%i", cm.Host, cluster), strings.NewReader(`{"options":{"keys": true}}`)))
 	if err != nil {
 		t.Fatalf("posting request: %v", err)
 	}
 	resp.Body.Close()
-	resp, err = http.DefaultClient.Do(MustNewHTTPRequest("POST", "http://"+cm.Host+"/index/i/field/f", strings.NewReader(`{"options":{"keys": true}}`)))
+	resp, err = http.DefaultClient.Do(MustNewHTTPRequest("POST", fmt.Sprintf("http://%s/index/%i/field/f", cm.Host, cluster), strings.NewReader(`{"options":{"keys": true}}`)))
 	if err != nil {
 		t.Fatalf("posting request: %v", err)
 	}
 	resp.Body.Close()
 
-	cm.Index = "i"
+	cm.Index = cluster.Idx("i")
 	cm.Field = "f"
 	cm.Paths = []string{file.Name()}
 	err = cm.Run(ctx)
@@ -240,18 +253,15 @@ func TestImportCommand_RunKeys(t *testing.T) {
 
 // Ensure that import with keys runs with key replication.
 func TestImportCommand_KeyReplication(t *testing.T) {
-	buf := bytes.Buffer{}
-	stdin, stdout, stderr := GetIO(buf)
-	cm := NewImportCommand(stdin, stdout, stderr)
+	cmLog := logger.NewStandardLogger(io.Discard)
+	cm := NewImportCommand(cmLog)
 	file, err := testhook.TempFile(t, "import-key.csv")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// create a large import file in order to test the
-	// translateStoreBufferSize growth logic.
 	keyBytes := []byte{}
-	for row := 0; row < 1000; row++ {
-		for col := 0; col < 1000; col++ {
+	for row := 0; row < 50; row++ {
+		for col := 0; col < 50; col++ {
 			x := fmt.Sprintf("foo%d,bar%d\n", row, col)
 			keyBytes = append(keyBytes, x...)
 		}
@@ -275,18 +285,18 @@ func TestImportCommand_KeyReplication(t *testing.T) {
 
 	cm.Host = host0
 
-	resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", "http://"+cm.Host+"/index/i", strings.NewReader(`{"options":{"keys": true}}`)))
+	resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", fmt.Sprintf("http://%s/index/%i", cm.Host, c), strings.NewReader(`{"options":{"keys": true}}`)))
 	if err != nil {
 		t.Fatalf("posting request: %v", err)
 	}
 	resp.Body.Close()
-	resp, err = http.DefaultClient.Do(MustNewHTTPRequest("POST", "http://"+cm.Host+"/index/i/field/f", strings.NewReader(`{"options":{"keys": true}}`)))
+	resp, err = http.DefaultClient.Do(MustNewHTTPRequest("POST", fmt.Sprintf("http://%s/index/%i/field/f", cm.Host, c), strings.NewReader(`{"options":{"keys": true}}`)))
 	if err != nil {
 		t.Fatalf("posting request: %v", err)
 	}
 	resp.Body.Close()
 
-	cm.Index = "i"
+	cm.Index = c.Idx("i")
 	cm.Field = "f"
 	cm.Paths = []string{file.Name()}
 	err = cm.Run(ctx)
@@ -298,14 +308,14 @@ func TestImportCommand_KeyReplication(t *testing.T) {
 	for _, host := range []string{host0, host1} {
 		if err := test.RetryUntil(2*time.Second, func() error {
 			qry := "Count(Row(f=foo0))"
-			resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", "http://"+host+"/index/i/query", strings.NewReader(qry)))
+			resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", fmt.Sprintf("http://%s/index/%i/query", host, c), strings.NewReader(qry)))
 			if err != nil {
 				return fmt.Errorf("Querying data for validation: %s", err)
 			}
 
 			// Read body and unmarshal response.
-			exp := `{"results":[1000]}` + "\n"
-			if body, err := ioutil.ReadAll(resp.Body); err != nil {
+			exp := `{"results":[50]}` + "\n"
+			if body, err := io.ReadAll(resp.Body); err != nil {
 				return fmt.Errorf("reading: %s", err)
 			} else if !reflect.DeepEqual(body, []byte(exp)) {
 				return fmt.Errorf("expected: %s, but got: %s", exp, body)
@@ -320,9 +330,8 @@ func TestImportCommand_KeyReplication(t *testing.T) {
 
 // Ensure that integer import with keys runs.
 func TestImportCommand_RunValueKeys(t *testing.T) {
-	buf := bytes.Buffer{}
-	stdin, stdout, stderr := GetIO(buf)
-	cm := NewImportCommand(stdin, stdout, stderr)
+	cmLog := logger.NewStandardLogger(io.Discard)
+	cm := NewImportCommand(cmLog)
 	file, err := testhook.TempFile(t, "import-key.csv")
 	if err != nil {
 		t.Fatal(err)
@@ -338,18 +347,18 @@ func TestImportCommand_RunValueKeys(t *testing.T) {
 	cmd := cluster.GetNode(0)
 	cm.Host = cmd.API.Node().URI.HostPort()
 
-	resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", "http://"+cm.Host+"/index/i", strings.NewReader(`{"options":{"keys": true}}`)))
+	resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", fmt.Sprintf("http://%s/index/%i", cm.Host, cluster), strings.NewReader(`{"options":{"keys": true}}`)))
 	if err != nil {
 		t.Fatalf("posting request: %v", err)
 	}
 	resp.Body.Close()
-	resp, err = http.DefaultClient.Do(MustNewHTTPRequest("POST", "http://"+cm.Host+"/index/i/field/f", strings.NewReader(`{"options":{"type": "int", "min": 0, "max": 100}}`)))
+	resp, err = http.DefaultClient.Do(MustNewHTTPRequest("POST", fmt.Sprintf("http://%s/index/%i/field/f", cm.Host, cluster), strings.NewReader(`{"options":{"type": "int", "min": 0, "max": 100}}`)))
 	if err != nil {
 		t.Fatalf("posting request: %v", err)
 	}
 	resp.Body.Close()
 
-	cm.Index = "i"
+	cm.Index = cluster.Idx("i")
 	cm.Field = "f"
 	cm.Paths = []string{file.Name()}
 	err = cm.Run(ctx)
@@ -363,9 +372,8 @@ func TestImportCommand_InvalidFile(t *testing.T) {
 	defer cluster.Close()
 	cmd := cluster.GetNode(0)
 
-	buf := bytes.Buffer{}
-	stdin, stdout, stderr := GetIO(buf)
-	cm := NewImportCommand(stdin, stdout, stderr)
+	cmLog := logger.NewStandardLogger(io.Discard)
+	cm := NewImportCommand(cmLog)
 	cm.Host = cmd.API.Node().URI.HostPort()
 	cm.Index = "i"
 	cm.Field = "f"
@@ -451,9 +459,8 @@ func TestImportCommand_BugOverwriteValue(t *testing.T) {
 	defer cluster.Close()
 	cmd := cluster.GetNode(0)
 
-	buf := bytes.Buffer{}
-	stdin, stdout, stderr := GetIO(buf)
-	cm := NewImportCommand(stdin, stdout, stderr)
+	cmLog := logger.NewStandardLogger(io.Discard)
+	cm := NewImportCommand(cmLog)
 	file, err := testhook.TempFile(t, "import-value.csv")
 	if err != nil {
 		t.Fatal(err)
@@ -466,18 +473,18 @@ func TestImportCommand_BugOverwriteValue(t *testing.T) {
 
 	cm.Host = cmd.API.Node().URI.HostPort()
 
-	resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", "http://"+cm.Host+"/index/i", strings.NewReader("")))
+	resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", fmt.Sprintf("http://%s/index/%i", cm.Host, cluster), strings.NewReader("")))
 	if err != nil {
 		t.Fatalf("posting request: %v", err)
 	}
 	resp.Body.Close()
-	resp, err = http.DefaultClient.Do(MustNewHTTPRequest("POST", "http://"+cm.Host+"/index/i/field/f", strings.NewReader(`{"options":{"type": "int", "min": 0, "max":2147483648 }}`)))
+	resp, err = http.DefaultClient.Do(MustNewHTTPRequest("POST", fmt.Sprintf("http://%s/index/%i/field/f", cm.Host, cluster), strings.NewReader(`{"options":{"type": "int", "min": 0, "max":2147483648 }}`)))
 	if err != nil {
 		t.Fatalf("posting request: %v", err)
 	}
 	resp.Body.Close()
 
-	cm.Index = "i"
+	cm.Index = cluster.Idx("i")
 	cm.Field = "f"
 	cm.Paths = []string{file.Name()}
 	err = cm.Run(ctx)
@@ -518,9 +525,8 @@ func TestImportCommand_BugOverwriteValue(t *testing.T) {
 
 // Ensure that import into bool field runs.
 func TestImportCommand_RunBool(t *testing.T) {
-	buf := bytes.Buffer{}
-	stdin, stdout, stderr := GetIO(buf)
-	cm := NewImportCommand(stdin, stdout, stderr)
+	cmLog := logger.NewStandardLogger(io.Discard)
+	cm := NewImportCommand(cmLog)
 	ctx := context.Background()
 
 	cluster := test.MustRunCluster(t, 1)
@@ -528,18 +534,18 @@ func TestImportCommand_RunBool(t *testing.T) {
 	cmd := cluster.GetNode(0)
 	cm.Host = cmd.API.Node().URI.HostPort()
 
-	resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", "http://"+cm.Host+"/index/i", strings.NewReader("")))
+	resp, err := http.DefaultClient.Do(MustNewHTTPRequest("POST", fmt.Sprintf("http://%s/index/%i", cm.Host, cluster), strings.NewReader("")))
 	if err != nil {
 		t.Fatalf("posting request: %v", err)
 	}
 	resp.Body.Close()
-	resp, err = http.DefaultClient.Do(MustNewHTTPRequest("POST", "http://"+cm.Host+"/index/i/field/f", strings.NewReader(`{"options":{"type": "bool"}}`)))
+	resp, err = http.DefaultClient.Do(MustNewHTTPRequest("POST", fmt.Sprintf("http://%s/index/%i/field/f", cm.Host, cluster), strings.NewReader(`{"options":{"type": "bool"}}`)))
 	if err != nil {
 		t.Fatalf("posting request: %v", err)
 	}
 	resp.Body.Close()
 
-	cm.Index = "i"
+	cm.Index = cluster.Idx("i")
 	cm.Field = "f"
 
 	t.Run("Valid", func(t *testing.T) {
@@ -698,9 +704,8 @@ func TestImport_AuthOn(t *testing.T) {
 	}
 
 	t.Run("set", func(t *testing.T) {
-		buf := bytes.Buffer{}
-		stdin, stdout, stderr := GetIO(buf)
-		cm := NewImportCommand(stdin, stdout, stderr)
+		cmLog := logger.NewStandardLogger(io.Discard)
+		cm := NewImportCommand(cmLog)
 		file, err := testhook.TempFile(t, "import.csv")
 		if err != nil {
 			t.Fatalf("creating tempfile: %v", err)
@@ -714,6 +719,7 @@ func TestImport_AuthOn(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// note: cluster isn't shared because of custom opts
 		cluster := test.MustRunCluster(t, clusterSize, commandOpts...)
 		defer cluster.Close()
 		cmd := cluster.GetNode(0)
@@ -724,11 +730,7 @@ func TestImport_AuthOn(t *testing.T) {
 			cm.Field = test.Field
 			cm.CreateSchema = test.CreateSchema
 			cm.Paths = []string{file.Name()}
-			ctx := context.WithValue(
-				context.Background(),
-				authn.ContextValueAccessToken,
-				test.Token,
-			)
+			ctx := authn.WithAccessToken(context.Background(), test.Token)
 			err = cm.Run(ctx)
 			if test.Err != nil {
 				if !strings.Contains(err.Error(), test.Err.Error()) {

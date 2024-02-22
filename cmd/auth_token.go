@@ -3,24 +3,20 @@
 package cmd
 
 import (
-	"context"
-	"io"
-
 	"github.com/featurebasedb/featurebase/v3/ctl"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/spf13/cobra"
 )
 
-func newAuthTokenCommand(stdin io.Reader, stdout io.Writer, stderr io.Writer) *cobra.Command {
-	cmd := ctl.NewAuthTokenCommand(stdin, stdout, stderr)
+func newAuthTokenCommand(logdest logger.Logger) *cobra.Command {
+	cmd := ctl.NewAuthTokenCommand(logdest)
 	ccmd := &cobra.Command{
 		Use:   "auth-token",
 		Short: "Get an auth-token",
 		Long: `
 Retrieves an auth-token for use in authenticating with FeatureBase from the configured identity provider.
 `,
-		RunE: func(c *cobra.Command, args []string) error {
-			return cmd.Run(context.Background())
-		},
+		RunE: UsageErrorWrapper(cmd),
 	}
 
 	flags := ccmd.Flags()

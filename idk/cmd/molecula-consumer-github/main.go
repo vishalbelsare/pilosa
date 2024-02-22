@@ -7,7 +7,6 @@ import (
 	"expvar"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -15,9 +14,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/jaffee/commandeer/pflag"
 	"github.com/featurebasedb/featurebase/v3/idk"
 	"github.com/featurebasedb/featurebase/v3/logger"
+	"github.com/jaffee/commandeer/pflag"
 	"github.com/pkg/errors"
 )
 
@@ -286,6 +285,7 @@ func (s *Source) issueSchema() []idk.Field {
 		idk.RecordTimeField{NameVal: "created_at", Layout: time.RFC3339},
 	}
 }
+
 func (s *Source) Close() error {
 	return nil
 }
@@ -316,6 +316,8 @@ func (r EventRecord) Data() []interface{} {
 
 func (r EventRecord) Commit(ctx context.Context) error { return nil }
 
+func (r EventRecord) Schema() interface{} { return nil }
+
 type UserRecord Event
 
 func (r UserRecord) Data() []interface{} {
@@ -323,6 +325,8 @@ func (r UserRecord) Data() []interface{} {
 }
 
 func (r UserRecord) Commit(ctx context.Context) error { return nil }
+
+func (r UserRecord) Schema() interface{} { return nil }
 
 type RepoRecord Event
 
@@ -332,11 +336,15 @@ func (r RepoRecord) Data() []interface{} {
 
 func (r RepoRecord) Commit(ctx context.Context) error { return nil }
 
+func (r RepoRecord) Schema() interface{} { return nil }
+
 type IssueRecord Event
 
 func (r IssueRecord) Valid() bool {
 	return r.Type == "IssuesEvent" || r.Type == "IssueCommentEvent"
 }
+
+func (r IssueRecord) Schema() interface{} { return nil }
 
 func (r IssueRecord) Data() []interface{} {
 	var issue Issue
@@ -384,9 +392,9 @@ func (m *Main) openURLReader(t time.Time) (io.ReadCloser, error) {
 	}
 
 	// If cache enabled, write to file first and then return.
-	if buf, err := ioutil.ReadAll(resp.Body); err != nil {
+	if buf, err := io.ReadAll(resp.Body); err != nil {
 		return nil, err
-	} else if err := ioutil.WriteFile(cachePath+".tmp", buf, 0666); err != nil {
+	} else if err := os.WriteFile(cachePath+".tmp", buf, 0666); err != nil {
 		return nil, err
 	} else if err := os.Rename(cachePath+".tmp", cachePath); err != nil {
 		return nil, err

@@ -8,25 +8,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/hashicorp/go-retryablehttp"
+	fbcontext "github.com/featurebasedb/featurebase/v3/context"
+
 	"github.com/featurebasedb/featurebase/v3/authn"
+	"github.com/featurebasedb/featurebase/v3/dax"
 	"github.com/featurebasedb/featurebase/v3/disco"
-	"github.com/featurebasedb/featurebase/v3/ingest"
 	"github.com/featurebasedb/featurebase/v3/logger"
 	pnet "github.com/featurebasedb/featurebase/v3/net"
 	"github.com/featurebasedb/featurebase/v3/tracing"
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
 )
@@ -50,6 +50,12 @@ type InternalClient struct {
 
 	// secret Key for auth across nodes
 	secretKey string
+
+	// pathPrefix is prepended to every URL path. This is used, for example,
+	// when running a compute nodes as a sub-service of the featurebase command.
+	// In that case, a path might look like `localhost:8080/compute/schema`,
+	// where `/compute` is the pathPrefix.
+	pathPrefix string
 }
 
 // NewInternalClient returns a new instance of InternalClient to connect to host.
@@ -104,6 +110,7 @@ func WithClientRetryPeriod(period time.Duration) InternalClientOption {
 		rc.RetryWaitMin = min
 		rc.RetryMax = int(attempts)
 		rc.CheckRetry = retryWith400Policy
+		rc.Logger = logger.NopLogger
 		c.retryableClient = rc
 	}
 }
@@ -111,6 +118,13 @@ func WithClientRetryPeriod(period time.Duration) InternalClientOption {
 func WithClientLogger(log logger.Logger) InternalClientOption {
 	return func(c *InternalClient) {
 		c.log = log
+	}
+}
+
+// WithPathPrefix sets the http path prefix.
+func WithPathPrefix(prefix string) InternalClientOption {
+	return func(c *InternalClient) {
+		c.pathPrefix = prefix
 	}
 }
 
@@ -228,34 +242,43 @@ func NewInternalClientFromURI(defaultURI *pnet.URI, remoteClient *http.Client, o
 // same for refresh tokens as well.
 func AddAuthToken(ctx context.Context, header *http.Header) {
 	var access, refresh string
-	if token, ok := ctx.Value(authn.ContextValueAccessToken).(string); ok {
+	if token, ok := authn.GetAccessToken(ctx); ok {
 		// the AccessToken value should be prefixed with "Bearer"
 		access = token
 	}
-	if token, ok := ctx.Value(authn.ContextValueRefreshToken).(string); ok {
+	if token, ok := authn.GetRefreshToken(ctx); ok {
 		refresh = token
 	}
 
 	// not combining these ifs so we don't call ctx.Value unless we have to
 	if access == "" || refresh == "" {
-		if uinfo := ctx.Value("userinfo"); uinfo != nil {
+		if uinfo, _ := authn.GetUserInfo(ctx); uinfo != nil {
 			if access == "" {
 				// UserInfo.Token is not prefixed with "Bearer"
-				access = "Bearer " + uinfo.(*authn.UserInfo).Token
+				access = "Bearer " + uinfo.Token
 			}
 			if refresh == "" {
-				refresh = uinfo.(*authn.UserInfo).RefreshToken
+				refresh = uinfo.RefreshToken
 			}
 		}
 	}
 
 	// set ogIP to request for remote calls
-	if ogIP, ok := ctx.Value(OriginalIPHeader).(string); ok && ogIP != "" {
+	if ogIP, ok := fbcontext.OriginalIP(ctx); ok && ogIP != "" {
 		header.Set(OriginalIPHeader, ogIP)
 	}
 
 	header.Set("Authorization", access)
 	header.Set(authn.RefreshHeaderName, refresh)
+}
+
+// prefix is a helper function which allows us to provide a pathPrefix value as
+// "compute" instead of "/compute".
+func (c *InternalClient) prefix() string {
+	if c.pathPrefix == "" {
+		return ""
+	}
+	return "/" + c.pathPrefix
 }
 
 // MaxShardByIndex returns the number of shards on a server by index.
@@ -268,7 +291,8 @@ func (c *InternalClient) MaxShardByIndex(ctx context.Context) (map[string]uint64
 // maxShardByIndex returns the number of shards on a server by index.
 func (c *InternalClient) maxShardByIndex(ctx context.Context) (map[string]uint64, error) {
 	// Execute request against the host.
-	u := uriPathToURL(c.defaultURI, "/internal/shards/max")
+	path := fmt.Sprintf("%s/internal/shards/max", c.prefix())
+	u := uriPathToURL(c.defaultURI, path)
 
 	// Build request.
 	req, err := http.NewRequest("GET", u.String(), nil)
@@ -301,7 +325,8 @@ func (c *InternalClient) AvailableShards(ctx context.Context, indexName string) 
 	defer span.Finish()
 
 	// Execute request against the host.
-	u := uriPathToURL(c.defaultURI, path.Join("/internal/index", indexName, "/shards"))
+	path := fmt.Sprintf("%s/internal/index/%s/shards", c.prefix(), indexName)
+	u := uriPathToURL(c.defaultURI, path)
 
 	// Build request.
 	req, err := http.NewRequest("GET", u.String(), nil)
@@ -335,7 +360,7 @@ func (c *InternalClient) SchemaNode(ctx context.Context, uri *pnet.URI, views bo
 
 	// TODO: /?views parameter will be ignored, till we implement schemator!
 	// Execute request against the host.
-	u := uri.Path(fmt.Sprintf("/schema?views=%v", views))
+	u := uri.Path(fmt.Sprintf("%s/schema?views=%v", c.prefix(), views))
 
 	// Build request.
 	req, err := http.NewRequest("GET", u, nil)
@@ -367,7 +392,7 @@ func (c *InternalClient) Schema(ctx context.Context) ([]*IndexInfo, error) {
 	defer span.Finish()
 
 	// Execute request against the host.
-	u := c.defaultURI.Path("/schema")
+	u := c.defaultURI.Path(fmt.Sprintf("%s/schema", c.prefix()))
 
 	// Build request.
 	req, err := http.NewRequest("GET", u, nil)
@@ -393,124 +418,6 @@ func (c *InternalClient) Schema(ctx context.Context) ([]*IndexInfo, error) {
 	return rsp.Indexes, nil
 }
 
-// IngestSchema uses the new schema ingest endpoint. It returns a
-// map from index names to fields created within them; note that if the
-// entire index was created, the list of fields is empty. The intended
-// usage is cleaning up after creating the indexes, so if you create the
-// index, you don't need to delete the fields, but if you created fields
-// within an existing index, you should delete those fields but not the
-// whole index.
-func (c *InternalClient) IngestSchema(ctx context.Context, uri *pnet.URI, buf []byte) (created map[string][]string, err error) {
-	if uri == nil {
-		uri = c.defaultURI
-	}
-	u := uri.Path("/internal/schema")
-	req, err := http.NewRequest("POST", u, bytes.NewReader(buf))
-	if err != nil {
-		return nil, errors.Wrap(err, "creating request")
-	}
-
-	req.Header.Set("Content-Length", strconv.Itoa(len(buf)))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "pilosa/"+Version)
-	AddAuthToken(ctx, &req.Header)
-
-	resp, err := c.executeRequest(req.WithContext(ctx), giveRawResponse(true))
-	if err != nil {
-		return nil, errors.Wrap(err, "executing request")
-	}
-	defer resp.Body.Close()
-	buf, err = ioutil.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		if err != nil {
-			return nil, errors.Wrapf(err, "bad status '%s' and err reading body", resp.Status)
-		}
-		var msg string
-		// try to decode a JSON response
-		var sr successResponse
-		qr := &QueryResponse{}
-		if err = json.Unmarshal(buf, &sr); err == nil {
-			msg = sr.Error.Error()
-		} else if err := c.serializer.Unmarshal(buf, qr); err == nil {
-			msg = qr.Err.Error()
-		} else {
-			msg = string(buf)
-		}
-		return nil, errors.Errorf("against %s %s: '%s'", req.URL.String(), resp.Status, msg)
-	}
-	// this is the err from ioutil.ReadAll, but in the case where resp.StatusCode
-	// was 2xx, so we don't have a bad status.
-	if err != nil {
-		return nil, errors.Wrapf(err, "error reading response body")
-	}
-	if err = json.Unmarshal(buf, &created); err != nil {
-		return nil, errors.Wrapf(err, "error interpreting response body")
-	}
-	return created, nil
-}
-
-// IngestOperations uses the new ingest endpoint for ingest data
-func (c *InternalClient) IngestOperations(ctx context.Context, uri *pnet.URI, indexName string, buf []byte) error {
-	if uri == nil {
-		uri = c.defaultURI
-	}
-	u := uri.Path(fmt.Sprintf("/internal/ingest/%s", indexName))
-	req, err := http.NewRequest("POST", u, bytes.NewReader(buf))
-	if err != nil {
-		return errors.Wrap(err, "creating request")
-	}
-
-	req.Header.Set("Content-Length", strconv.Itoa(len(buf)))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "pilosa/"+Version)
-	AddAuthToken(ctx, &req.Header)
-
-	resp, err := c.executeRequest(req.WithContext(ctx))
-	if err != nil {
-		return errors.Wrap(err, "executing request")
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return errors.Errorf("unexpected status code: %s", resp.Status)
-	}
-	return nil
-}
-
-// IngestNodeOperations uses the internal/protobuf ingest endpoint for ingest data
-func (c *InternalClient) IngestNodeOperations(ctx context.Context, uri *pnet.URI, indexName string, ireq *ingest.ShardedRequest) error {
-	if uri == nil {
-		uri = c.defaultURI
-	}
-	u := uri.Path(fmt.Sprintf("/internal/ingest/%s/node", indexName))
-
-	buf, err := c.serializer.Marshal(ireq)
-	if err != nil {
-		return errors.Wrap(err, "marshalling")
-	}
-	req, err := http.NewRequest("POST", u, bytes.NewReader(buf))
-	if err != nil {
-		return errors.Wrap(err, "creating request")
-	}
-
-	req.Header.Set("Content-Length", strconv.Itoa(len(buf)))
-	req.Header.Set("Content-Type", "application/x-protobuf")
-	req.Header.Set("Accept", "application/x-protobuf")
-	req.Header.Set("User-Agent", "pilosa/"+Version)
-	AddAuthToken(ctx, &req.Header)
-
-	resp, err := c.executeRequest(req.WithContext(ctx))
-	if err != nil {
-		return errors.Wrap(err, "executing request")
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return errors.Errorf("unexpected status code: %s", resp.Status)
-	}
-	return nil
-}
-
 // MutexCheck uses the mutex-check endpoint to request mutex collision data
 // from a single node. It produces per-shard results, and does not translate
 // them.
@@ -520,7 +427,7 @@ func (c *InternalClient) MutexCheck(ctx context.Context, uri *pnet.URI, indexNam
 	}
 	// This is not actually a "Path", but reworking this to support queries
 	// is messier than I have resources to pursue just now.
-	u := uri.Path(fmt.Sprintf("/internal/index/%s/field/%s/mutex-check?details=%t&limit=%d", indexName, fieldName, details, limit))
+	u := uri.Path(fmt.Sprintf("%s/internal/index/%s/field/%s/mutex-check?details=%t&limit=%d", c.prefix(), indexName, fieldName, details, limit))
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request")
@@ -544,7 +451,7 @@ func (c *InternalClient) MutexCheck(ctx context.Context, uri *pnet.URI, indexNam
 }
 
 func (c *InternalClient) PostSchema(ctx context.Context, uri *pnet.URI, s *Schema, remote bool) error {
-	u := uri.Path(fmt.Sprintf("/schema?remote=%v", remote))
+	u := uri.Path(fmt.Sprintf("%s/schema?remote=%v", c.prefix(), remote))
 	buf, err := json.Marshal(s)
 	if err != nil {
 		return errors.Wrap(err, "marshalling schema")
@@ -596,7 +503,7 @@ func (c *InternalClient) CreateIndex(ctx context.Context, index string, opt Inde
 	}
 
 	// Create URL & HTTP request.
-	u := uriPathToURL(&coord.URI, fmt.Sprintf("/index/%s", index))
+	u := uriPathToURL(&coord.URI, fmt.Sprintf("%s/index/%s", c.prefix(), index))
 	req, err := http.NewRequest("POST", u.String(), bytes.NewReader(buf))
 	if err != nil {
 		return errors.Wrap(err, "creating request")
@@ -624,7 +531,7 @@ func (c *InternalClient) FragmentNodes(ctx context.Context, index string, shard 
 	defer span.Finish()
 
 	// Execute request against the host.
-	u := uriPathToURL(c.defaultURI, "/internal/fragment/nodes")
+	u := uriPathToURL(c.defaultURI, fmt.Sprintf("%s/internal/fragment/nodes", c.prefix()))
 	u.RawQuery = (url.Values{"index": {index}, "shard": {strconv.FormatUint(shard, 10)}}).Encode()
 
 	// Build request.
@@ -657,7 +564,7 @@ func (c *InternalClient) Nodes(ctx context.Context) ([]*disco.Node, error) {
 	defer span.Finish()
 
 	// Execute request against the host.
-	u := uriPathToURL(c.defaultURI, "/internal/nodes")
+	u := uriPathToURL(c.defaultURI, fmt.Sprintf("%s/internal/nodes", c.prefix()))
 
 	// Build request.
 	req, err := http.NewRequest("GET", u.String(), nil)
@@ -687,11 +594,12 @@ func (c *InternalClient) Nodes(ctx context.Context) ([]*disco.Node, error) {
 func (c *InternalClient) Query(ctx context.Context, index string, queryRequest *QueryRequest) (*QueryResponse, error) {
 	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.Query")
 	defer span.Finish()
-	return c.QueryNode(ctx, c.defaultURI, index, queryRequest)
+	addr := dax.Address(c.defaultURI.String())
+	return c.QueryNode(ctx, addr, index, queryRequest)
 }
 
 // QueryNode executes query against the index, sending the request to the node specified.
-func (c *InternalClient) QueryNode(ctx context.Context, uri *pnet.URI, index string, queryRequest *QueryRequest) (*QueryResponse, error) {
+func (c *InternalClient) QueryNode(ctx context.Context, addr dax.Address, index string, queryRequest *QueryRequest) (*QueryResponse, error) {
 	span, ctx := tracing.StartSpanFromContext(ctx, "QueryNode")
 	defer span.Finish()
 
@@ -706,7 +614,7 @@ func (c *InternalClient) QueryNode(ctx context.Context, uri *pnet.URI, index str
 	}
 
 	// Create HTTP request.
-	u := uri.Path(fmt.Sprintf("/index/%s/query", index))
+	u := fmt.Sprintf("%s/index/%s/query", addr.WithScheme("http"), index)
 	req, err := http.NewRequest("POST", u, bytes.NewReader(buf))
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request")
@@ -728,7 +636,7 @@ func (c *InternalClient) QueryNode(ctx context.Context, uri *pnet.URI, index str
 	defer resp.Body.Close()
 
 	// Read body and unmarshal response.
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "reading")
 	}
@@ -785,7 +693,7 @@ func (c *InternalClient) importNode(ctx context.Context, node *disco.Node, index
 	defer span.Finish()
 
 	// Create URL & HTTP request.
-	path := fmt.Sprintf("/index/%s/field/%s/import", index, field)
+	path := fmt.Sprintf("%s/index/%s/field/%s/import", c.prefix(), index, field)
 	u := nodePathToURL(node, path)
 
 	vals := url.Values{}
@@ -816,7 +724,7 @@ func (c *InternalClient) importNode(ctx context.Context, node *disco.Node, index
 	defer resp.Body.Close()
 
 	// Read body and unmarshal response.
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return errors.Wrap(err, "reading")
 	}
@@ -980,7 +888,6 @@ func (c *InternalClient) Import(ctx context.Context, qcx *Qcx, req *ImportReques
 func (c *InternalClient) ImportValue(ctx context.Context, qcx *Qcx, req *ImportValueRequest, options *ImportOptions) error {
 	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.Import")
 	defer span.Finish()
-
 	if req.ColumnKeys != nil {
 		req.Shard = ^uint64(0)
 	}
@@ -1010,7 +917,7 @@ func (c *InternalClient) ImportRoaring(ctx context.Context, uri *pnet.URI, index
 
 	vals := url.Values{}
 	vals.Set("remote", strconv.FormatBool(remote))
-	url := fmt.Sprintf("%s/index/%s/field/%s/import-roaring/%d?%s", uri, index, field, shard, vals.Encode())
+	url := fmt.Sprintf("%s%s/index/%s/field/%s/import-roaring/%d?%s", uri, c.prefix(), index, field, shard, vals.Encode())
 
 	// Marshal data to protobuf.
 	data, err := c.serializer.Marshal(req)
@@ -1018,35 +925,7 @@ func (c *InternalClient) ImportRoaring(ctx context.Context, uri *pnet.URI, index
 		return errors.Wrap(err, "marshal import request")
 	}
 
-	// Generate HTTP request.
-	httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	if err != nil {
-		return errors.Wrap(err, "creating request")
-	}
-	httpReq.Header.Set("Content-Type", "application/x-protobuf")
-	httpReq.Header.Set("Accept", "application/x-protobuf")
-	httpReq.Header.Set("X-Pilosa-Row", "roaring")
-	httpReq.Header.Set("User-Agent", "pilosa/"+Version)
-	AddAuthToken(ctx, &httpReq.Header)
-
-	// Execute request against the host.
-	resp, err := c.executeRequest(httpReq.WithContext(ctx))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	dec := json.NewDecoder(resp.Body)
-	rbody := &ImportResponse{}
-	err = dec.Decode(rbody)
-	// Decode can return EOF when no error occurred. helpful!
-	if err != nil && err != io.EOF {
-		return errors.Wrap(err, "decoding response body")
-	}
-	if rbody.Err != "" {
-		return errors.Wrap(errors.New(rbody.Err), "importing roaring")
-	}
-	return nil
+	return c.executeProtobufRequest(ctx, url, data)
 }
 
 // ExportCSV bulk exports data for a single shard from a host to CSV format.
@@ -1088,7 +967,7 @@ func (c *InternalClient) exportNodeCSV(ctx context.Context, node *disco.Node, in
 	defer span.Finish()
 
 	// Create URL.
-	u := nodePathToURL(node, "/export")
+	u := nodePathToURL(node, fmt.Sprintf("%s/export", c.prefix()))
 	u.RawQuery = url.Values{
 		"index": {index},
 		"field": {field},
@@ -1130,7 +1009,7 @@ func (c *InternalClient) RetrieveShardFromURI(ctx context.Context, index, field,
 		URI: uri,
 	}
 
-	u := nodePathToURL(node, "/internal/fragment/data")
+	u := nodePathToURL(node, fmt.Sprintf("%s/internal/fragment/data", c.prefix()))
 	u.RawQuery = url.Values{
 		"index": {index},
 		"field": {field},
@@ -1228,7 +1107,7 @@ func (c *InternalClient) CreateFieldWithOptions(ctx context.Context, index, fiel
 	}
 
 	// Create URL & HTTP request.
-	u := uriPathToURL(&coord.URI, fmt.Sprintf("/index/%s/field/%s", index, field))
+	u := uriPathToURL(&coord.URI, fmt.Sprintf("%s/index/%s/field/%s", c.prefix(), index, field))
 	req, err := http.NewRequest("POST", u.String(), bytes.NewReader(buf))
 	if err != nil {
 		return errors.Wrap(err, "creating request")
@@ -1251,108 +1130,12 @@ func (c *InternalClient) CreateFieldWithOptions(ctx context.Context, index, fiel
 	return errors.Wrap(resp.Body.Close(), "closing response body")
 }
 
-// FragmentBlocks returns a list of block checksums for a fragment on a host.
-// Only returns blocks which contain data.
-func (c *InternalClient) FragmentBlocks(ctx context.Context, uri *pnet.URI, index, field, view string, shard uint64) ([]FragmentBlock, error) {
-	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.FragmentBlocks")
-	defer span.Finish()
-
-	if uri == nil {
-		uri = c.defaultURI
-	}
-	u := uriPathToURL(uri, "/internal/fragment/blocks")
-	u.RawQuery = url.Values{
-		"index": {index},
-		"field": {field},
-		"view":  {view},
-		"shard": {strconv.FormatUint(shard, 10)},
-	}.Encode()
-
-	// Build request.
-	req, err := http.NewRequest("GET", u.String(), nil)
-	if err != nil {
-		return nil, errors.Wrap(err, "creating request")
-	}
-
-	req.Header.Set("User-Agent", "pilosa/"+Version)
-	req.Header.Set("Accept", "application/json")
-	AddAuthToken(ctx, &req.Header)
-
-	// Execute request.
-	resp, err := c.executeRequest(req.WithContext(ctx))
-	if err != nil {
-		// Return the appropriate error.
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			return nil, ErrFragmentNotFound
-		}
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	// Decode response object.
-	var rsp getFragmentBlocksResponse
-	if err := json.NewDecoder(resp.Body).Decode(&rsp); err != nil {
-		return nil, errors.Wrap(err, "decoding")
-	}
-	return rsp.Blocks, nil
-}
-
-// BlockData returns row/column id pairs for a block.
-func (c *InternalClient) BlockData(ctx context.Context, uri *pnet.URI, index, field, view string, shard uint64, block int) ([]uint64, []uint64, error) {
-	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.BlockData")
-	defer span.Finish()
-
-	if uri == nil {
-		panic("need to pass a URI to BlockData")
-	}
-	buf, err := c.serializer.Marshal(&BlockDataRequest{
-		Index: index,
-		Field: field,
-		View:  view,
-		Shard: shard,
-		Block: uint64(block),
-	})
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "marshaling")
-	}
-
-	u := uriPathToURL(uri, "/internal/fragment/block/data")
-	req, err := http.NewRequest("GET", u.String(), bytes.NewReader(buf))
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "creating request")
-	}
-	req.Header.Set("Content-Type", "application/protobuf")
-	req.Header.Set("Content-Length", strconv.Itoa(len(buf)))
-	req.Header.Set("Accept", "application/protobuf")
-	req.Header.Set("X-Pilosa-Row", "roaring")
-	req.Header.Set("User-Agent", "pilosa/"+Version)
-	AddAuthToken(ctx, &req.Header)
-
-	resp, err := c.executeRequest(req.WithContext(ctx))
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			return nil, nil, nil
-		}
-		return nil, nil, err
-	}
-	defer resp.Body.Close()
-
-	// Decode response object.
-	var rsp BlockDataResponse
-	if body, err := ioutil.ReadAll(resp.Body); err != nil {
-		return nil, nil, errors.Wrap(err, "reading")
-	} else if err := c.serializer.Unmarshal(body, &rsp); err != nil {
-		return nil, nil, errors.Wrap(err, "unmarshalling")
-	}
-	return rsp.RowIDs, rsp.ColumnIDs, nil
-}
-
 // SendMessage posts a message synchronously.
 func (c *InternalClient) SendMessage(ctx context.Context, uri *pnet.URI, msg []byte) error {
 	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.SendMessage")
 	defer span.Finish()
 
-	u := uriPathToURL(uri, "/internal/cluster/message")
+	u := uriPathToURL(uri, fmt.Sprintf("%s/internal/cluster/message", c.prefix()))
 	req, err := http.NewRequest("POST", u.String(), bytes.NewReader(msg))
 	if err != nil {
 		return errors.Wrap(err, "making new request")
@@ -1372,7 +1155,7 @@ func (c *InternalClient) SendMessage(ctx context.Context, uri *pnet.URI, msg []b
 		return errors.Wrap(err, "executing request")
 	}
 	defer resp.Body.Close()
-	_, err = io.Copy(ioutil.Discard, resp.Body)
+	_, err = io.Copy(io.Discard, resp.Body)
 	return errors.Wrap(err, "draining SendMessage response body")
 }
 
@@ -1397,7 +1180,7 @@ func (c *InternalClient) TranslateKeysNode(ctx context.Context, uri *pnet.URI, i
 	}
 
 	// Create HTTP request.
-	u := uri.Path("/internal/translate/keys")
+	u := uri.Path(fmt.Sprintf("%s/internal/translate/keys", c.prefix()))
 	req, err := http.NewRequest("POST", u, bytes.NewReader(buf))
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request")
@@ -1421,7 +1204,7 @@ func (c *InternalClient) TranslateKeysNode(ctx context.Context, uri *pnet.URI, i
 	defer resp.Body.Close()
 
 	// Read body and unmarshal response.
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "reading")
 	}
@@ -1452,7 +1235,7 @@ func (c *InternalClient) TranslateIDsNode(ctx context.Context, uri *pnet.URI, in
 	}
 
 	// Create HTTP request.
-	u := uri.Path("/internal/translate/ids")
+	u := uri.Path(fmt.Sprintf("%s/internal/translate/ids", c.prefix()))
 	req, err := http.NewRequest("POST", u, bytes.NewReader(buf))
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request")
@@ -1473,7 +1256,7 @@ func (c *InternalClient) TranslateIDsNode(ctx context.Context, uri *pnet.URI, in
 	defer resp.Body.Close()
 
 	// Read body and unmarshal response.
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "reading")
 	}
@@ -1487,7 +1270,7 @@ func (c *InternalClient) TranslateIDsNode(ctx context.Context, uri *pnet.URI, in
 
 // GetPastQueries retrieves the query history log for the specified node.
 func (c *InternalClient) GetPastQueries(ctx context.Context, uri *pnet.URI) ([]PastQueryStatus, error) {
-	u := uri.Path("/query-history?remote=true")
+	u := uri.Path(fmt.Sprintf("%s/query-history?remote=true", c.prefix()))
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request")
@@ -1505,7 +1288,7 @@ func (c *InternalClient) GetPastQueries(ctx context.Context, uri *pnet.URI) ([]P
 	defer resp.Body.Close()
 
 	// Read body and unmarshal response.
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "reading")
 	}
@@ -1522,7 +1305,7 @@ func (c *InternalClient) FindIndexKeysNode(ctx context.Context, uri *pnet.URI, i
 	defer span.Finish()
 
 	// Create HTTP request.
-	u := uriPathToURL(uri, fmt.Sprintf("/internal/translate/index/%s/keys/find", index))
+	u := uriPathToURL(uri, fmt.Sprintf("%s/internal/translate/index/%s/keys/find", c.prefix(), index))
 	reqData, err := json.Marshal(keys)
 	if err != nil {
 		return nil, errors.Wrap(err, "marshalling request")
@@ -1552,7 +1335,7 @@ func (c *InternalClient) FindIndexKeysNode(ctx context.Context, uri *pnet.URI, i
 	}()
 
 	// Read the response body.
-	result, err := ioutil.ReadAll(resp.Body)
+	result, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "reading response")
 	}
@@ -1572,7 +1355,7 @@ func (c *InternalClient) FindFieldKeysNode(ctx context.Context, uri *pnet.URI, i
 	defer span.Finish()
 
 	// Create HTTP request.
-	u := uriPathToURL(uri, fmt.Sprintf("/internal/translate/field/%s/%s/keys/find", index, field))
+	u := uriPathToURL(uri, fmt.Sprintf("%s/internal/translate/field/%s/%s/keys/find", c.prefix(), index, field))
 	q := u.Query()
 	q.Add("remote", "true")
 	u.RawQuery = q.Encode()
@@ -1601,7 +1384,7 @@ func (c *InternalClient) FindFieldKeysNode(ctx context.Context, uri *pnet.URI, i
 	}()
 
 	// Read the response body.
-	result, err := ioutil.ReadAll(resp.Body)
+	result, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "reading response")
 	}
@@ -1621,7 +1404,7 @@ func (c *InternalClient) CreateIndexKeysNode(ctx context.Context, uri *pnet.URI,
 	defer span.Finish()
 
 	// Create HTTP request.
-	u := uriPathToURL(uri, fmt.Sprintf("/internal/translate/index/%s/keys/create", index))
+	u := uriPathToURL(uri, fmt.Sprintf("%s/internal/translate/index/%s/keys/create", c.prefix(), index))
 	reqData, err := json.Marshal(keys)
 	if err != nil {
 		return nil, errors.Wrap(err, "marshalling request")
@@ -1651,7 +1434,7 @@ func (c *InternalClient) CreateIndexKeysNode(ctx context.Context, uri *pnet.URI,
 	}()
 
 	// Read the response body.
-	result, err := ioutil.ReadAll(resp.Body)
+	result, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "reading response")
 	}
@@ -1671,7 +1454,7 @@ func (c *InternalClient) CreateFieldKeysNode(ctx context.Context, uri *pnet.URI,
 	defer span.Finish()
 
 	// Create HTTP request.
-	u := uriPathToURL(uri, fmt.Sprintf("/internal/translate/field/%s/%s/keys/create", index, field))
+	u := uriPathToURL(uri, fmt.Sprintf("%s/internal/translate/field/%s/%s/keys/create", c.prefix(), index, field))
 	q := u.Query()
 	q.Add("remote", "true")
 	u.RawQuery = q.Encode()
@@ -1704,7 +1487,7 @@ func (c *InternalClient) CreateFieldKeysNode(ctx context.Context, uri *pnet.URI,
 	}()
 
 	// Read the response body.
-	result, err := ioutil.ReadAll(resp.Body)
+	result, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "reading response")
 	}
@@ -1724,7 +1507,7 @@ func (c *InternalClient) MatchFieldKeysNode(ctx context.Context, uri *pnet.URI, 
 	defer span.Finish()
 
 	// Create HTTP request.
-	u := uriPathToURL(uri, fmt.Sprintf("/internal/translate/field/%s/%s/keys/like", index, field))
+	u := uriPathToURL(uri, fmt.Sprintf("%s/internal/translate/field/%s/%s/keys/like", c.prefix(), index, field))
 	req, err := http.NewRequest("POST", u.String(), strings.NewReader(like))
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request")
@@ -1749,7 +1532,7 @@ func (c *InternalClient) MatchFieldKeysNode(ctx context.Context, uri *pnet.URI, 
 	}()
 
 	// Read the response body.
-	result, err := ioutil.ReadAll(resp.Body)
+	result, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "reading response")
 	}
@@ -1767,7 +1550,7 @@ func (c *InternalClient) Transactions(ctx context.Context) (map[string]*Transact
 	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.Transactions")
 	defer span.Finish()
 
-	u := uriPathToURL(c.defaultURI, "/transactions")
+	u := uriPathToURL(c.defaultURI, fmt.Sprintf("%s/transactions", c.prefix()))
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating transactions request")
@@ -1781,7 +1564,7 @@ func (c *InternalClient) Transactions(ctx context.Context) (map[string]*Transact
 		return nil, errors.Wrap(err, "executing request")
 	}
 	defer func() {
-		_, _ = io.Copy(ioutil.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 	trnsMap := make(map[string]*Transaction)
@@ -1804,7 +1587,7 @@ func (c *InternalClient) StartTransaction(ctx context.Context, id string, timeou
 	// tests, and we want to test requests against all hosts. A robust
 	// client implementation would ensure that these requests go to
 	// the primary.
-	u := uriPathToURL(c.defaultURI, "/transaction/"+id)
+	u := uriPathToURL(c.defaultURI, fmt.Sprintf("%s/transaction/%s", c.prefix(), id))
 	req, err := http.NewRequest("POST", u.String(), bytes.NewReader(buf))
 	if err != nil {
 		return nil, errors.Wrap(err, "creating post transaction request")
@@ -1820,7 +1603,7 @@ func (c *InternalClient) StartTransaction(ctx context.Context, id string, timeou
 		return nil, errors.Wrap(err, "executing request")
 	}
 	defer func() {
-		_, _ = io.Copy(ioutil.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 	tr := &TransactionResponse{}
@@ -1840,7 +1623,7 @@ func (c *InternalClient) FinishTransaction(ctx context.Context, id string) (*Tra
 	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.FinishTransaction")
 	defer span.Finish()
 
-	u := uriPathToURL(c.defaultURI, "/transaction/"+id+"/finish")
+	u := uriPathToURL(c.defaultURI, fmt.Sprintf("%s/transaction/%s/finish", c.prefix(), id))
 	req, err := http.NewRequest("POST", u.String(), nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating finish transaction request")
@@ -1855,7 +1638,7 @@ func (c *InternalClient) FinishTransaction(ctx context.Context, id string) (*Tra
 		return nil, errors.Wrap(err, "executing request")
 	}
 	defer func() {
-		_, _ = io.Copy(ioutil.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 	tr := &TransactionResponse{}
@@ -1878,7 +1661,7 @@ func (c *InternalClient) GetTransaction(ctx context.Context, id string) (*Transa
 	// tests, and we want to test requests against all hosts. A robust
 	// client implementation would ensure that these requests go to
 	// the primary.
-	u := uriPathToURL(c.defaultURI, "/transaction/"+id)
+	u := uriPathToURL(c.defaultURI, fmt.Sprintf("%s/transaction/%s", c.prefix(), id))
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating get transaction request")
@@ -1892,7 +1675,7 @@ func (c *InternalClient) GetTransaction(ctx context.Context, id string) (*Transa
 		return nil, errors.Wrap(err, "executing request")
 	}
 	defer func() {
-		_, _ = io.Copy(ioutil.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 	tr := &TransactionResponse{}
@@ -1905,6 +1688,27 @@ func (c *InternalClient) GetTransaction(ctx context.Context, id string) (*Transa
 		err = errors.New(tr.Error)
 	}
 	return tr.Transaction, err
+}
+
+func (c *InternalClient) GetDataframeShard(ctx context.Context, index string, shard uint64) (*http.Response, error) {
+	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.GetDataframeShard")
+	defer span.Finish()
+
+	// Execute request against the host.
+	path := fmt.Sprintf("/index/%v/dataframe/%04d", index, shard)
+	// Build request.
+	url := uriPathToURL(c.defaultURI, path)
+	req, err := http.NewRequest("GET", url.String(), nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "creating request")
+	}
+
+	req.Header.Set("User-Agent", "pilosa/"+Version)
+	req.Header.Set("Accept", "application/octet-stream")
+	AddAuthToken(ctx, &req.Header)
+
+	// Execute request.
+	return c.executeRequest(req.WithContext(ctx), giveRawResponse(true))
 }
 
 type executeOpts struct {
@@ -1922,6 +1726,7 @@ func giveRawResponse(b bool) executeRequestOption {
 		eo.giveRawResponse = b
 	}
 }
+
 func forwardAuthHeader(b bool) executeRequestOption {
 	return func(eo *executeOpts) {
 		eo.forwardAuthHeader = b
@@ -1994,7 +1799,7 @@ func (c *InternalClient) handleResponse(req *http.Request, eo *executeOpts, resp
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
-		buf, err := ioutil.ReadAll(resp.Body)
+		buf, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return resp, errors.Wrapf(err, "bad status '%s' and err reading body", resp.Status)
 		}
@@ -2250,7 +2055,7 @@ func (c *InternalClient) RetrieveTranslatePartitionFromURI(ctx context.Context, 
 		URI: uri,
 	}
 
-	u := nodePathToURL(node, "/internal/translate/data")
+	u := nodePathToURL(node, fmt.Sprintf("%s/internal/translate/data", c.prefix()))
 	u.RawQuery = url.Values{
 		"index":     {index},
 		"partition": {strconv.FormatInt(int64(partition), 10)},
@@ -2276,6 +2081,7 @@ func (c *InternalClient) RetrieveTranslatePartitionFromURI(ctx context.Context, 
 
 	return resp.Body, nil
 }
+
 func (c *InternalClient) ImportIndexKeys(ctx context.Context, uri *pnet.URI, index string, partitionID int, remote bool, readerFunc func() (io.Reader, error)) error {
 	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.ImportIndexKeys")
 	defer span.Finish()
@@ -2290,7 +2096,7 @@ func (c *InternalClient) ImportIndexKeys(ctx context.Context, uri *pnet.URI, ind
 
 	vals := url.Values{}
 	vals.Set("remote", strconv.FormatBool(remote))
-	url := fmt.Sprintf("%s/internal/translate/index/%s/%d", uri, index, partitionID)
+	url := fmt.Sprintf("%s%s/internal/translate/index/%s/%d", uri, c.prefix(), index, partitionID)
 
 	// Generate HTTP request.
 	httpReq, err := retryablehttp.NewRequest("POST", url, readerFunc)
@@ -2324,7 +2130,7 @@ func (c *InternalClient) ImportFieldKeys(ctx context.Context, uri *pnet.URI, ind
 
 	vals := url.Values{}
 	vals.Set("remote", strconv.FormatBool(remote))
-	url := fmt.Sprintf("%s/internal/translate/field/%s/%s", uri, index, field)
+	url := fmt.Sprintf("%s%s/internal/translate/field/%s/%s", uri, c.prefix(), index, field)
 
 	// Generate HTTP request.
 	httpReq, err := retryablehttp.NewRequest("POST", url, readerFunc)
@@ -2350,7 +2156,7 @@ func (c *InternalClient) ShardReader(ctx context.Context, index string, shard ui
 	defer span.Finish()
 
 	// Execute request against the host.
-	u := fmt.Sprintf("%s/internal/index/%s/shard/%d/snapshot", c.defaultURI, index, shard)
+	u := fmt.Sprintf("%s%s/internal/index/%s/shard/%d/snapshot", c.defaultURI, c.prefix(), index, shard)
 
 	// Build request.
 	req, err := http.NewRequest("GET", u, nil)
@@ -2376,7 +2182,8 @@ func (c *InternalClient) IDAllocDataReader(ctx context.Context) (io.ReadCloser, 
 	defer span.Finish()
 
 	// Build request.
-	req, err := http.NewRequest("GET", c.defaultURI.String()+"/internal/idalloc/data", nil)
+	uri := fmt.Sprintf("%s%s/internal/idalloc/data", c.defaultURI, c.prefix())
+	req, err := http.NewRequest("GET", uri, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request")
 	}
@@ -2397,7 +2204,7 @@ func (c *InternalClient) IDAllocDataWriter(ctx context.Context, f io.Reader, pri
 	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.IDAllocDataWriter")
 	defer span.Finish()
 
-	u := primary.URI.Path("/internal/idalloc/restore")
+	u := primary.URI.Path(fmt.Sprintf("%s/internal/idalloc/restore", c.prefix()))
 
 	// Build request.
 	req, err := http.NewRequest("POST", u, f)
@@ -2424,7 +2231,7 @@ func (c *InternalClient) IndexTranslateDataReader(ctx context.Context, index str
 	defer span.Finish()
 
 	// Execute request against the host.
-	u := fmt.Sprintf("%s/internal/translate/data?index=%s&partition=%d", c.defaultURI, url.QueryEscape(index), partitionID)
+	u := fmt.Sprintf("%s%s/internal/translate/data?index=%s&partition=%d", c.defaultURI, c.prefix(), url.QueryEscape(index), partitionID)
 
 	// Build request.
 	req, err := http.NewRequest("GET", u, nil)
@@ -2452,9 +2259,17 @@ func (c *InternalClient) IndexTranslateDataReader(ctx context.Context, index str
 func (c *InternalClient) FieldTranslateDataReader(ctx context.Context, index, field string) (io.ReadCloser, error) {
 	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.FieldTranslateDataReader")
 	defer span.Finish()
+	nodes, err := c.Nodes(ctx)
+	if err != nil {
+		return nil, err
+	}
 
+	primary := getPrimaryNode(nodes)
+	if primary == nil {
+		return nil, errors.New("no primary")
+	}
 	// Execute request against the host.
-	u := fmt.Sprintf("%s/internal/translate/data?index=%s&field=%s", c.defaultURI, url.QueryEscape(index), url.QueryEscape(field))
+	u := fmt.Sprintf("%s%s/internal/translate/data?index=%s&field=%s", primary.URI, c.prefix(), url.QueryEscape(index), url.QueryEscape(field))
 
 	// Build request.
 	req, err := http.NewRequest("GET", u, nil)
@@ -2483,7 +2298,7 @@ func (c *InternalClient) Status(ctx context.Context) (string, error) {
 	defer span.Finish()
 
 	// Execute request against the host.
-	u := c.defaultURI.Path("/status")
+	u := c.defaultURI.Path(fmt.Sprintf("%s/status", c.prefix()))
 
 	// Build request.
 	req, err := http.NewRequest("GET", u, nil)
@@ -2514,7 +2329,7 @@ func (c *InternalClient) PartitionNodes(ctx context.Context, partitionID int) ([
 	defer span.Finish()
 
 	// Execute request against the host.
-	u := uriPathToURL(c.defaultURI, "/internal/partition/nodes")
+	u := uriPathToURL(c.defaultURI, fmt.Sprintf("%s/internal/partition/nodes", c.prefix()))
 	u.RawQuery = (url.Values{"partition": {strconv.FormatInt(int64(partitionID), 10)}}).Encode()
 
 	// Build request.
@@ -2546,7 +2361,7 @@ func (c *InternalClient) SetInternalAPI(api *API) {
 }
 
 func (c *InternalClient) OAuthConfig() (rsp oauth2.Config, err error) {
-	u := uriPathToURL(c.defaultURI, "/internal/oauth-config")
+	u := uriPathToURL(c.defaultURI, fmt.Sprintf("%s/internal/oauth-config", c.prefix()))
 
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
@@ -2622,4 +2437,59 @@ func (c *InternalClient) getDiskUsage(ctx context.Context, index string) (DiskUs
 	}
 
 	return sum, nil
+}
+
+func (c *InternalClient) executeProtobufRequest(ctx context.Context, url string, data []byte) error {
+	httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
+	if err != nil {
+		return errors.Wrap(err, "creating request")
+	}
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	httpReq.Header.Set("Accept", "application/x-protobuf")
+	httpReq.Header.Set("X-Pilosa-Row", "roaring")
+	httpReq.Header.Set("User-Agent", "pilosa/"+Version)
+	AddAuthToken(ctx, &httpReq.Header)
+
+	// Execute request against the host.
+	resp, err := c.executeRequest(httpReq.WithContext(ctx))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	dec := json.NewDecoder(resp.Body)
+	rbody := &ImportResponse{}
+	err = dec.Decode(rbody)
+	// Decode can return EOF when no error occurred. helpful!
+	if err != nil && err != io.EOF {
+		return errors.Wrap(err, "decoding response body")
+	}
+	if rbody.Err != "" {
+		return errors.Wrap(errors.New(rbody.Err), "importing roaring")
+	}
+	return nil
+}
+
+// ImportRoaringShard(ctx, node, string(tid), shard, request
+func (c *InternalClient) ImportRoaringShard(ctx context.Context, uri *pnet.URI, index string, shard uint64, remote bool, req *ImportRoaringShardRequest) error {
+	span, ctx := tracing.StartSpanFromContext(ctx, "InternalClient.ImportRoaringShard")
+	defer span.Finish()
+
+	if index == "" {
+		return ErrIndexRequired
+	}
+	if uri == nil {
+		uri = c.defaultURI
+	}
+
+	vals := url.Values{}
+	vals.Set("remote", strconv.FormatBool(remote))
+	url := fmt.Sprintf("%s%s/index/%s/shard/%d/import-roaring?%s", uri, c.prefix(), index, shard, vals.Encode())
+
+	// Marshal data to protobuf.
+	data, err := c.serializer.Marshal(req)
+	if err != nil {
+		return errors.Wrap(err, "marshal import roaring shard request")
+	}
+	return c.executeProtobufRequest(ctx, url, data)
 }

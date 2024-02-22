@@ -1,12 +1,14 @@
-// Copyright 2022 Molecula Corp. (DBA FeatureBase).
-// SPDX-License-Identifier: Apache-2.0
+// Copyright 2021 Molecula Corp. All rights reserved.
 package pilosa
 
 import (
 	"encoding/json"
+	"fmt"
+	"math/bits"
+	"reflect"
 	"time"
 
-	"github.com/featurebasedb/featurebase/v3/ingest"
+	"github.com/featurebasedb/featurebase/v3/shardwidth"
 	"github.com/featurebasedb/featurebase/v3/tracing"
 	"github.com/pkg/errors"
 )
@@ -75,6 +77,28 @@ func (resp *QueryResponse) MarshalJSON() ([]byte, error) {
 		Results: resp.Results,
 		Profile: resp.Profile,
 	})
+}
+
+// SameAs compares one QueryResponse to another and returns nil if the Results
+// and Err are both identical, or a descriptive error if they differ.
+// This function replaces using reflect.DeepEqual directly on the
+// QueryResponse, since QueryResponse contains an error field and reflect.DeepEqual
+// should not be used on errors.
+func (qr *QueryResponse) SameAs(other *QueryResponse) error {
+	switch {
+	case !reflect.DeepEqual(qr.Results, other.Results):
+		return fmt.Errorf("responses contained different results")
+	case qr.Err == nil && other.Err == nil:
+		return nil
+	case qr.Err == nil && other.Err != nil:
+		return fmt.Errorf("unexpected error: %w", other.Err)
+	case qr.Err != nil && other.Err == nil:
+		return fmt.Errorf("missing error: expected %v, got no error", qr.Err)
+	case qr.Err.Error() != other.Err.Error():
+		return fmt.Errorf("wrong error: expected %v, got %w", qr.Err, other.Err)
+	default:
+		return nil
+	}
 }
 
 // HandlerI is the interface for the data handler, a wrapper around
@@ -157,7 +181,6 @@ func (ivr *ImportValueRequest) Clone() *ImportValueRequest {
 // The top level Shard has to agree with Ivr[i].Shard and the Iv[i].Shard
 // for all i included (in Ivr and Ir). The same goes for the top level Index: all records
 // have to be writes to the same Index. These requirements are checked.
-//
 type AtomicRecord struct {
 	Index string
 	Shard uint64
@@ -300,26 +323,106 @@ func (ir *ImportRequest) Clone() *ImportRequest {
 // requests. We don't sort the entries within each shard because the correct
 // sorting depends on the field type and we don't want to deal with that
 // here.
-func (ir *ImportRequest) SortToShards() map[uint64]*ImportRequest {
-	// cheat: use ingest
-	fo := ingest.FieldOperation{
-		RecordIDs: ir.ColumnIDs,
-		Values:    ir.RowIDs,
-		Signed:    ir.Timestamps,
+func (ir *ImportRequest) SortToShards() (result map[uint64]*ImportRequest) {
+	if len(ir.ColumnIDs) == 0 {
+		return nil
 	}
-	sharded := fo.SortToShards()
-	output := make(map[uint64]*ImportRequest, len(sharded))
-	for shard, shardOp := range sharded {
-		shardReq := *ir
-		shardReq.ColumnKeys = nil
-		shardReq.RowKeys = nil
-		shardReq.Shard = shard
-		shardReq.ColumnIDs = shardOp.RecordIDs
-		shardReq.RowIDs = shardOp.Values
-		shardReq.Timestamps = shardOp.Signed
-		output[shard] = &shardReq
+	diffMask := uint64(0)
+	prev := ir.ColumnIDs[0]
+	for _, r := range ir.ColumnIDs[1:] {
+		diffMask |= r ^ prev
+		prev = r
 	}
+	bitsRemaining := bits.Len64(diffMask)
+	if bitsRemaining <= shardwidth.Exponent {
+		shard := ir.ColumnIDs[0] >> shardwidth.Exponent
+		ir.Shard = shard
+		ir.ColumnKeys = nil
+		ir.RowKeys = nil
+		return map[uint64]*ImportRequest{shard: ir}
+	}
+	output := make(map[uint64]*ImportRequest)
+	sortToShardsInto(ir, bitsRemaining-8, output)
 	return output
+}
+
+// sortToShardsInto puts the shards it finds into the given map, so that
+// as we split off buckets, they can be inserted into the same map.
+func sortToShardsInto(ir *ImportRequest, shift int, into map[uint64]*ImportRequest) {
+	if shift < shardwidth.Exponent {
+		shift = shardwidth.Exponent
+	}
+	nextShift := shift - 8
+	if nextShift < shardwidth.Exponent {
+		nextShift = shardwidth.Exponent
+	}
+	// count things that belong in each of the 256 buckets
+	var buckets [256]int
+	var starts [256]int
+
+	// compute the buckets ourselves
+	for _, r := range ir.ColumnIDs {
+		b := (r >> shift) & 0xFF
+		buckets[b]++
+	}
+	total := 0
+	// compute starting points of each bucket, converting the
+	// bucket counts into ends
+	for i := range buckets {
+		starts[i] = total
+		total += buckets[i]
+		buckets[i] = total
+	}
+	// starts[n] is the index of the first thing that should
+	// go in that bucket, buckets[n] is the index of the first
+	// thing that shouldn't
+	var bucketOp ImportRequest = *ir
+	bucketOp.ColumnKeys = nil
+	bucketOp.RowKeys = nil
+	origStarts := make([]int, len(starts))
+	copy(origStarts, starts[:])
+	for bucket, start := range origStarts {
+		end := buckets[bucket]
+		if end <= start {
+			continue
+		}
+		for j := start; j < end; j++ {
+			want := int((ir.ColumnIDs[j] >> shift) & 0xFF)
+			for want != bucket {
+				// move this to the beginning of the
+				// bucket it wants to be in, swapping
+				// the thing there here
+				dst := starts[want]
+				ir.ColumnIDs[j], ir.ColumnIDs[dst] = ir.ColumnIDs[dst], ir.ColumnIDs[j]
+				if ir.RowIDs != nil {
+					ir.RowIDs[j], ir.RowIDs[dst] = ir.RowIDs[dst], ir.RowIDs[j]
+				}
+				if ir.Timestamps != nil {
+					ir.Timestamps[j], ir.Timestamps[dst] = ir.Timestamps[dst], ir.Timestamps[j]
+				}
+				starts[want]++
+				want = int((ir.ColumnIDs[j] >> shift) & 0xFF)
+			}
+		}
+		// If shift == shardwidth.Exponent, then this is a completed
+		// shard and can go into the sharded output. otherwise, we
+		// can subdivide it.
+		bucketOp.ColumnIDs = ir.ColumnIDs[start:end]
+		if ir.RowIDs != nil {
+			bucketOp.RowIDs = ir.RowIDs[start:end]
+		}
+		if ir.Timestamps != nil {
+			bucketOp.Timestamps = ir.Timestamps[start:end]
+		}
+		if shift == shardwidth.Exponent {
+			x := bucketOp
+			shard := ir.ColumnIDs[start] >> shardwidth.Exponent
+			x.Shard = shard
+			into[shard] = &x
+		} else {
+			sortToShardsInto(&bucketOp, nextShift, into)
+		}
+	}
 }
 
 // ValidateWithTimestamp ensures that the payload of the request is valid.
@@ -348,6 +451,7 @@ type ImportRoaringRequest struct {
 	Block           int
 	Views           map[string][]byte
 	UpdateExistence bool
+	SuppressLog     bool
 }
 
 // ImportRoaringShardRequest is the request for the shard
@@ -359,6 +463,11 @@ type ImportRoaringShardRequest struct {
 	// a successful response to the client.
 	Remote bool
 	Views  []RoaringUpdate
+
+	// SuppressLog requests we not write to the write log. Typically
+	// that would be because this request is being replayed from a
+	// write log.
+	SuppressLog bool
 }
 
 // RoaringUpdate represents the bits to clear and then set in a particular view.

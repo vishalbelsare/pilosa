@@ -5,7 +5,6 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"os"
@@ -31,7 +30,7 @@ type Custom struct {
 // NewCustom returns a new instance of Custom.
 func NewCustom(cfg SourceGeneratorConfig) Sourcer {
 	conf := &CustomConfig{}
-	if bytes, err := ioutil.ReadFile(cfg.CustomConfig); err != nil {
+	if bytes, err := os.ReadFile(cfg.CustomConfig); err != nil {
 		return &Custom{err: errors.Wrap(err, "reading custom config file")}
 	} else if err = yaml.Unmarshal(bytes, conf); err != nil {
 		return &Custom{err: errors.Wrap(err, "unmarshaling custom config file")}
@@ -45,7 +44,6 @@ func NewCustom(cfg SourceGeneratorConfig) Sourcer {
 			IDKAndGenFields: ig,
 		}
 	}
-
 }
 
 // CustomConfig represents the JSON/yaml configuration for the "custom" datagen source.
@@ -132,8 +130,8 @@ func (g *GenField) DefaultIDKField() (idk.Field, error) {
 	case "uint":
 		return idk.IDField{NameVal: g.Name}, nil
 	case "int":
-		var min int64 = g.Min
-		var max int64 = g.Max
+		var min = g.Min
+		var max = g.Max
 		return idk.IntField{NameVal: g.Name, Min: &min, Max: &max}, nil
 	case "string":
 		return idk.StringField{NameVal: g.Name}, nil
@@ -298,6 +296,8 @@ func (c *Custom) Source(cfg SourceConfig) idk.Source {
 		recordsToGenerate = cfg.endAt - cfg.startFrom
 	}
 	return &CustomSource{
+		cur:    cfg.startFrom,
+		endAt:  cfg.endAt,
 		conf:   c.CustomConfig,
 		schema: c.IDKAndGenFields.schema,
 
@@ -319,13 +319,13 @@ func (c *Custom) PrimaryKeyFields() []string {
 // DefaultEndAt sets the endAt record value for the
 // case where one is not provided. It implements the
 // Sourcer interface. Not used for Custom.
-func (_ *Custom) DefaultEndAt() uint64 {
+func (*Custom) DefaultEndAt() uint64 {
 	return 0
 }
 
 // Info describes what this implementation of Sourcer
 // generates. It implements the Sourcer interface.
-func (_ *Custom) Info() string {
+func (*Custom) Info() string {
 	return "Generates data from a yaml definition file."
 }
 
@@ -335,6 +335,8 @@ var _ idk.Source = (*CustomSource)(nil)
 // CustomSource is an instance of a source generated
 // by the Sourcer implementation Custom.
 type CustomSource struct {
+	cur        uint64
+	endAt      uint64
 	conf       *CustomConfig
 	generators []FieldGenerator
 
@@ -355,6 +357,10 @@ func (cs *CustomSource) Schema() []idk.Field {
 // any of the generators are nil, it uses the value from the last
 // non-nil generator.
 func (cs *CustomSource) Record() (idk.Record, error) {
+	if cs.cur >= cs.endAt {
+		return nil, io.EOF
+	}
+
 	// track last generated value
 	var last interface{}
 	for i, gen := range cs.generators {
@@ -366,7 +372,7 @@ func (cs *CustomSource) Record() (idk.Record, error) {
 		var err error
 		cs.record[i], err = gen.Generate(cs.record[i])
 		if err == io.EOF {
-			return nil, nil
+			return nil, io.EOF
 		}
 		if err != nil {
 			return nil, errors.Wrapf(err, "generating for %+v", cs.schema[i])
@@ -374,11 +380,12 @@ func (cs *CustomSource) Record() (idk.Record, error) {
 		last = cs.record[i]
 	}
 	if cs.recordsToGenerate > 0 && cs.recordCounter >= cs.recordsToGenerate {
-		//break when number records produced
+		// break when number records produced
 		return nil, io.EOF
 	} else {
 		cs.recordCounter++
 	}
+	cs.cur++
 	return cs.record, nil
 }
 

@@ -4,12 +4,16 @@ package pilosa
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
+	"github.com/featurebasedb/featurebase/v3/dax"
+	"github.com/featurebasedb/featurebase/v3/dax/computer"
+	"github.com/featurebasedb/featurebase/v3/dax/storage"
 	"github.com/featurebasedb/featurebase/v3/disco"
-	"github.com/featurebasedb/featurebase/v3/ingest"
 	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/featurebasedb/featurebase/v3/roaring"
 	"github.com/pkg/errors"
@@ -22,7 +26,7 @@ const (
 )
 
 // cluster represents a collection of nodes.
-type cluster struct { // nolint: maligned
+type cluster struct { //nolint: maligned
 	noder disco.Noder
 
 	id   string
@@ -53,9 +57,6 @@ type cluster struct { // nolint: maligned
 	holder      *Holder
 	broadcaster broadcaster
 
-	abortAntiEntropyCh chan struct{}
-	muAntiEntropy      sync.Mutex
-
 	translationSyncer TranslationSyncer
 
 	mu sync.RWMutex
@@ -72,6 +73,12 @@ type cluster struct { // nolint: maligned
 	confirmDownSleep   time.Duration
 
 	partitionAssigner string
+
+	serverlessStorage *storage.ResourceManager
+
+	// isComputeNode is set to true if this node is running as a DAX compute
+	// node.
+	isComputeNode bool
 }
 
 // newCluster returns a new instance of Cluster with defaults.
@@ -97,33 +104,6 @@ func newCluster() *cluster {
 	}
 }
 
-// initializeAntiEntropy is called by the anti entropy routine when it starts.
-// If the AE channel is created without a routine reading from it, cluster will
-// block indefinitely when calling abortAntiEntropy().
-func (c *cluster) initializeAntiEntropy() {
-	c.mu.Lock()
-	c.abortAntiEntropyCh = make(chan struct{})
-	c.mu.Unlock()
-}
-
-// abortAntiEntropyQ checks whether the cluster wants to abort the anti entropy
-// process (so that it can resize). It does not block.
-func (c *cluster) abortAntiEntropyQ() bool {
-	select {
-	case <-c.abortAntiEntropyCh:
-		return true
-	default:
-		return false
-	}
-}
-
-// abortAntiEntropy blocks until the anti-entropy routine calls abortAntiEntropyQ
-func (c *cluster) abortAntiEntropy() {
-	if c.abortAntiEntropyCh != nil {
-		c.abortAntiEntropyCh <- struct{}{}
-	}
-}
-
 func (c *cluster) primaryNode() *disco.Node {
 	return c.unprotectedPrimaryNode()
 }
@@ -133,63 +113,6 @@ func (c *cluster) unprotectedPrimaryNode() *disco.Node {
 	// Create a snapshot of the cluster to use for node/partition calculations.
 	snap := c.NewSnapshot()
 	return snap.PrimaryFieldTranslationNode()
-}
-
-func (c *cluster) applySchemaWithNewShards(schema *Schema) error {
-	if schema == nil || len(schema.Indexes) == 0 {
-		return nil
-	}
-
-	if err := c.holder.applySchema(schema); err != nil {
-		return errors.Wrap(err, "applying schema")
-	}
-
-	// Get and set the shards for each field.
-	for _, idx := range c.holder.indexes {
-		for _, fld := range idx.fields {
-			err := fld.loadAvailableShards()
-			if err != nil {
-				return errors.Wrapf(err, "getting shards for field: %s/%s", idx.name, fld.name)
-			}
-		}
-	}
-
-	return nil
-}
-
-// unprotectedStatus returns the the cluster's status including what nodes it contains, its ID, and current state.
-func (c *cluster) unprotectedStatus() (*ClusterStatus, error) {
-	state, err := c.noder.ClusterState(context.Background())
-	if err != nil {
-		return nil, err
-	}
-
-	indexes, err := c.holder.Schema()
-	if err != nil {
-		return nil, errors.Wrap(err, "getting schema")
-	}
-
-	return &ClusterStatus{
-		State:  string(state),
-		Nodes:  c.Nodes(),
-		Schema: &Schema{Indexes: indexes},
-	}, nil
-}
-
-func (c *cluster) remoteSchema() (*Schema, error) {
-	for _, n := range c.noder.Nodes() {
-		if c.disCo.ID() == n.ID {
-			continue
-		}
-
-		ii, err := c.InternalClient.SchemaNode(context.Background(), &n.URI, true)
-		if err != nil {
-			return nil, errors.Wrapf(err, "getting schema from %s (%v)", n.ID, n.URI)
-		}
-
-		return &Schema{ii}, nil
-	}
-	return nil, nil
 }
 
 // nodeIDs returns the list of IDs in the cluster.
@@ -394,6 +317,44 @@ func (c *cluster) findFieldKeys(ctx context.Context, field *Field, keys ...strin
 	return translations, nil
 }
 
+func (c *cluster) appendFieldKeysWriteLog(ctx context.Context, qtid dax.QualifiedTableID, fieldName dax.FieldName, translations map[string]uint64) error {
+	// TODO move marshaling somewhere more centralized and less... explicitly json-y
+	msg := computer.FieldKeyMap{
+		TableKey:   qtid.Key(),
+		Field:      fieldName,
+		StringToID: translations,
+	}
+
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return errors.Wrap(err, "marshalling field key map to json")
+	}
+	resource := c.serverlessStorage.GetFieldKeyResource(qtid, fieldName)
+	err = resource.Append(b)
+	if err != nil {
+		return errors.Wrap(err, "appending field keys")
+	}
+	return nil
+
+}
+
+func (c *cluster) appendTableKeysWriteLog(ctx context.Context, qtid dax.QualifiedTableID, partition dax.PartitionNum, translations map[string]uint64) error {
+	msg := computer.PartitionKeyMap{
+		TableKey:   qtid.Key(),
+		Partition:  partition,
+		StringToID: translations,
+	}
+
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return errors.Wrap(err, "marshalling partition key map to json")
+	}
+
+	resource := c.serverlessStorage.GetTableKeyResource(qtid, partition)
+	return errors.Wrap(resource.Append(b), "appending table keys")
+
+}
+
 func (c *cluster) createFieldKeys(ctx context.Context, field *Field, keys ...string) (map[string]uint64, error) {
 	if idx := field.ForeignIndex(); idx != "" {
 		// The field uses foreign index keys.
@@ -411,8 +372,27 @@ func (c *cluster) createFieldKeys(ctx context.Context, field *Field, keys ...str
 		return nil, errors.Errorf("translating field(%s/%s) keys(%v) - cannot find primary node", field.Index(), field.Name(), keys)
 	}
 	if c.Node.ID == primary.ID {
-		// The local copy is the authoritative copy.
-		return field.TranslateStore().CreateKeys(keys...)
+		translations, err := field.TranslateStore().CreateKeys(keys...)
+		if err != nil {
+			return nil, errors.Errorf("creating field(%s/%s) keys(%v)", field.Index(), field.Name(), keys)
+		}
+
+		// If this is not a DAX compute node, bail early; there's no need to
+		// send data to the write log.
+		if !c.isComputeNode {
+			return translations, nil
+		}
+
+		// Send to write log.
+		tkey := dax.TableKey(field.Index())
+		qtid := tkey.QualifiedTableID()
+		fieldName := dax.FieldName(field.Name())
+		err = c.appendFieldKeysWriteLog(ctx, qtid, fieldName, translations)
+		if err != nil {
+			return nil, errors.Wrap(err, "appending to write log")
+		}
+
+		return translations, nil
 	}
 
 	// Attempt to find the keys locally.
@@ -562,38 +542,6 @@ func (c *cluster) translateIndexKeys(ctx context.Context, indexName string, keys
 	return ids, nil
 }
 
-// This implements ingest's key translator interface on a cluster/index pair.
-type clusterKeyTranslator struct {
-	ctx       context.Context // we're created within a request context and need to pass that to cluster ops
-	c         *cluster
-	indexName string
-}
-
-var _ ingest.KeyTranslator = &clusterKeyTranslator{}
-
-func (i clusterKeyTranslator) TranslateKeys(keys ...string) (map[string]uint64, error) {
-	return i.c.createIndexKeys(i.ctx, i.indexName, keys...)
-}
-
-func (i clusterKeyTranslator) TranslateIDs(ids ...uint64) (map[uint64]string, error) {
-	keys, err := i.c.translateIndexIDs(i.ctx, i.indexName, ids)
-	if err != nil {
-		return nil, err
-	}
-	if len(keys) != len(ids) {
-		return nil, fmt.Errorf("translating %d id(s), got %d key(s)", len(ids), len(keys))
-	}
-	out := make(map[uint64]string, len(keys))
-	for i, id := range ids {
-		out[id] = keys[i]
-	}
-	return out, nil
-}
-
-func newIngestKeyTranslatorFromCluster(ctx context.Context, c *cluster, indexName string) *clusterKeyTranslator {
-	return &clusterKeyTranslator{ctx: ctx, c: c, indexName: indexName}
-}
-
 // TODO: remove this when it is no longer used
 func (c *cluster) translateIndexKeySet(ctx context.Context, indexName string, keySet map[string]struct{}, writable bool) (map[string]uint64, error) {
 	keys := make([]string, 0, len(keySet))
@@ -635,6 +583,13 @@ func (c *cluster) findIndexKeys(ctx context.Context, indexName string, keys ...s
 	for _, key := range keys {
 		partitionID := snap.KeyToKeyPartition(indexName, key)
 		keysByPartition[partitionID] = append(keysByPartition[partitionID], key)
+
+		// This node only handles keys for the partition(s) that it owns.
+		if c.isComputeNode {
+			if !intInPartitions(partitionID, idx.translatePartitions) {
+				return nil, errors.Errorf("cannot find key on this partition: %s, %d", key, partitionID)
+			}
+		}
 	}
 
 	// TODO: use local replicas to short-circuit network traffic
@@ -744,6 +699,14 @@ func (c *cluster) createIndexKeys(ctx context.Context, indexName string, keys ..
 	for _, key := range keys {
 		partitionID := snap.KeyToKeyPartition(indexName, key)
 		keysByPartition[partitionID] = append(keysByPartition[partitionID], key)
+
+		// This node only handles keys for the partition(s) that it owns.
+		if c.isComputeNode {
+			if !intInPartitions(partitionID, idx.translatePartitions) {
+				log.Printf("cannot create key on this partition: %s, %d", key, partitionID)
+				return nil, errors.Errorf("cannot create key on this partition: %s, %d", key, partitionID)
+			}
+		}
 	}
 
 	// TODO: use local replicas to short-circuit network traffic
@@ -809,7 +772,18 @@ func (c *cluster) createIndexKeys(ctx context.Context, indexName string, keys ..
 			}
 
 			translateResults <- translations
-			return nil
+
+			// If this is not a DAX compute node, bail early; there's no need to
+			// send data to the write log.
+			if !c.isComputeNode {
+				return nil
+			}
+
+			// Send to write log.
+			tkey := dax.TableKey(idx.Name())
+			qtid := tkey.QualifiedTableID()
+			partitionNum := dax.PartitionNum(partitionID)
+			return c.appendTableKeysWriteLog(ctx, qtid, partitionNum, translations)
 		})
 	}
 
@@ -864,6 +838,12 @@ func (c *cluster) translateIndexIDSet(ctx context.Context, indexName string, idS
 	idsByPartition := make(map[int][]uint64, c.partitionN)
 	for id := range idSet {
 		partitionID := snap.IDToShardPartition(indexName, id)
+		// This node only handles keys for the partition(s) that it owns.
+		if c.isComputeNode {
+			if !intInPartitions(partitionID, index.translatePartitions) {
+				return nil, errors.Errorf("cannot find id on this partition: %d, %d", id, partitionID)
+			}
+		}
 		idsByPartition[partitionID] = append(idsByPartition[partitionID], id)
 	}
 
@@ -936,7 +916,9 @@ type CreateShardMessage struct {
 type CreateIndexMessage struct {
 	Index     string
 	CreatedAt int64
-	Meta      IndexOptions
+	Owner     string
+
+	Meta IndexOptions
 }
 
 // DeleteIndexMessage is an internal message indicating index deletion.
@@ -949,6 +931,7 @@ type CreateFieldMessage struct {
 	Index     string
 	Field     string
 	CreatedAt int64
+	Owner     string
 	Meta      *FieldOptions
 }
 
@@ -1028,4 +1011,18 @@ const (
 type TransactionMessage struct {
 	Transaction *Transaction
 	Action      string
+}
+
+func intInPartitions(i int, s dax.PartitionNums) bool {
+	for _, a := range s {
+		if int(a) == i {
+			return true
+		}
+	}
+	return false
+}
+
+// DeleteDataframeMessage is an internal message indicating dataframe deletion.
+type DeleteDataframeMessage struct {
+	Index string
 }

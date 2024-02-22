@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"math/rand"
 	"os"
@@ -18,15 +17,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/confluentinc/confluent-kafka-go/kafka"
 	confluent "github.com/confluentinc/confluent-kafka-go/kafka"
-	"github.com/glycerine/vprint"
-	"github.com/go-avro/avro"
-	liavro "github.com/linkedin/goavro/v2"
 	"github.com/featurebasedb/featurebase/v3/idk"
 	"github.com/featurebasedb/featurebase/v3/idk/common"
 	"github.com/featurebasedb/featurebase/v3/idk/kafka/csrc"
 	"github.com/featurebasedb/featurebase/v3/logger"
+	"github.com/glycerine/vprint"
+	"github.com/go-avro/avro"
+	liavro "github.com/linkedin/goavro/v2"
 )
 
 func configureSourceTestFlags(source *Source) {
@@ -81,11 +79,11 @@ func TestAvroToPDKSchema(t *testing.T) {
 	}
 
 	// check that we've covered all the test schemas
-	files, err := ioutil.ReadDir("./testdata/schemas")
+	files, err := os.ReadDir("./testdata/schemas")
 	if err != nil {
 		t.Fatalf("reading directory: %v", err)
 	}
-	if len(files) != len(tests)+4 { // +4 because we aren't testing bigschema.json, the two delete ones, or the ID allocation one here.
+	if len(files) != len(tests)+9 { // +9 because we aren't testing bigschema.json, the five delete ones, alltypes. timeQuantums or the ID allocation one here.
 		t.Errorf("have different number of schemas and tests: %d and %d\n%+v", len(files), len(tests), files)
 	}
 
@@ -227,6 +225,19 @@ func TestAvroToPDKField(t *testing.T) {
 			expField: idk.IDField{NameVal: "int-ttl"},
 			expErr:   "nil",
 		},
+		{
+			name: "recordTime",
+			schemaField: &avro.SchemaField{
+				Name: "record-time",
+				Type: &avro.BytesSchema{},
+				Properties: map[string]interface{}{
+					"layout":    "2006-01-02 15:04:05",
+					"fieldType": "recordTime",
+				},
+			},
+			expField: idk.RecordTimeField{NameVal: "record-time", Layout: "2006-01-02 15:04:05"},
+			expErr:   "nil",
+		},
 	}
 
 	for _, test := range tests {
@@ -251,7 +262,7 @@ func decodeTestSchema(t *testing.T, filename string) avro.Schema {
 }
 
 func readTestSchema(t *testing.T, filename string) string {
-	bytes, err := ioutil.ReadFile("./testdata/schemas/" + filename)
+	bytes, err := os.ReadFile("./testdata/schemas/" + filename)
 	if err != nil {
 		t.Fatalf("reading schema file: %v", err)
 	}
@@ -299,7 +310,8 @@ var tests = []struct {
 		},
 		exp: [][]interface{}{
 			{"a", true, int64(101), []byte{9, 196}, float64(9.4921)},
-			{nil, nil, nil, nil, nil}},
+			{nil, nil, nil, nil, nil},
+		},
 	},
 	{
 		schemaFile: "floatscale.json",
@@ -435,27 +447,28 @@ func TestKafkaSourceSchemaChangeCommitRegression(t *testing.T) {
 	}
 
 	go func() {
-
 		topic := "xyzzy"
-		src.recordChannel <- recordWithError{Record: &confluent.Message{
-			TopicPartition: confluent.TopicPartition{
-				Topic:     &topic,
-				Partition: 0,
-				Offset:    confluent.Offset(0),
+		src.recordChannel <- recordWithError{
+			Record: &confluent.Message{
+				TopicPartition: confluent.TopicPartition{
+					Topic:     &topic,
+					Partition: 0,
+					Offset:    confluent.Offset(0),
+				},
+				Timestamp: time.Now(),
+				Value:     data1,
 			},
-			Timestamp: time.Now(),
-			Value:     data1,
-		},
 		}
-		src.recordChannel <- recordWithError{Record: &confluent.Message{
-			TopicPartition: confluent.TopicPartition{
-				Topic:     &topic,
-				Partition: 0,
-				Offset:    confluent.Offset(1),
+		src.recordChannel <- recordWithError{
+			Record: &confluent.Message{
+				TopicPartition: confluent.TopicPartition{
+					Topic:     &topic,
+					Partition: 0,
+					Offset:    confluent.Offset(1),
+				},
+				Timestamp: time.Now(),
+				Value:     data2,
 			},
-			Timestamp: time.Now(),
-			Value:     data2,
-		},
 		}
 		close(src.recordChannel)
 	}()
@@ -509,14 +522,14 @@ func TestKafkaSourceTimeout(t *testing.T) {
 
 	go func() {
 		topic := "test"
-		src.recordChannel <- recordWithError{Record: &confluent.Message{
-			TopicPartition: confluent.TopicPartition{
-				Topic: &topic,
+		src.recordChannel <- recordWithError{
+			Record: &confluent.Message{
+				TopicPartition: confluent.TopicPartition{
+					Topic: &topic,
+				},
+				Value: buf,
 			},
-			Value: buf,
-		},
 		}
-
 	}()
 
 	// ensure we can get a message if one is available
@@ -550,8 +563,6 @@ func TestKafkaSourceTimeout(t *testing.T) {
 // be, but I think it has something to do with kafka rebalancing
 // itself when a new client joins.
 func TestKafkaSourceIntegration(t *testing.T) {
-	t.Parallel()
-
 	if testing.Short() {
 		t.Skip()
 	}
@@ -624,7 +635,6 @@ func TestKafkaSourceIntegration(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func mustNewProducer(t *testing.T, kafkaHost string) *confluent.Producer {
@@ -770,7 +780,6 @@ func TestKafkaSourceNotAutoCommitting(t *testing.T) {
 	} else if off := offsets[0]; int64(off.Offset) != numRecords {
 		t.Fatalf("after commit, offset is not %d: %d", numRecords-1, off.Offset)
 	}
-
 }
 
 func TestRegistryURLParsing(t *testing.T) {
@@ -829,6 +838,7 @@ func TestRegistryURLParsing(t *testing.T) {
 	}
 
 	for i, test := range tests {
+		test := test
 		t.Run(fmt.Sprintf("%s-%d", test.name, i), func(t *testing.T) {
 			t.Parallel()
 
@@ -847,10 +857,8 @@ func TestRegistryURLParsing(t *testing.T) {
 			if codecURL != test.expectedCodecURL {
 				t.Errorf("codec URL exp:\n%s\ngot:\n%s", test.expectedCodecURL, codecURL)
 			}
-
 		})
 	}
-
 }
 
 func postSchema(t *testing.T, schemaFile, subj, regURL string, tlsConfig *tls.Config) (schemaID int) {
@@ -886,7 +894,8 @@ func tCreateTopic(t *testing.T, topic string, p *confluent.Producer) {
 		[]confluent.TopicSpecification{{
 			Topic:             topic,
 			NumPartitions:     64,
-			ReplicationFactor: 1}},
+			ReplicationFactor: 1,
+		}},
 		// Admin options
 		confluent.SetAdminOperationTimeout(maxDur))
 	if err != nil {
@@ -898,7 +907,6 @@ func tCreateTopic(t *testing.T, topic string, p *confluent.Producer) {
 		}
 	}
 	a.Close()
-
 }
 
 func tPutRecordsKafka(t *testing.T, p *confluent.Producer, topic string, schemaID int, schema *liavro.Codec, key string, records ...map[string]interface{}) {
@@ -907,14 +915,14 @@ func tPutRecordsKafka(t *testing.T, p *confluent.Producer, topic string, schemaI
 
 func tPutRecordsKafkaPartition(t *testing.T, p *confluent.Producer, topic string, schemaID int, schema *liavro.Codec, key string, partition int32, records ...map[string]interface{}) {
 	t.Helper()
-	delivery_chan := make(chan kafka.Event, 10000)
+	delivery_chan := make(chan confluent.Event, 10000)
 	for _, record := range records {
 		data, err := endcodeAvro(schemaID, schema, record)
 		if err != nil {
 			t.Fatalf("encoding record: %v", err)
 		}
-		err = p.Produce(&kafka.Message{
-			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: partition},
+		err = p.Produce(&confluent.Message{
+			TopicPartition: confluent.TopicPartition{Topic: &topic, Partition: partition},
 			Key:            []byte(key),
 			Value:          data,
 		}, delivery_chan)
@@ -922,7 +930,7 @@ func tPutRecordsKafkaPartition(t *testing.T, p *confluent.Producer, topic string
 			t.Fatalf("producing record: %v", err)
 		}
 		e := <-delivery_chan
-		m := e.(*kafka.Message)
+		m := e.(*confluent.Message)
 
 		if m.TopicPartition.Error != nil {
 			t.Fatalf("Delivery failed: %v\n", m.TopicPartition.Error)

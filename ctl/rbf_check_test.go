@@ -5,29 +5,36 @@ package ctl
 import (
 	"bytes"
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/featurebasedb/featurebase/v3/logger"
 )
 
 func TestRBFCheckCommand_Run(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
-		var stdout, stderr bytes.Buffer
-		cmd := NewRBFCheckCommand(bytes.NewReader(nil), &stdout, &stderr)
-		cmd.Path = filepath.Join("testdata", "rbf-check", "ok")
+		cmLog := logger.NewStandardLogger(os.Stderr)
+		cmd := NewRBFCheckCommand(cmLog)
+		buf := &bytes.Buffer{}
+		cmd.stdout = buf
+		cmd.Path = filepath.Join("testdata", "ok")
 		if err := cmd.Run(context.Background()); err != nil {
 			t.Fatal(err)
-		} else if got, want := stdout.String(), `ok`+"\n"; got != want {
+		} else if got, want := buf.String(), `ok`+"\n"; got != want {
 			t.Fatalf("got:\n%s\n\nwant:\n%s", got, want)
 		}
 	})
 
 	t.Run("ErrInvalidPageType", func(t *testing.T) {
-		var stdout, stderr bytes.Buffer
-		cmd := NewRBFCheckCommand(bytes.NewReader(nil), &stdout, &stderr)
-		cmd.Path = filepath.Join("testdata", "rbf-check", "err-invalid-page-type")
+		cmLog := logger.NewStandardLogger(os.Stderr)
+		cmd := NewRBFCheckCommand(cmLog)
+		buf := &bytes.Buffer{}
+		cmd.stdout = buf
+		cmd.Path = filepath.Join("testdata", "err-invalid-page-type")
 		if err := cmd.Run(context.Background()); err == nil || err.Error() != `check failed` {
 			t.Fatal(err)
-		} else if got, want := stdout.String(), `page not in-use & not free: pgno=4`+"\n"; got != want {
+		} else if got, want := buf.String(), `page not in-use & not free: pgno=4`+"\n"; got != want {
 			t.Fatalf("got:\n%s\n\nwant:\n%s", got, want)
 		}
 	})

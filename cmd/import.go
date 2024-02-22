@@ -5,11 +5,11 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"io"
 	"strconv"
 
 	pilosa "github.com/featurebasedb/featurebase/v3"
 	"github.com/featurebasedb/featurebase/v3/ctl"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/featurebasedb/featurebase/v3/pql"
 	"github.com/spf13/cobra"
 )
@@ -44,8 +44,8 @@ func (dfv *DecimalFlagValue) Type() string {
 }
 
 // newImportCommand runs the FeatureBase import subcommand for ingesting bulk data.
-func newImportCommand(stdin io.Reader, stdout, stderr io.Writer) *cobra.Command {
-	Importer = ctl.NewImportCommand(stdin, stdout, stderr)
+func newImportCommand(logdest logger.Logger) *cobra.Command {
+	Importer = ctl.NewImportCommand(logdest)
 	importCmd := &cobra.Command{
 		Use:   "import",
 		Short: "Bulk load data into FeatureBase.",
@@ -61,7 +61,7 @@ omitted. If it is present then its format should be YYYY-MM-DDTHH:MM.
 `,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			Importer.Paths = args
-			return Importer.Run(context.Background())
+			return considerUsageError(cmd, Importer.Run(context.Background()))
 		},
 	}
 

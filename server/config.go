@@ -52,6 +52,22 @@ type Config struct {
 	// Name a unique name for this node in the cluster.
 	Name string `toml:"name"`
 
+	// ControllerAddress is the location at which this node should register
+	// itself and retrieve its instructions. For example, after registring, the
+	// Controller service might tell this node that it is responsible for
+	// specific shards for a particular index.
+	ControllerAddress string `toml:"controller-address"`
+
+	// WriteloggerDir is the location at which this node should
+	// read/write change logs. Typically a network mounted filesystem
+	// for availability/durability.
+	WriteloggerDir string `toml:"writelogger-dir"`
+
+	// SnapshotterDir is the location at which this node should
+	// read/write snapshots. Typically a network mounted filesystem
+	// for availability/durability.
+	SnapshotterDir string `toml:"snapshotter-dir"`
+
 	// DataDir is the directory where Pilosa stores both indexed data and
 	// running state such as cluster topology information.
 	DataDir string `toml:"data-dir"`
@@ -62,11 +78,15 @@ type Config struct {
 	// BindGRPC is the host:port on which Pilosa will bind for gRPC.
 	BindGRPC string `toml:"bind-grpc"`
 
+	// Listener is an already-bound listener to use for http.
+	// Listener *net.TCPListener
+	Listener net.Listener
+
 	// GRPCListener is an already-bound listener to use for gRPC.
 	// This is for use by test infrastructure, where it's useful to
 	// be able to dynamically generate the bindings by actually binding
 	// to :0, and avoid "address already in use" errors.
-	GRPCListener *net.TCPListener
+	GRPCListener net.Listener
 
 	// Advertise is the address advertised by the server to other nodes
 	// in the cluster. It should be reachable by all other nodes and should
@@ -123,8 +143,23 @@ type Config struct {
 	// don't exhaust the goroutine limit.
 	ImportWorkerPoolSize int `toml:"-"`
 
+	// DirectiveWorkerPoolSize controls how many goroutines are created for
+	// processing a Directive (i.e. concurrently loading key/partition/shard
+	// data from shapshotter and writelogger) on a compute node. Defaults to
+	// runtime.NumCPU().
+	DirectiveWorkerPoolSize int `toml:"-"`
+
 	// Limits the total amount of memory to be used by Extract() & SELECT queries.
 	MaxQueryMemory int64 `toml:"max-query-memory"`
+
+	// On startup, featurebase server contacts a web server to check the latest version.
+	// This stores the address for that check
+	VerChkAddress string `toml:"verchk-address"`
+
+	// When checking version, server sends a UUID so that we can keep track of
+	// how many unique Featurebase installs are out there. The file is stored in
+	// the data directory; this stores the filename to use.
+	UUIDFile string `toml:"uuid-file"`
 
 	Cluster struct {
 		ReplicaN int    `toml:"replicas"`
@@ -145,6 +180,7 @@ type Config struct {
 		PrimaryURL string `toml:"primary-url"`
 	} `toml:"translation"`
 
+	// AntiEntropy config is now deprecated
 	AntiEntropy struct {
 		Interval toml.Duration `toml:"interval"`
 	} `toml:"anti-entropy"`
@@ -177,27 +213,9 @@ type Config struct {
 		MutexFraction int `toml:"mutex-fraction"`
 	} `toml:"profile"`
 
-	Postgres struct {
-		// Bind is the address to which to bind a postgres endpoint.
-		// If this is empty, no endpoint will be created.
-		Bind string `toml:"bind"`
-		// TLS configuration for postgres connections.
-		TLS TLSConfig `toml:"tls"`
-
-		StartupTimeout toml.Duration `toml:"startup-timeout"`
-		ReadTimeout    toml.Duration `toml:"read-timeout"`
-		WriteTimeout   toml.Duration `toml:"write-timout"`
-
-		MaxStartupSize uint32 `toml:"max-startup-size"`
-
-		// ConnectionLimit is the maximum number of postgres connections to allow simultaneously.
-		// Setting this to 0 disables the limit.
-		// This mostly exists because other DBs seem to have it.
-		ConnectionLimit uint16 `toml:"max-connections"`
-		// SqlVersion is which type of sqlhandling to be applied.
-		// The constant SqlV2 can be used to try the new experimental Molecula SQL handling
-		SqlVersion uint16 `toml:"sql-version"`
-	} `toml:"postgres"`
+	// CheckInTimeout is the amount of time between compute node check-ins to
+	// Controller.
+	CheckInInterval time.Duration `toml:"check-in-interval"`
 
 	// Storage.Backend determines which Tx implementation the holder/Index will
 	// use; one of the available transactional-storage engines. Choices are
@@ -226,6 +244,7 @@ type Config struct {
 
 	DataDog struct {
 		Enable           bool   `toml:"enable"`
+		EnableTracing    bool   `toml:"enable-tracing"`
 		Service          string `toml:"service"`
 		Env              string `toml:"env"`
 		Version          string `toml:"version"`
@@ -238,6 +257,11 @@ type Config struct {
 	} `toml:"datadog"`
 
 	Auth Auth
+
+	Dataframe struct {
+		Enable     bool `toml:"enable"`
+		UseParquet bool `toml:"use-parquet"`
+	} `toml:"dataframe"`
 }
 
 type Auth struct {
@@ -287,7 +311,6 @@ func (c *Config) validate() error {
 		"Etcd.LPeerURL", c.Etcd.LPeerURL, // ":"
 		"Etcd.APeerURL", c.Etcd.APeerURL, // ""
 		"Etcd.ClusterURL", c.Etcd.ClusterURL,
-		"Postgres.Bind", c.Postgres.Bind,
 	}
 
 	ports := make(map[int]bool)
@@ -354,12 +377,18 @@ func NewConfig() *Config {
 		WorkerPoolSize:       runtime.NumCPU(),
 		ImportWorkerPoolSize: runtime.NumCPU(),
 
+		DirectiveWorkerPoolSize: runtime.NumCPU(),
+
 		Storage:   storage.NewDefaultConfig(),
 		RBFConfig: rbfcfg.NewDefaultConfig(),
 
 		QueryHistoryLength: 100,
 
 		LongQueryTime: toml.Duration(-time.Minute),
+
+		CheckInInterval: 60 * time.Second,
+		VerChkAddress:   "https://analytics.featurebase.com/v2/featurebase/metrics",
+		UUIDFile:        ".client_id.txt",
 	}
 
 	// Cluster config.
@@ -382,13 +411,6 @@ func NewConfig() *Config {
 
 	c.Profile.BlockRate = 10000000 // 1 sample per 10 ms
 	c.Profile.MutexFraction = 100  // 1% sampling
-
-	// Postgres config (off by default).
-	c.Postgres.MaxStartupSize = 8 * 1024 * 1024
-	c.Postgres.StartupTimeout = toml.Duration(5 * time.Second)
-	c.Postgres.ReadTimeout = toml.Duration(10 * time.Second)
-	c.Postgres.WriteTimeout = toml.Duration(10 * time.Second)
-	// we don't really need a connection limit
 
 	c.Etcd.AClientURL = ""
 	c.Etcd.LClientURL = "http://localhost:10301"

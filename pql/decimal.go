@@ -3,6 +3,7 @@
 package pql
 
 import (
+	"fmt"
 	"math"
 	"math/big"
 	"strconv"
@@ -112,6 +113,52 @@ func AddDecimal(a, b Decimal) Decimal {
 	}
 }
 
+// SubtractDecimal subtracts b from a and returns a new Decimal.
+//
+// If the Scale of a and b don't match, the returned Decimal will have the
+// smallest Scale needed to precisely represent the sum.
+func SubtractDecimal(a, b Decimal) Decimal {
+	ac, bc := sameScalify(a, b)
+	apv, bpv := &ac.value, &bc.value
+	apv.Sub(apv, bpv)
+	return Decimal{
+		value: *apv,
+		Scale: ac.Scale,
+	}
+}
+
+// MultiplyDecimal multiplies a by b and returns a new Decimal.
+//
+// If the Scale of a and b don't match, the returned Decimal will have the
+// smallest Scale needed to precisely represent the sum.
+func MultiplyDecimal(a, b Decimal) Decimal {
+	ac, bc := sameScalify(a, b)
+	apv, bpv := &ac.value, &bc.value
+	scaleFactor := big.NewInt(Pow10(ac.Scale))
+	apv.Mul(apv, bpv)
+	apv.Div(apv, scaleFactor)
+	return Decimal{
+		value: *apv,
+		Scale: ac.Scale,
+	}
+}
+
+// DivideDecimal multiplies a by b and returns a new Decimal.
+//
+// If the Scale of a and b don't match, the returned Decimal will have the
+// smallest Scale needed to precisely represent the sum.
+func DivideDecimal(a, b Decimal) Decimal {
+	ac, bc := sameScalify(a, b)
+	apv, bpv := &ac.value, &bc.value
+	scaleFactor := big.NewInt(Pow10(ac.Scale))
+	apv.Mul(apv, scaleFactor)
+	apv.Div(apv, bpv)
+	return Decimal{
+		value: *apv,
+		Scale: ac.Scale,
+	}
+}
+
 // LessThan returns true if d < d2.
 func (d Decimal) LessThan(d2 Decimal) bool {
 	return d.lessThan(d2, false)
@@ -140,7 +187,6 @@ func (d *Decimal) withLargerScale(scale int64) *Decimal {
 		val = val.Mul(val, ten)
 		dc.Scale++
 	}
-
 	return dc
 }
 
@@ -298,6 +344,33 @@ const (
 	stateLeadingZeros = "zeros"
 	stateMantissa     = "mantissa"
 )
+
+// FromInt64 converts an int64 into a Decimal.
+func FromInt64(i int64, scale int64) Decimal {
+	us := i * Pow10(scale)
+	return NewDecimal(us, scale)
+}
+
+// FromFloat64 converts a float into a Decimal.
+func FromFloat64(f float64) Decimal {
+	scale := decimalPlaces(fmt.Sprintf("%v", f))
+	us := int64(f * math.Pow(10, float64(scale)))
+	return NewDecimal(us, int64(scale))
+}
+
+func decimalPlaces(v string) int {
+	i := strings.IndexByte(v, '.')
+	if i > -1 {
+		return len(v) - i - 1
+	}
+	return 0
+}
+
+// FromFloat64WithScale converts a float into a Decimal.
+func FromFloat64WithScale(f float64, scale int) (Decimal, error) {
+	us := int64(f * math.Pow(10, float64(scale)))
+	return NewDecimal(us, int64(scale)), nil
+}
 
 // ParseDecimal parses a string into a Decimal.
 func ParseDecimal(s string) (Decimal, error) {

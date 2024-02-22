@@ -5,9 +5,9 @@ import (
 	"log"
 	"os"
 
-	"github.com/jaffee/commandeer/pflag"
 	"github.com/featurebasedb/featurebase/v3/idk/csv"
 	"github.com/featurebasedb/featurebase/v3/logger"
+	"github.com/jaffee/commandeer/pflag"
 )
 
 func main() {
@@ -30,8 +30,8 @@ func main() {
 		return
 	}
 
-	if m.Concurrency != 1 {
-		m.Log().Infof("Concurrency is not supported for csv ingest. '--concurrency' flag will be ignored.")
+	if m.Concurrency != 1 && m.AutoGenerate {
+		m.Log().Infof("Concurrency is not supported for csv ingest when using '--auto-generate'. '--concurrency' flag will be ignored and concurrency will be set to 1.")
 		m.Concurrency = 1
 	}
 

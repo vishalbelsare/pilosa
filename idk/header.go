@@ -32,7 +32,7 @@ const (
 
 var (
 	ErrNoFieldSpec      = errors.New("no field spec in this header")
-	ErrInvalidFieldName = errors.New("field name must match [a-z][a-z0-9_-]{0,229}")
+	ErrInvalidFieldName = errors.New("field name must match [a-z][a-z0-9Θ_-]{0,229}")
 	ErrParsingEpoch     = "parsing epoch for "
 	ErrDecodingConfig   = "decoding config for field "
 )
@@ -42,12 +42,12 @@ var (
 // destname are separated by "___", triple underscore) and converts it
 // to an idk Field like:
 //
-// FieldTypeField {
-//     NameVal: sourcename,
-//     DestNameVal: destname,
-//     Thing1: Arg,
-//     Thing2: Arg2,
-// }
+//	FieldTypeField {
+//	    NameVal: sourcename,
+//	    DestNameVal: destname,
+//	    Thing1: Arg,
+//	    Thing2: Arg2,
+//	}
 //
 // It does this using a variety of reflective magic. The unwritten
 // rules are that all idk Fields must be structs and have their first
@@ -506,13 +506,18 @@ func (t PathTable) FlatMap() map[string]int {
 	return m
 }
 
+// RawField is used in cases where header fields are configured as json,
+// typically read from a file. But this type is also used by the kafka runner in
+// fbsql.
+type RawField struct {
+	Name   string   `json:"name"`
+	Path   []string `json:"path"`
+	Type   string   `json:"type"`
+	Config json.RawMessage
+}
+
 func ParseHeader(raw []byte) ([]Field, PathTable, error) {
-	var rawSchema []struct {
-		Name   string   `json:"name"`
-		Path   []string `json:"path"`
-		Type   string   `json:"type"`
-		Config json.RawMessage
-	}
+	var rawSchema []RawField
 	err := json.Unmarshal(raw, &rawSchema)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "parsing schema")

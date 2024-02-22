@@ -15,11 +15,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
-	"github.com/featurebasedb/featurebase/v3/disco"
 	"github.com/featurebasedb/featurebase/v3/pql"
 	"github.com/featurebasedb/featurebase/v3/roaring"
-	"github.com/featurebasedb/featurebase/v3/stats"
 	"github.com/featurebasedb/featurebase/v3/testhook"
 	"github.com/featurebasedb/featurebase/v3/tracing"
 	"github.com/pkg/errors"
@@ -74,6 +73,7 @@ var availableShardFileFlushDuration = &protected{
 type Field struct {
 	mu            sync.RWMutex
 	createdAt     int64
+	owner         string
 	path          string
 	index         string
 	name          string
@@ -84,8 +84,6 @@ type Field struct {
 	viewMap map[string]*view
 
 	broadcaster broadcaster
-	Stats       stats.StatsClient
-	schemator   disco.Schemator
 	serializer  Serializer
 
 	// Field options.
@@ -271,7 +269,9 @@ func OptFieldTypeTimestamp(epoch time.Time, timeUnit string) FieldOption {
 // scale = -2:
 // min : [-922337203685477580800, -100]
 // GAPs: [-99, -1], [-199, -101] ... [-922337203685477580799, -922337203685477580701]
-//       0
+//
+//	0
+//
 // max : [100, 922337203685477580700]
 // GAPs: [1, 99], [101, 199] ... [922337203685477580601, 922337203685477580699]
 //
@@ -282,7 +282,6 @@ func OptFieldTypeTimestamp(epoch time.Time, timeUnit string) FieldOption {
 //
 // min : [-922337203685477580800, -922337203685477580800+(2^64)]
 // max : [922337203685477580700-(2^64), 922337203685477580700]
-//
 func OptFieldTypeDecimal(scale int64, minmax ...pql.Decimal) FieldOption {
 	return func(fo *FieldOptions) error {
 		if fo.Type != "" {
@@ -378,28 +377,27 @@ func OptFieldTypeBool() FieldOption {
 	}
 }
 
-// NewField returns a new instance of field.
-// NOTE: This function is only used in tests, which is why
-// it only takes a single `FieldOption` (the assumption being
-// that it's of the type `OptFieldType*`). This means
-// this function couldn't be used to set, for example,
-// `FieldOptions.Keys`.
-func NewField(holder *Holder, path, index, name string, opts FieldOption) (*Field, error) {
-	err := ValidateName(name)
-	if err != nil {
-		return nil, errors.Wrap(err, "validating name")
+// OptFieldTrackExistence exists mostly to allow the
+// FieldFromFieldOptions/FieldOptionsFromField round-trip to work.
+// If you are actually creating a field, via api.CreateField,
+// it will be turned on unconditionally. You can't turn it
+// off.
+func OptFieldTrackExistence() FieldOption {
+	return func(fo *FieldOptions) error {
+		fo.TrackExistence = true
+		return nil
 	}
-
-	return newField(holder, path, index, name, opts)
 }
 
 // newField returns a new instance of field (without name validation).
-func newField(holder *Holder, path, index, name string, opts FieldOption) (*Field, error) {
+func newField(holder *Holder, path, index, name string, opts ...FieldOption) (*Field, error) {
 	// Apply functional option.
 	fo := FieldOptions{}
-	err := opts(&fo)
-	if err != nil {
-		return nil, errors.Wrap(err, "applying option")
+	for _, opt := range opts {
+		err := opt(&fo)
+		if err != nil {
+			return nil, errors.Wrap(err, "applying option")
+		}
 	}
 
 	f := &Field{
@@ -411,8 +409,6 @@ func newField(holder *Holder, path, index, name string, opts FieldOption) (*Fiel
 		viewMap: make(map[string]*view),
 
 		broadcaster: NopBroadcaster,
-		Stats:       stats.NopStatsClient,
-		schemator:   disco.NopSchemator,
 		serializer:  NopSerializer,
 
 		options: applyDefaultOptions(&fo),
@@ -987,6 +983,51 @@ func (f *Field) hasBSIGroup(name string) bool {
 	return false
 }
 
+// cleanupViewName yields a "corrected" view name, handling some
+// idioms we used elsewhere in code. Given an empty string,
+// it yields a default view name (either "standard" or the BSI view
+// for BSI fields). Given a string starting with numbers, it
+// yields the corresponding time quantum view (prefixing "standard_").
+// It yields an error if the view name given does not correspond
+// to a view which should exist. For instance, the "standard" or
+// "existence" views for a BSI field, or a time quantum view for
+// a non-time field.
+func (f *Field) cleanupViewName(viewName string) (string, error) {
+	if viewName == "" {
+		switch f.options.Type {
+		case FieldTypeInt, FieldTypeDecimal, FieldTypeTimestamp:
+			return "bsig_" + f.name, nil
+		default:
+			return viewStandard, nil
+		}
+	}
+	switch f.options.Type {
+	case FieldTypeInt, FieldTypeDecimal, FieldTypeTimestamp:
+		if viewName == "bsig_"+f.name {
+			return viewName, nil
+		}
+		return viewName, fmt.Errorf("BSI-type field view should be named bsig_[fieldname], got %q", viewName)
+	case FieldTypeTime:
+		switch {
+		case viewName == viewStandard, viewName == viewExistence:
+			return viewName, nil
+		case strings.HasPrefix(viewName, viewStandard):
+			return viewName, nil
+		case unicode.IsDigit(rune(viewName[0])):
+			return viewStandard + "_" + viewName, nil
+		default:
+			return viewName, fmt.Errorf("time field views are %q, %q, or %q_[digits], got %q", viewStandard, viewExistence, viewStandard, viewName)
+		}
+	default:
+		switch viewName {
+		case viewStandard, viewExistence:
+			return viewName, nil
+		default:
+			return viewName, fmt.Errorf("unexpected view name %q, expecting %q or %q", viewName, viewStandard, viewExistence)
+		}
+	}
+}
+
 // createBSIGroup creates a new bsiGroup on the field.
 func (f *Field) createBSIGroup(bsig *bsiGroup) error {
 	// Append bsiGroup.
@@ -1037,8 +1078,9 @@ func (f *Field) viewsByTimeRange(from, to time.Time) (views []string, err error)
 	}
 
 	// Get min/max based on existing views.
-	var vs []string
-	for _, v := range f.views() {
+	fv := f.views()
+	vs := make([]string, 0, len(fv))
+	for _, v := range fv {
 		vs = append(vs, v.name)
 	}
 	min, max := minMaxViews(vs, q)
@@ -1069,7 +1111,7 @@ func (f *Field) viewsByTimeRange(from, to time.Time) (views []string, err error)
 
 // RowTime gets the row at the particular time with the granularity specified by
 // the quantum.
-func (f *Field) RowTime(tx Tx, rowID uint64, time time.Time, quantum string) (*Row, error) {
+func (f *Field) RowTime(qcx *Qcx, rowID uint64, time time.Time, quantum string) (*Row, error) {
 	if !TimeQuantum(quantum).Valid() {
 		return nil, ErrInvalidTimeQuantum
 	}
@@ -1079,7 +1121,7 @@ func (f *Field) RowTime(tx Tx, rowID uint64, time time.Time, quantum string) (*R
 		return nil, errors.Errorf("view with quantum %v not found.", quantum)
 	}
 
-	return view.row(tx, rowID)
+	return view.row(qcx, rowID)
 }
 
 // viewPath returns the path to a view in the field.
@@ -1181,7 +1223,6 @@ func (f *Field) newView(path, name string) *view {
 	view := newView(f.holder, path, f.index, f.name, name, f.options)
 	view.idx = f.idx
 	view.fld = f
-	view.stats = f.Stats
 	view.broadcaster = f.broadcaster
 	return view
 }
@@ -1196,7 +1237,7 @@ func (f *Field) deleteView(name string) error {
 	}
 
 	// Delete the view from etcd as the system of record.
-	if err := f.schemator.DeleteView(context.TODO(), f.index, f.name, name); err != nil {
+	if err := f.holder.Schemator.DeleteView(context.TODO(), f.index, f.name, name); err != nil {
 		return errors.Wrapf(err, "deleting view from etcd: %s/%s/%s", f.index, f.name, name)
 	}
 
@@ -1220,14 +1261,14 @@ func (f *Field) deleteView(name string) error {
 // package, and the fact that it's only allowed on
 // `set`,`mutex`, and `bool` fields is odd. This may
 // be considered for deprecation in a future version.
-func (f *Field) Row(tx Tx, rowID uint64) (*Row, error) {
+func (f *Field) Row(qcx *Qcx, rowID uint64) (*Row, error) {
 	switch f.Type() {
 	case FieldTypeSet, FieldTypeMutex, FieldTypeBool:
 		view := f.view(viewStandard)
 		if view == nil {
 			return nil, ErrInvalidView
 		}
-		return view.row(tx, rowID)
+		return view.row(qcx, rowID)
 	default:
 		return nil, errors.Errorf("row method unsupported for field type: %s", f.Type())
 	}
@@ -1257,7 +1298,7 @@ func (f *Field) MutexCheck(ctx context.Context, qcx *Qcx, details bool, limit in
 }
 
 // SetBit sets a bit on a view within the field.
-func (f *Field) SetBit(tx Tx, rowID, colID uint64, t *time.Time) (changed bool, err error) {
+func (f *Field) SetBit(qcx *Qcx, rowID, colID uint64, t *time.Time) (changed bool, err error) {
 	viewName := viewStandard
 	if !f.options.NoStandardView {
 		// Retrieve view. Exit if it doesn't exist.
@@ -1267,10 +1308,19 @@ func (f *Field) SetBit(tx Tx, rowID, colID uint64, t *time.Time) (changed bool, 
 		}
 
 		// Set non-time bit.
-		if v, err := view.setBit(tx, rowID, colID); err != nil {
+		if v, err := view.setBit(qcx, rowID, colID); err != nil {
 			return changed, errors.Wrap(err, "setting on view")
 		} else if v {
 			changed = v
+		}
+		if f.options.TrackExistence {
+			view, err := f.createViewIfNotExists(viewExistence)
+			if err != nil {
+				return changed, errors.Wrap(err, "creating existence view")
+			}
+			if _, err := view.setBit(qcx, bsiExistsBit, colID); err != nil {
+				return changed, errors.Wrap(err, "setting existence on view")
+			}
 		}
 	}
 
@@ -1286,7 +1336,7 @@ func (f *Field) SetBit(tx Tx, rowID, colID uint64, t *time.Time) (changed bool, 
 			return changed, errors.Wrapf(err, "creating view %s", subname)
 		}
 
-		if c, err := view.setBit(tx, rowID, colID); err != nil {
+		if c, err := view.setBit(qcx, rowID, colID); err != nil {
 			return changed, errors.Wrapf(err, "setting on view %s", subname)
 		} else if c {
 			changed = true
@@ -1297,7 +1347,10 @@ func (f *Field) SetBit(tx Tx, rowID, colID uint64, t *time.Time) (changed bool, 
 }
 
 // ClearBit clears a bit within the field.
-func (f *Field) ClearBit(tx Tx, rowID, colID uint64) (changed bool, err error) {
+//
+// This does not, for now, create existence bits for the field, because it
+// doesn't create them for the index.
+func (f *Field) ClearBit(qcx *Qcx, rowID, colID uint64) (changed bool, err error) {
 	viewName := viewStandard
 
 	// Retrieve view. Exit if it doesn't exist.
@@ -1307,12 +1360,24 @@ func (f *Field) ClearBit(tx Tx, rowID, colID uint64) (changed bool, err error) {
 	}
 
 	// Clear non-time bit.
-	if v, err := view.clearBit(tx, rowID, colID); err != nil {
+	if v, err := view.clearBit(qcx, rowID, colID); err != nil {
 		return false, errors.Wrap(err, "clearing on view")
 	} else if v {
 		changed = changed || v
+		if changed && f.options.TrackExistence && f.options.Type == FieldTypeMutex {
+			// we also want to try to clear any existence bit
+			existView, ok := f.viewMap[viewExistence]
+			if ok {
+				_, err := existView.clearBit(qcx, 0, colID)
+				if err != nil {
+					return false, errors.Wrap(err, "clearing existence bit")
+				}
+			}
+		}
 	}
-	if len(f.viewMap) == 1 { // assuming no time views
+	// We used to check length of view map here. Now that we might
+	// have an existence view, that won't work.
+	if f.options.Type != FieldTypeTime { // assuming no time views
 		return changed, nil
 	}
 	lastViewNameSize := 0
@@ -1325,7 +1390,7 @@ func (f *Field) ClearBit(tx Tx, rowID, colID uint64) (changed bool, err error) {
 			level--
 		}
 		if level < skipAbove {
-			cleared, err := view.clearBit(tx, rowID, colID)
+			cleared, err := view.clearBit(qcx, rowID, colID)
 			changed = changed || cleared
 			if err != nil {
 				return changed, errors.Wrapf(err, "clearing on view %s", view.name)
@@ -1340,30 +1405,6 @@ func (f *Field) ClearBit(tx Tx, rowID, colID uint64) (changed bool, err error) {
 	}
 
 	return changed, nil
-}
-
-// ClearBits clears all bits corresponding to the given record IDs in standard
-// or BSI views. It does not delete bits from time quantum views.
-func (f *Field) ClearBits(tx Tx, shard uint64, recordIDs ...uint64) error {
-	bsig := f.bsiGroup(f.name)
-	var v *view
-	if bsig != nil {
-		// looks like we're a BSI field?
-		v = f.view(viewBSIGroupPrefix + f.name)
-	} else {
-		v = f.view(viewStandard)
-	}
-	// it's fine if we never actually created the view, that means the
-	// bits are all clear!
-	if v == nil {
-		return nil
-	}
-	frag := v.Fragment(shard)
-	if frag == nil {
-		return nil
-	}
-	_, err := frag.ClearRecords(tx, recordIDs)
-	return err
 }
 
 func groupCompare(a, b string, offset int) (lt, eq bool) {
@@ -1388,6 +1429,12 @@ func (f *Field) allTimeViewsSortedByQuantum() (me []*view) {
 			i++
 		}
 	}
+	// return the empty list if there weren't any. this could happen
+	// if we got called because this is a time field, but in fact
+	// no time views have been created.
+	if i == 0 {
+		return me[:0]
+	}
 	me = me[:i]
 	year := strings.Index(me[0].name, "_") + 4
 	month := year + 2
@@ -1409,13 +1456,13 @@ func (f *Field) allTimeViewsSortedByQuantum() (me []*view) {
 
 // StringValue reads an integer field value for a column, and converts
 // it to a string based on a foreign index string key.
-func (f *Field) StringValue(tx Tx, columnID uint64) (value string, exists bool, err error) {
+func (f *Field) StringValue(qcx *Qcx, columnID uint64) (value string, exists bool, err error) {
 	bsig := f.bsiGroup(f.name)
 	if bsig == nil {
 		return value, false, ErrBSIGroupNotFound
 	}
 
-	val, exists, err := f.Value(tx, columnID)
+	val, exists, err := f.Value(qcx, columnID)
 	if exists {
 		value, err = f.translateStore.TranslateID(uint64(val))
 	}
@@ -1423,7 +1470,7 @@ func (f *Field) StringValue(tx Tx, columnID uint64) (value string, exists bool, 
 }
 
 // Value reads a field value for a column.
-func (f *Field) Value(tx Tx, columnID uint64) (value int64, exists bool, err error) {
+func (f *Field) Value(qcx *Qcx, columnID uint64) (value int64, exists bool, err error) {
 	bsig := f.bsiGroup(f.name)
 	if bsig == nil {
 		return 0, false, ErrBSIGroupNotFound
@@ -1435,7 +1482,7 @@ func (f *Field) Value(tx Tx, columnID uint64) (value int64, exists bool, err err
 		return 0, false, nil
 	}
 
-	v, exists, err := view.value(tx, columnID, bsig.BitDepth)
+	v, exists, err := view.value(qcx, columnID, bsig.BitDepth)
 	if err != nil {
 		return 0, false, err
 	} else if !exists {
@@ -1445,7 +1492,7 @@ func (f *Field) Value(tx Tx, columnID uint64) (value int64, exists bool, err err
 }
 
 // SetValue sets a field value for a column.
-func (f *Field) SetValue(tx Tx, columnID uint64, value int64) (changed bool, err error) {
+func (f *Field) SetValue(qcx *Qcx, columnID uint64, value int64) (changed bool, err error) {
 	// Fetch bsiGroup & validate min/max.
 	bsig := f.bsiGroup(f.name)
 	if bsig == nil {
@@ -1493,11 +1540,11 @@ func (f *Field) SetValue(tx Tx, columnID uint64, value int64) (changed bool, err
 	}
 	view.holder.addIndex(view.idx)
 
-	return view.setValue(tx, columnID, bsig.BitDepth, baseValue)
+	return view.setValue(qcx, columnID, bsig.BitDepth, baseValue)
 }
 
 // ClearValue removes a field value for a column.
-func (f *Field) ClearValue(tx Tx, columnID uint64) (changed bool, err error) {
+func (f *Field) ClearValue(qcx *Qcx, columnID uint64) (changed bool, err error) {
 	bsig := f.bsiGroup(f.name)
 	if bsig == nil {
 		return false, ErrBSIGroupNotFound
@@ -1507,17 +1554,19 @@ func (f *Field) ClearValue(tx Tx, columnID uint64) (changed bool, err error) {
 	if view == nil {
 		return false, nil
 	}
-	value, exists, err := view.value(tx, columnID, bsig.BitDepth)
+	value, exists, err := view.value(qcx, columnID, bsig.BitDepth)
 	if err != nil {
 		return false, err
 	}
 	if exists {
-		return view.clearValue(tx, columnID, bsig.BitDepth, value)
+		return view.clearValue(qcx, columnID, bsig.BitDepth, value)
 	}
 	return false, nil
 }
 
-func (f *Field) MaxForShard(tx Tx, shard uint64, filter *Row) (ValCount, error) {
+func (f *Field) MaxForShard(qcx *Qcx, shard uint64, filter *Row) (ValCount, error) {
+	tx, finisher, err := qcx.GetTx(Txo{Write: false, Index: f.idx, Shard: shard})
+	defer finisher(&err)
 	bsig := f.bsiGroup(f.name)
 	if bsig == nil {
 		return ValCount{}, ErrBSIGroupNotFound
@@ -1533,26 +1582,21 @@ func (f *Field) MaxForShard(tx Tx, shard uint64, filter *Row) (ValCount, error) 
 		return ValCount{}, nil
 	}
 
-	var localTx Tx
-	if NilInside(tx) {
-		localTx = f.holder.txf.NewTx(Txo{Write: !writable, Index: f.idx, Fragment: fragment, Shard: fragment.shard})
-		defer localTx.Rollback()
-	} else {
-		localTx = tx
-	}
-
-	max, cnt, err := fragment.max(localTx, filter, bsig.BitDepth)
+	max, cnt, err := fragment.max(tx, filter, bsig.BitDepth)
 	if err != nil {
 		return ValCount{}, errors.Wrap(err, "calling fragment.max")
 	}
 
-	return f.valCountize(max, cnt, bsig)
+	v, err := f.valCountize(max, cnt, bsig)
+	return v, err
 }
 
 // MinForShard returns the minimum value which appears in this shard
 // (this field must be an Int or Decimal field). It also returns the
 // number of times the minimum value appears.
-func (f *Field) MinForShard(tx Tx, shard uint64, filter *Row) (ValCount, error) {
+func (f *Field) MinForShard(qcx *Qcx, shard uint64, filter *Row) (ValCount, error) {
+	tx, finisher, err := qcx.GetTx(Txo{Write: false, Index: f.idx, Shard: shard})
+	defer finisher(&err)
 	bsig := f.bsiGroup(f.name)
 	if bsig == nil {
 		return ValCount{}, ErrBSIGroupNotFound
@@ -1568,20 +1612,13 @@ func (f *Field) MinForShard(tx Tx, shard uint64, filter *Row) (ValCount, error) 
 		return ValCount{}, nil
 	}
 
-	var localTx Tx
-	if NilInside(tx) {
-		localTx = f.idx.holder.txf.NewTx(Txo{Write: !writable, Index: f.idx, Fragment: fragment, Shard: fragment.shard})
-		defer localTx.Rollback()
-	} else {
-		localTx = tx
-	}
-
-	min, cnt, err := fragment.min(localTx, filter, bsig.BitDepth)
+	min, cnt, err := fragment.min(tx, filter, bsig.BitDepth)
 	if err != nil {
 		return ValCount{}, errors.Wrap(err, "calling fragment.min")
 	}
 
-	return f.valCountize(min, cnt, bsig)
+	v, err := f.valCountize(min, cnt, bsig)
+	return v, err
 }
 
 // valCountize takes the "raw" value and count we get from the
@@ -1590,6 +1627,11 @@ func (f *Field) MinForShard(tx Tx, shard uint64, filter *Row) (ValCount, error) 
 // includes the int64 "Val\" value to make comparisons easier in the
 // executor (at time of writing, Percentile takes advantage of this,
 // but we might be able to simplify logic in other places as well).
+//
+// Note that the ValCount returned has bsig.Base included, or if
+// you specify a nil bsig, includes the field's bsig.Base. Which is
+// to say, don't use this if you have a value that's already been
+// adjusted by base.
 func (f *Field) valCountize(val int64, cnt uint64, bsig *bsiGroup) (ValCount, error) {
 	if bsig == nil {
 		bsig = f.bsiGroup(f.name)
@@ -1600,10 +1642,10 @@ func (f *Field) valCountize(val int64, cnt uint64, bsig *bsiGroup) (ValCount, er
 	}
 	valCount := ValCount{Count: int64(cnt)}
 
-	if f.Options().Type == FieldTypeDecimal {
+	if f.options.Type == FieldTypeDecimal {
 		dec := pql.NewDecimal(val+bsig.Base, bsig.Scale)
 		valCount.DecimalVal = &dec
-	} else if f.Options().Type == FieldTypeTimestamp {
+	} else if f.options.Type == FieldTypeTimestamp {
 		ts, err := ValToTimestamp(f.options.TimeUnit, val+bsig.Base)
 		if err != nil {
 			return ValCount{}, errors.Wrap(err, "translating value to timestamp")
@@ -1640,6 +1682,92 @@ func (f *Field) Range(qcx *Qcx, name string, op pql.Token, predicate int64) (*Ro
 	return view.rangeOp(qcx, op, bsig.BitDepth, baseValue)
 }
 
+// existenceViewName reports the field we should use row 0 of
+// for existence data. For a BSI field (integer, decimal,
+// timestamp) this is the single BSI group. For other fields,
+// it's viewExistence, which is probably "existence".
+func (f *Field) existenceViewName() string {
+	if len(f.bsiGroups) > 0 {
+		return f.bsiGroups[0].Name
+	}
+	return viewExistence
+}
+
+// MarkExisting sets a range of column IDs as existing. The columnIDs
+// are assumed to include the shard offset, but this will also work if
+// they are shard-relative, as it's just stripping the offset.
+//
+// Positions aren't the same as column IDs; this function takes advantage
+// of the fact that we're always doing row 0, so we don't have to think
+// hard about this. It doesn't overwrite its input because the column IDs
+// could be reused by other things.
+//
+// Note that this is subtly inefficient; if you're tracking existence for
+// a field, we're computing the same column ID set to write to the index's
+// existence field as we're using for the field's existence view. We don't
+// have a good way to coalesce those, yet. (Also, that's not accurate in
+// the ImportValue case, where we don't write to the existence view, etc.)
+func (f *Field) MarkExisting(tx Tx, columnIDs []uint64, shard uint64) error {
+	return f.markExistingInView(tx, columnIDs, f.existenceViewName(), shard)
+}
+
+// markExistingInView implements the internals of MarkExisting, but lets
+// you use a non-standard view. It's only interesting for the existence field.
+func (f *Field) markExistingInView(tx Tx, columnIDs []uint64, viewName string, shard uint64) error {
+	copyCols := make([]uint64, len(columnIDs))
+	for i := range columnIDs {
+		copyCols[i] = columnIDs[i] % ShardWidth
+	}
+	eView, err := f.createViewIfNotExists(viewName)
+	if err != nil {
+		return errors.Wrapf(err, "creating view %s", viewName)
+	}
+
+	eFrag, err := eView.CreateFragmentIfNotExists(shard)
+	if err != nil {
+		return errors.Wrap(err, "creating fragment")
+	}
+	return eFrag.importPositions(tx, copyCols, nil, map[uint64]struct{}{0: {}})
+}
+
+// MarkNotExisting is just like MarkExisting, except it is clearing bits,
+// so it doesn't have to create the view or fragment if it doesn't exist.
+// Because the bits reported to us in the case we wrote this for are likely
+// to be sorted by position in the fragment, not by column ID, we sort the
+// list after stripping the rows from the positions.
+func (f *Field) MarkNotExisting(tx Tx, columnIDs []uint64, shard uint64) error {
+	viewName := f.existenceViewName()
+	v := f.view(viewName)
+	if v == nil {
+		return nil
+	}
+	frag := v.Fragment(shard)
+	if frag == nil {
+		return nil
+	}
+	copyCols := make([]uint64, len(columnIDs))
+	for i := range columnIDs {
+		copyCols[i] = columnIDs[i] % ShardWidth
+	}
+	sort.Slice(copyCols, func(i, j int) bool { return copyCols[i] < copyCols[j] })
+	return frag.importPositions(tx, nil, copyCols, map[uint64]struct{}{0: {}})
+}
+
+// Existing returns the existence row for this field, which
+// comes from either the BSI view or the existence view.
+func (f *Field) Existing(tx Tx, shard uint64) (*Row, error) {
+	viewName := f.existenceViewName()
+	v := f.view(viewName)
+	if v == nil {
+		return nil, nil
+	}
+	frag := v.Fragment(shard)
+	if frag == nil {
+		return nil, nil
+	}
+	return frag.row(tx, bsiExistsBit)
+}
+
 // Import bulk imports data.
 func (f *Field) Import(qcx *Qcx, rowIDs, columnIDs []uint64, timestamps []int64, shard uint64, options *ImportOptions) (err0 error) {
 	// Determine quantum if timestamps are set.
@@ -1651,6 +1779,9 @@ func (f *Field) Import(qcx *Qcx, rowIDs, columnIDs []uint64, timestamps []int64,
 			return errors.New("import clear is not supported with timestamps")
 		}
 	} else {
+		if f.options.NoStandardView {
+			return errors.New("can't import data with no timestamps into a field with no standard view")
+		}
 		// short path: if we don't have any timestamps, we only need
 		// to write to exactly one view, which is always viewStandard,
 		// and *every* bit goes into that view, and we already verified that
@@ -1678,7 +1809,33 @@ func (f *Field) Import(qcx *Qcx, rowIDs, columnIDs []uint64, timestamps []int64,
 		if err != nil {
 			return errors.Wrap(err, "creating fragment")
 		}
-
+		if f.options.TrackExistence {
+			// if we're clearing a mutex, we do something fancy. otherwise,
+			// if we're not clearing, we mark the existence bits. either way,
+			// we then fall on out to the default behavior of importing the
+			// bits.
+			switch {
+			case options.Clear && fieldType == FieldTypeMutex:
+				// special fancy case; we have to try to clear the bits first, to
+				// find out WHICH bits we cleared, so we can mark those bits as
+				// null.
+				var changed []uint64
+				changed, err1 = frag.clearBitsReportingChanges(tx, rowIDs, columnIDs)
+				if err1 != nil {
+					return err1
+				}
+				err1 = f.MarkNotExisting(tx, changed, shard)
+				return err1
+			case !options.Clear:
+				err1 = f.MarkExisting(tx, columnIDs, shard)
+				if err1 != nil {
+					return err1
+				}
+			default:
+				// nothing to do. we'll fall on out of the TrackExistence
+				// case and go ahead and import those bits naively
+			}
+		}
 		err1 = frag.bulkImport(tx, rowIDs, columnIDs, options)
 		return err1
 	}
@@ -1762,6 +1919,16 @@ func (f *Field) Import(qcx *Qcx, rowIDs, columnIDs []uint64, timestamps []int64,
 		}
 
 		err1 = frag.bulkImport(tx, data.RowIDs, data.ColumnIDs, options)
+		if err1 != nil {
+			return err1
+		}
+	}
+	// If we are tracking existence, and don't have NoStandardView, we
+	// create the existence view.
+	if f.options.TrackExistence && !f.options.NoStandardView {
+		// this dance with err1 is so the finisher gets called with
+		// the right error value if we hit an error
+		err1 = f.MarkExisting(tx, columnIDs, shard)
 		if err1 != nil {
 			return err1
 		}
@@ -1999,6 +2166,7 @@ func (p fieldSlice) Less(i, j int) bool { return p[i].Name() < p[j].Name() }
 type FieldInfo struct {
 	Name        string       `json:"name"`
 	CreatedAt   int64        `json:"createdAt,omitempty"`
+	Owner       string       `json:"owner"`
 	Options     FieldOptions `json:"options"`
 	Cardinality *uint64      `json:"cardinality,omitempty"`
 	Views       []*ViewInfo  `json:"views,omitempty"`
@@ -2019,6 +2187,7 @@ type FieldOptions struct {
 	Scale          int64         `json:"scale,omitempty"`
 	Keys           bool          `json:"keys"`
 	NoStandardView bool          `json:"noStandardView,omitempty"`
+	TrackExistence bool          `json:"trackExistence,omitempty"`
 	CacheSize      uint32        `json:"cacheSize,omitempty"`
 	CacheType      string        `json:"cacheType,omitempty"`
 	Type           string        `json:"type,omitempty"`
@@ -2067,6 +2236,22 @@ func applyDefaultOptions(o *FieldOptions) FieldOptions {
 		o.CacheSize = DefaultCacheSize
 	}
 	return *o
+}
+
+// ActuallyTrackingExistence reflects the distinction between the
+// TrackExistence bool, which is enabled by default for most fields,
+// and whether we actually do existence tracking. Specifically,
+// we don't do existence tracking for time quantum fields which don't
+// have a standard view, or for BSI fields.
+func (o *FieldOptions) ActuallyTrackingExistence() bool {
+	switch o.Type {
+	case FieldTypeTime:
+		return o.TrackExistence && !o.NoStandardView
+	case FieldTypeInt, FieldTypeDecimal, FieldTypeTimestamp:
+		return false
+	default:
+		return o.TrackExistence
+	}
 }
 
 // MarshalJSON marshals FieldOptions to JSON such that
@@ -2341,7 +2526,7 @@ func (f *Field) persistView(ctx context.Context, cvm *CreateViewMessage) error {
 		return ErrViewRequired
 	}
 
-	return f.schemator.CreateView(ctx, cvm.Index, cvm.Field, cvm.View)
+	return f.holder.Schemator.CreateView(ctx, cvm.Index, cvm.Field, cvm.View)
 }
 
 // Timestamp field ranges.
@@ -2410,13 +2595,5 @@ func (f *Field) SortShardRow(tx Tx, shard uint64, filter *Row, sort_desc bool) (
 		return nil, errors.New("fragment is nil")
 	}
 
-	var localTx Tx
-	if NilInside(tx) {
-		localTx = f.holder.txf.NewTx(Txo{Write: !writable, Index: f.idx, Fragment: fragment, Shard: fragment.shard})
-		defer localTx.Rollback()
-	} else {
-		localTx = tx
-	}
-
-	return fragment.sortBsiData(localTx, filter, bsig.BitDepth, sort_desc)
+	return fragment.sortBsiData(tx, filter, bsig.BitDepth, sort_desc)
 }

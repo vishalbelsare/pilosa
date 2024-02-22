@@ -6,11 +6,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
-	"expvar"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"mime"
 	"net"
@@ -27,24 +28,35 @@ import (
 	"sync"
 	"time"
 
-	"github.com/felixge/fgprof"
-	"github.com/gorilla/handlers"
-	"github.com/gorilla/mux"
+	"github.com/apache/arrow/go/v10/arrow"
 	"github.com/featurebasedb/featurebase/v3/authn"
 	"github.com/featurebasedb/featurebase/v3/authz"
+	fbcontext "github.com/featurebasedb/featurebase/v3/context"
+	"github.com/featurebasedb/featurebase/v3/dax"
 	"github.com/featurebasedb/featurebase/v3/disco"
-	"github.com/featurebasedb/featurebase/v3/ingest"
 	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/featurebasedb/featurebase/v3/monitor"
 	"github.com/featurebasedb/featurebase/v3/pql"
 	"github.com/featurebasedb/featurebase/v3/rbf"
+	"github.com/featurebasedb/featurebase/v3/sql3/planner/types"
 	"github.com/featurebasedb/featurebase/v3/storage"
 	"github.com/featurebasedb/featurebase/v3/tracing"
+	"github.com/featurebasedb/featurebase/v3/wireprotocol"
+	"github.com/felixge/fgprof"
+	"github.com/gorilla/handlers"
+	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/prom2json"
+	uuid "github.com/satori/go.uuid"
 	"github.com/zeebo/blake3"
+)
+
+const (
+	// HeaderRequestUserID is request userid header
+	HeaderRequestUserID = "X-Request-Userid"
 )
 
 // Handler represents an HTTP handler.
@@ -212,8 +224,10 @@ func OptHandlerCloseTimeout(d time.Duration) handlerOption {
 	}
 }
 
-var makeImportOk sync.Once
-var importOk []byte
+var (
+	makeImportOk sync.Once
+	importOk     []byte
+)
 
 // NewHandler returns a new instance of Handler with a default logger.
 func NewHandler(opts ...handlerOption) (*Handler, error) {
@@ -292,7 +306,7 @@ func (h *Handler) populateValidators() {
 	h.validators["PostImport"] = queryValidationSpecRequired().Optional("clear", "ignoreKeyCheck")
 	h.validators["PostImportAtomicRecord"] = queryValidationSpecRequired().Optional("simPowerLossAfter")
 	h.validators["PostImportRoaring"] = queryValidationSpecRequired().Optional("remote", "clear")
-	h.validators["PostQuery"] = queryValidationSpecRequired().Optional("shards", "excludeColumns", "profile")
+	h.validators["PostQuery"] = queryValidationSpecRequired().Optional("shards", "excludeColumns", "profile", "remote")
 	h.validators["GetInfo"] = queryValidationSpecRequired()
 	h.validators["RecalculateCaches"] = queryValidationSpecRequired()
 	h.validators["GetSchema"] = queryValidationSpecRequired().Optional("views")
@@ -312,7 +326,7 @@ func (h *Handler) populateValidators() {
 	h.validators["GetTransaction"] = queryValidationSpecRequired()
 	h.validators["PostTransaction"] = queryValidationSpecRequired()
 	h.validators["PostFinishTransaction"] = queryValidationSpecRequired()
-
+	h.validators["DeleteDataframe"] = queryValidationSpecRequired()
 }
 
 type contextKeyQuery int
@@ -366,6 +380,7 @@ func (h *Handler) queryArgValidator(next http.Handler) http.Handler {
 func (h *Handler) extractTracing(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		span, ctx := tracing.GlobalTracer.ExtractHTTPHeaders(r)
+		span.LogKV("http.url", r.URL.String())
 		defer span.Finish()
 
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -378,8 +393,7 @@ func (h *Handler) collectStats(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		dur := time.Since(t)
 
-		statsTags := make([]string, 0, 5)
-
+		isSlow := "false"
 		longQueryTime := h.api.LongQueryTime()
 		if longQueryTime > 0 && dur > longQueryTime {
 			queryRequest := r.Context().Value(contextKeyQueryRequest)
@@ -390,31 +404,27 @@ func (h *Handler) collectStats(next http.Handler) http.Handler {
 			}
 
 			h.logger.Printf("HTTP query duration %v exceeds %v: %s %s %s", dur, longQueryTime, r.Method, r.URL.String(), queryString)
-			statsTags = append(statsTags, "slow:true")
-		} else {
-			statsTags = append(statsTags, "slow:false")
+			isSlow = "true"
 		}
 
+		where := ""
 		pathParts := strings.Split(r.URL.Path, "/")
 		if externalPrefixFlag[pathParts[1]] {
-			statsTags = append(statsTags, "where:external")
+			where = "external"
 		} else {
-			statsTags = append(statsTags, "where:internal")
+			where = "internal"
 		}
-
-		statsTags = append(statsTags, "useragent:"+r.UserAgent())
-
 		path, err := mux.CurrentRoute(r).GetPathTemplate()
-		if err == nil {
-			statsTags = append(statsTags, "path:"+path)
+		if err != nil {
+			path = ""
 		}
-
-		statsTags = append(statsTags, "method:"+r.Method)
-
-		stats := h.api.StatsWithTags(statsTags)
-		if stats != nil {
-			stats.Timing(MetricHTTPRequest, dur, 0.1)
-		}
+		SummaryHttpRequests.With(prometheus.Labels{
+			"method":    r.Method,
+			"path":      path,
+			"slow":      isSlow,
+			"useragent": r.UserAgent(),
+			"where":     where,
+		}).Observe(dur.Seconds())
 	})
 }
 
@@ -482,7 +492,6 @@ func newRouter(handler *Handler) http.Handler {
 	// TODO: figure out how to protect these if needed
 	router.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux).Methods("GET")
 	router.PathPrefix("/debug/fgprof").Handler(fgprof.Handler()).Methods("GET")
-	router.Handle("/debug/vars", expvar.Handler()).Methods("GET")
 	router.Handle("/metrics", promhttp.Handler())
 
 	router.HandleFunc("/metrics.json", handler.chkAuthZ(handler.handleGetMetricsJSON, authz.Admin)).Methods("GET").Name("GetMetricsJSON")
@@ -494,7 +503,10 @@ func newRouter(handler *Handler) http.Handler {
 	router.HandleFunc("/index/{index}", handler.chkAuthZ(handler.handleGetIndex, authz.Read)).Methods("GET").Name("GetIndex")
 	router.HandleFunc("/index/{index}", handler.chkAuthZ(handler.handlePostIndex, authz.Admin)).Methods("POST").Name("PostIndex")
 	router.HandleFunc("/index/{index}", handler.chkAuthZ(handler.handleDeleteIndex, authz.Admin)).Methods("DELETE").Name("DeleteIndex")
-	//router.HandleFunc("/index/{index}/field", handler.chkAuthZ(handler.handleGetFields, authz.Read)).Methods("GET") // Not implemented.
+	router.HandleFunc("/index/{index}/dataframe/{shard}", handler.chkAuthZ(handler.handlePostDataframe, authz.Write)).Methods("POST").Name("PostDataframe")
+	router.HandleFunc("/index/{index}/dataframe/{shard}", handler.chkAuthZ(handler.handleGetDataframe, authz.Read)).Methods("GET").Name("GetDataframe")
+	router.HandleFunc("/index/{index}/dataframe", handler.chkAuthZ(handler.handleGetDataframeSchema, authz.Read)).Methods("GET").Name("GetDataframeSchema")
+	router.HandleFunc("/index/{index}/dataframe", handler.chkAuthZ(handler.handleDeleteDataframe, authz.Write)).Methods("DELETE").Name("DeleteDataframe")
 	router.HandleFunc("/index/{index}/field", handler.chkAuthZ(handler.handlePostField, authz.Write)).Methods("POST").Name("PostField")
 	router.HandleFunc("/index/{index}/field/", handler.chkAuthZ(handler.handlePostField, authz.Write)).Methods("POST").Name("PostField")
 	router.HandleFunc("/index/{index}/field/{field}/view", handler.chkAuthZ(handler.handleGetView, authz.Admin)).Methods("GET")
@@ -520,6 +532,11 @@ func newRouter(handler *Handler) http.Handler {
 	router.HandleFunc("/transaction/{id}/finish", handler.chkAuthZ(handler.handlePostFinishTransaction, authz.Read)).Methods("POST").Name("PostFinishTransaction")
 	router.HandleFunc("/transactions", handler.chkAuthZ(handler.handleGetTransactions, authz.Read)).Methods("GET").Name("GetTransactions")
 	router.HandleFunc("/queries", handler.chkAuthZ(handler.handleGetActiveQueries, authz.Admin)).Methods("GET").Name("GetActiveQueries")
+
+	router.HandleFunc("/sql", handler.chkAuthZ(handler.handlePostSQL, authz.Admin)).Methods("POST").Name("PostSQL")
+	// internal endpoint
+	router.HandleFunc("/sql-exec-graph", handler.chkAuthZ(handler.handlePostSQLPlanOperator, authz.Admin)).Methods("POST").Name("PostSQLPlanOperator")
+
 	router.HandleFunc("/query-history", handler.chkAuthZ(handler.handleGetPastQueries, authz.Admin)).Methods("GET").Name("GetPastQueries")
 	router.HandleFunc("/version", handler.handleGetVersion).Methods("GET").Name("GetVersion")
 
@@ -553,10 +570,7 @@ func newRouter(handler *Handler) http.Handler {
 	router.HandleFunc("/internal/index/{index}/shards", handler.chkAuthZ(handler.handleGetIndexAvailableShards, authz.Read)).Methods("GET").Name("GetIndexAvailableShards")
 	router.HandleFunc("/internal/nodes", handler.chkAuthN(handler.handleGetNodes)).Methods("GET").Name("GetNodes")
 	router.HandleFunc("/internal/shards/max", handler.chkAuthN(handler.handleGetShardsMax)).Methods("GET").Name("GetShardsMax") // TODO: deprecate, but it's being used by the client
-	router.HandleFunc("/internal/ingest/{index}", handler.chkAuthZ(handler.handlePostIngestData, authz.Write)).Methods("POST").Name("PostIngestData")
-	router.HandleFunc("/internal/ingest/{index}/node", handler.chkAuthZ(handler.handlePostIngestNode, authz.Write)).Methods("POST").Name("PostIngestNode")
 
-	router.HandleFunc("/internal/schema", handler.chkAuthZ(handler.handleIngestSchema, authz.Admin)).Methods("POST").Name("PostIngestSchema")
 	router.HandleFunc("/internal/translate/index/{index}/keys/find", handler.chkAuthZ(handler.handleFindIndexKeys, authz.Admin)).Methods("POST").Name("FindIndexKeys")
 	router.HandleFunc("/internal/translate/index/{index}/keys/create", handler.chkAuthZ(handler.handleCreateIndexKeys, authz.Admin)).Methods("POST").Name("CreateIndexKeys")
 	router.HandleFunc("/internal/translate/index/{index}/{partition}", handler.chkAuthZ(handler.handlePostTranslateIndexDB, authz.Admin)).Methods("POST").Name("PostTranslateIndexDB")
@@ -572,6 +586,7 @@ func newRouter(handler *Handler) http.Handler {
 	router.HandleFunc("/internal/idalloc/data", handler.chkAuthN(handler.handleIDAllocData)).Methods("GET").Name("IDAllocData")
 
 	router.HandleFunc("/internal/restore/{index}/{shardID}", handler.chkAuthZ(handler.handlePostRestore, authz.Admin)).Methods("POST").Name("Restore")
+	router.HandleFunc("/internal/dataframe/restore/{index}/{shardID}", handler.chkAuthZ(handler.handlePostDataframeRestore, authz.Admin)).Methods("POST").Name("Restore")
 
 	router.HandleFunc("/internal/debug/rbf", handler.chkAuthZ(handler.handleGetInternalDebugRBFJSON, authz.Admin)).Methods("GET").Name("GetInternalDebugRBFJSON")
 
@@ -587,6 +602,13 @@ func newRouter(handler *Handler) http.Handler {
 	router.HandleFunc("/auth", handler.handleCheckAuthentication).Methods("GET").Name("CheckAuthentication")
 	router.HandleFunc("/userinfo", handler.handleUserInfo).Methods("GET").Name("UserInfo")
 	router.HandleFunc("/internal/oauth-config", handler.handleOAuthConfig).Methods("GET").Name("GetOAuthConfig")
+
+	router.HandleFunc("/health", handler.handleGetHealth).Methods("GET").Name("GetHealth")
+	router.HandleFunc("/directive", handler.handleGetDirective).Methods("GET").Name("GetDirective")
+	router.HandleFunc("/directive", handler.handlePostDirective).Methods("POST").Name("PostDirective")
+	router.HandleFunc("/snapshot/shard-data", handler.handlePostSnapshotShardData).Methods("POST").Name("PostShapshotShardData")
+	router.HandleFunc("/snapshot/table-keys", handler.handlePostSnapshotTableKeys).Methods("POST").Name("PostShapshotTableKeys")
+	router.HandleFunc("/snapshot/field-keys", handler.handlePostSnapshotFieldKeys).Methods("POST").Name("PostShapshotFieldKeys")
 
 	// Endpoints to support lattice UI embedded via statik.
 	// The messiness here reflects the fact that assets live in a nontrivial
@@ -663,7 +685,7 @@ func (h *Handler) chkAllowedNetworks(r *http.Request) (bool, context.Context) {
 	// if client IP is in allowed networks
 	// add it to the context for key X-Molecula-Original-IP
 	if h.auth.CheckAllowedNetworks(reqIP) {
-		ctx := context.WithValue(r.Context(), OriginalIPHeader, reqIP)
+		ctx := fbcontext.WithOriginalIP(r.Context(), reqIP)
 		return true, ctx
 	}
 	return false, r.Context()
@@ -672,38 +694,55 @@ func (h *Handler) chkAllowedNetworks(r *http.Request) (bool, context.Context) {
 func (h *Handler) chkAuthN(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		if h.auth != nil {
-			// if IP is in allowed networks, then serve the request
-			allowedNetwork, ctx := h.chkAllowedNetworks(r)
-			if allowedNetwork {
-				handler.ServeHTTP(w, r.WithContext(ctx))
-				return
-			}
 
-			access, refresh := getTokens(r)
-			uinfo, err := h.auth.Authenticate(access, refresh)
-			if err != nil {
-				http.Error(w, errors.Wrap(err, "authenticating").Error(), http.StatusUnauthorized)
-				return
-			}
-			// just in case it got refreshed
-			ctx = context.WithValue(ctx, authn.ContextValueAccessToken, "Bearer "+access)
-			ctx = context.WithValue(ctx, authn.ContextValueRefreshToken, refresh)
-			h.auth.SetCookie(w, uinfo.Token, uinfo.RefreshToken, uinfo.Expiry)
+		// if the request is unauthenticated and we have the appropriate header get the userid from the header
+		requestUserID := r.Header.Get(HeaderRequestUserID)
+		ctx = fbcontext.WithUserID(ctx, requestUserID)
+
+		if h.auth == nil {
+			handler.ServeHTTP(w, r.WithContext(ctx))
+			return
 		}
+
+		// if IP is in allowed networks, then serve the request
+		allowedNetwork, ctx := h.chkAllowedNetworks(r)
+		if allowedNetwork {
+			handler.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
+		access, refresh := getTokens(r)
+		uinfo, err := h.auth.Authenticate(access, refresh)
+		if err != nil {
+			http.Error(w, errors.Wrap(err, "authenticating").Error(), http.StatusUnauthorized)
+			return
+		}
+
+		// prefer the user id from an authenticated request over one in a header
+		ctx = fbcontext.WithUserID(ctx, uinfo.UserID)
+
+		// just in case it got refreshed
+		ctx = authn.WithAccessToken(ctx, "Bearer"+access)
+		ctx = authn.WithRefreshToken(ctx, refresh)
+		h.auth.SetCookie(w, uinfo.Token, uinfo.RefreshToken, uinfo.Expiry)
+
 		handler.ServeHTTP(w, r.WithContext(ctx))
 	}
 }
 
 func (h *Handler) chkAuthZ(handler http.HandlerFunc, perm authz.Permission) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// if auth isn't turned on, just serve the request
+		ctx := r.Context()
+
+		// if the request is unauthenticated and we have the appropriate header get the userid from the header
+		requestUserID := r.Header.Get(HeaderRequestUserID)
+		ctx = fbcontext.WithUserID(ctx, requestUserID)
+
+		// handle the case when auth is not turned on
 		if h.auth == nil {
-			handler.ServeHTTP(w, r)
+			handler.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
-
-		ctx := r.Context()
 
 		// check if IP is in allowed networks, if yes give it admin permissions
 		allowedNetwork, ctx := h.chkAllowedNetworks(r)
@@ -720,21 +759,24 @@ func (h *Handler) chkAuthZ(handler http.HandlerFunc, perm authz.Permission) http
 		access, refresh := getTokens(r)
 
 		uinfo, err := h.auth.Authenticate(access, refresh)
-
-		ctx = context.WithValue(ctx, authn.ContextValueAccessToken, "Bearer "+access)
-		ctx = context.WithValue(ctx, authn.ContextValueRefreshToken, refresh)
-
 		if err != nil {
 			http.Error(w, errors.Wrap(err, "authenticating").Error(), http.StatusForbidden)
 			return
 		}
+
+		// prefer the user id from an authenticated request over one in a header
+		ctx = fbcontext.WithUserID(ctx, uinfo.UserID)
+
+		ctx = authn.WithAccessToken(ctx, "Bearer "+access)
+		ctx = authn.WithRefreshToken(ctx, refresh)
+
 		// just in case it got refreshed
 		h.auth.SetCookie(w, uinfo.Token, uinfo.RefreshToken, uinfo.Expiry)
 
 		// put the user's authN/Z info in the context
-		ctx = context.WithValue(r.Context(), contextKeyGroupMembership, uinfo.Groups)
-		ctx = context.WithValue(ctx, authn.ContextValueAccessToken, "Bearer "+uinfo.Token)
-		ctx = context.WithValue(ctx, authn.ContextValueRefreshToken, uinfo.RefreshToken)
+		ctx = context.WithValue(ctx, contextKeyGroupMembership, uinfo.Groups)
+		ctx = authn.WithAccessToken(ctx, "Bearer "+uinfo.Token)
+		ctx = authn.WithRefreshToken(ctx, uinfo.RefreshToken)
 		// unlikely h.permissions will be nil, but we'll check to be safe
 		if h.permissions == nil {
 			h.logger.Errorf("authentication is turned on without authorization permissions set")
@@ -810,7 +852,6 @@ func (h *Handler) chkAuthZ(handler http.HandlerFunc, perm authz.Permission) http
 			}
 		}
 		handler.ServeHTTP(w, r.WithContext(ctx))
-
 	}
 }
 
@@ -822,7 +863,7 @@ func GetIP(r *http.Request) string {
 	}
 
 	// check if original IP is in the context
-	if ogIP, ok := r.Context().Value(OriginalIPHeader).(string); ok && ogIP != "" {
+	if ogIP, ok := fbcontext.OriginalIP(r.Context()); ok && ogIP != "" {
 		return ogIP
 	}
 
@@ -833,7 +874,6 @@ func GetIP(r *http.Request) string {
 	forwardedList := strings.Split(forwarded, ",")
 	if forwardedList[0] != "" {
 		return forwardedList[0]
-
 	}
 
 	return r.RemoteAddr
@@ -898,7 +938,7 @@ type successResponse struct {
 	Error     *HTTPError `json:"error,omitempty"`
 }
 
-// Error defines a standard application error.
+// HTTPError defines a standard application error.
 type HTTPError struct {
 	// Human-readable message.
 	Message string `json:"message"`
@@ -1218,7 +1258,6 @@ func (h *Handler) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleGetInfo(w http.ResponseWriter, r *http.Request) {
-
 	if !validHeaderAcceptJSON(r.Header) {
 		http.Error(w, "JSON only acceptable response", http.StatusNotAcceptable)
 		return
@@ -1330,8 +1369,259 @@ func (h *Handler) handlePostQuery(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Handler) handleCPUProfileStart(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) writeBadRequest(w http.ResponseWriter, r *http.Request, err error) {
+	w.WriteHeader(http.StatusBadRequest)
+	e := h.writeQueryResponse(w, r, &QueryResponse{Err: err})
+	if e != nil {
+		h.logger.Errorf("write query response error: %v (while trying to write another error: %v)", e, err)
+	}
+}
 
+// handlePostSQLOperator handles an internal sql3 plan operator execution request
+// these requests come from other nodes in the cluster
+// handlePostSQLOperator will 'rehydrate' a plan operator and return data in the
+// featurebase wire format for effciency
+// we do not track these requests as user requests
+// TODO(pok) - thus is there anything we need here to align with how we do this for other nodes
+func (h *Handler) handlePostSQLPlanOperator(w http.ResponseWriter, r *http.Request) {
+	writeError := func(err error) {
+		if err != nil {
+			w.Write(wireprotocol.WriteError(err))
+		}
+	}
+
+	// always finish with a done message
+	defer w.Write(wireprotocol.WriteDone())
+
+	ctx := r.Context()
+
+	rootOperator, err := h.api.RehydratePlanOperator(ctx, r.Body)
+	if err != nil {
+		writeError(err)
+		return
+	}
+
+	// get a query iterator.
+	iter, err := rootOperator.Iterator(ctx, nil)
+	if err != nil {
+		writeError(err)
+		return
+	}
+	// read schema & write to response.
+	columns := rootOperator.Schema()
+	b, err := wireprotocol.WriteSchema(columns)
+	if err != nil {
+		writeError(err)
+		return
+	}
+	w.Write(b)
+
+	var rowErr error
+	var currentRow types.Row
+	var nextErr error
+
+	for currentRow, nextErr = iter.Next(ctx); nextErr == nil; currentRow, nextErr = iter.Next(ctx) {
+		b, err := wireprotocol.WriteRow(currentRow, columns)
+		if err != nil {
+			rowErr = err
+			break
+		}
+		w.Write(b)
+	}
+	if nextErr != nil && nextErr != types.ErrNoMoreRows {
+		rowErr = nextErr
+	}
+	writeError(rowErr)
+}
+
+// handlePostSQL handles /sql requests
+// supports a ?plan=true|false parameter to send back the plan in the
+// query response
+func (h *Handler) handlePostSQL(w http.ResponseWriter, r *http.Request) {
+	includePlan := false
+	includePlanValue := r.URL.Query().Get("plan")
+	if len(includePlanValue) > 0 {
+		var err error
+		includePlan, err = strconv.ParseBool(includePlanValue)
+		if err != nil {
+			h.writeBadRequest(w, r, err)
+			return
+		}
+	}
+
+	// get the body
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.writeBadRequest(w, r, err)
+		return
+	}
+
+	requestID, err := uuid.NewV4()
+	if err != nil {
+		h.writeBadRequest(w, r, err)
+	}
+	// put the requestId in the context
+	ctx := fbcontext.WithRequestID(r.Context(), requestID.String())
+
+	// update the counter for requests
+	PerfCounterSQLRequestSec.Add(1)
+
+	// Write response back to client.
+	w.Header().Set("Content-Type", "application/json")
+
+	// the pandas data frame format in json
+
+	// Opening bracket.
+	w.Write([]byte("{"))
+
+	// Write the closing bracket on any exit from this method.
+	defer func() {
+		var execTime int64
+		// we are going to make best effort here - don't actually care about the error
+		// if there was an error, the request.ElapsedTime will be zero
+		request, _ := h.api.server.SystemLayer.ExecutionRequests().GetRequest(requestID.String())
+		execTime = request.ElapsedTime.Microseconds()
+
+		var value []byte
+		value, err = json.Marshal(execTime)
+		if err != nil {
+			w.Write([]byte(`,"execution-time": 0`))
+		} else {
+			w.Write([]byte(`,"execution-time":`))
+			w.Write(value)
+		}
+		w.Write([]byte("}"))
+	}()
+
+	// writeError is a helper function that can be called anywhere during the
+	// output handling to insert an error into the json output.
+	writeError := func(err error, withComma bool) {
+		if err != nil {
+			errMsg, err := json.Marshal(err.Error())
+			if err != nil {
+				errMsg = []byte(`"PROBLEM ENCODING ERROR MESSAGE"`)
+			}
+			if withComma {
+				w.Write([]byte(`,"error":`))
+			} else {
+				w.Write([]byte(`"error":`))
+			}
+			w.Write(errMsg)
+		}
+	}
+
+	// writeWarnings is a helper function that can be called anywhere during the
+	// output handling to insert warnings into the json output.
+	writeWarnings := func(warnings []string) {
+		if len(warnings) > 0 {
+			w.Write([]byte(`,"warnings": [`))
+			for i, warn := range warnings {
+				warnMsg, err := json.Marshal(warn)
+				if err != nil {
+					warnMsg = []byte(`"PROBLEM ENCODING WARNING"`)
+				}
+				w.Write(warnMsg)
+				if i < len(warnings)-1 {
+					w.Write([]byte(`,`))
+				}
+			}
+			w.Write([]byte(`]`))
+		}
+	}
+
+	writePlan := func(plan map[string]interface{}) {
+		if plan != nil && includePlan {
+			planBytes, err := json.Marshal(plan)
+			if err != nil {
+				planBytes = []byte(`"PROBLEM ENCODING QUERY PLAN"`)
+			}
+			w.Write([]byte(`,"query-plan":`))
+			w.Write(planBytes)
+		}
+	}
+
+	sql := string(b)
+	rootOperator, err := h.api.CompilePlan(ctx, sql)
+	if err != nil {
+		writeError(err, false)
+		return
+	}
+
+	// Get a query iterator.
+	iter, err := rootOperator.Iterator(ctx, nil)
+	if err != nil {
+		writeError(err, false)
+		writeWarnings(rootOperator.Warnings())
+		return
+	}
+
+	// Read schema & write to response.
+	columns := rootOperator.Schema()
+	schema := WireQuerySchema{
+		Fields: make([]*WireQueryField, len(columns)),
+	}
+	for i, col := range columns {
+		btype, err := dax.BaseTypeFromString(col.Type.BaseTypeName())
+		if err != nil {
+			writeError(err, false)
+			writeWarnings(rootOperator.Warnings())
+			return
+		}
+		schema.Fields[i] = &WireQueryField{
+			Name:     dax.FieldName(col.ColumnName),
+			Type:     col.Type.TypeDescription(),
+			BaseType: btype,
+			TypeInfo: col.Type.TypeInfo(),
+		}
+	}
+	w.Write([]byte(`"schema":`))
+	jsonSchema, err := json.Marshal(schema)
+	if err != nil {
+		h.logger.Errorf("write schema response error: %s", err)
+		// Provide an empty list as the schema value to maintain valid json.
+		w.Write([]byte("[]"))
+		writeError(err, false)
+		writeWarnings(rootOperator.Warnings())
+		return
+	}
+	w.Write(jsonSchema)
+
+	// Write the data (rows).
+	w.Write([]byte(`,"data":[`))
+
+	var rowErr error
+	var currentRow types.Row
+	var nextErr error
+
+	rowCounter := 1
+	for currentRow, nextErr = iter.Next(ctx); nextErr == nil; currentRow, nextErr = iter.Next(ctx) {
+		jsonRow, err := json.Marshal(currentRow)
+		if err != nil {
+			h.logger.Errorf("json encoding error: %s", err)
+			rowErr = err
+			break
+		}
+
+		if rowCounter > 1 {
+			// Include a comma between data rows.
+			w.Write([]byte(","))
+		}
+		w.Write(jsonRow)
+
+		rowCounter++
+	}
+	if nextErr != nil && nextErr != types.ErrNoMoreRows {
+		rowErr = nextErr
+	}
+
+	w.Write([]byte("]"))
+
+	writeError(rowErr, true)
+	writeWarnings(rootOperator.Warnings())
+	writePlan(rootOperator.Plan())
+}
+
+func (h *Handler) handleCPUProfileStart(w http.ResponseWriter, r *http.Request) {
 	if h.pprofCPUProfileBuffer == nil {
 		h.pprofCPUProfileBuffer = bytes.NewBuffer(nil)
 	} else {
@@ -1348,7 +1638,6 @@ func (h *Handler) handleCPUProfileStart(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handler) handleCPUProfileStop(w http.ResponseWriter, r *http.Request) {
-
 	if h.pprofCPUProfileBuffer == nil {
 		http.Error(w, "no cpu profile in progress", http.StatusBadRequest)
 		return
@@ -1363,7 +1652,7 @@ func (h *Handler) handleCPUProfileStop(w http.ResponseWriter, r *http.Request) {
 	// Date: Tue, 03 Nov 2020 18:31:36 GMT
 	// Content-Length: 939
 
-	//Send the headers
+	// Send the headers
 	by := h.pprofCPUProfileBuffer.Bytes()
 	w.Header().Set("Content-Disposition", "attachment; filename=\"profile\"")
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -1512,12 +1801,11 @@ type postIndexRequest struct {
 	Options IndexOptions `json:"options"`
 }
 
-//_postIndexRequest is necessary to avoid recursion while decoding.
+// _postIndexRequest is necessary to avoid recursion while decoding.
 type _postIndexRequest postIndexRequest
 
 // Custom Unmarshal JSON to validate request body when creating a new index.
 func (p *postIndexRequest) UnmarshalJSON(b []byte) error {
-
 	// m is an overflow map used to capture additional, unexpected keys.
 	m := make(map[string]interface{})
 	if err := json.Unmarshal(b, &m); err != nil {
@@ -1532,6 +1820,7 @@ func (p *postIndexRequest) UnmarshalJSON(b []byte) error {
 	// Unmarshal expected values.
 	_p := _postIndexRequest{
 		Options: IndexOptions{
+			Description:    "",
 			Keys:           false,
 			TrackExistence: true,
 		},
@@ -1617,6 +1906,7 @@ func (h *Handler) handlePostIndex(w http.ResponseWriter, r *http.Request) {
 	// Decode request.
 	req := postIndexRequest{
 		Options: IndexOptions{
+			Description:    "",
 			Keys:           false,
 			TrackExistence: true,
 		},
@@ -1702,7 +1992,6 @@ func (h *Handler) handleGetPastQueries(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(queries); err != nil {
 		h.logger.Errorf("encoding GetActiveQueries response: %s", err)
 	}
-
 }
 
 func fieldOptionsToFunctionalOpts(opt fieldOptions) []FieldOption {
@@ -1881,174 +2170,6 @@ func (h *Handler) handlePatchField(w http.ResponseWriter, r *http.Request) {
 
 	err = h.api.UpdateField(r.Context(), indexName, fieldName, req)
 	resp.write(w, err)
-}
-
-// handlePostIngestData handles JSON ingest data that may need key
-// translation, for the entire cluster.
-func (h *Handler) handlePostIngestData(w http.ResponseWriter, r *http.Request) {
-	if !validHeaderAcceptJSON(r.Header) {
-		http.Error(w, "JSON only acceptable response", http.StatusNotAcceptable)
-		return
-	}
-
-	indexName, ok := mux.Vars(r)["index"]
-	if !ok {
-		http.Error(w, "index name is required", http.StatusBadRequest)
-		return
-	}
-
-	qcx := h.api.Txf().NewQcx()
-	err := h.api.IngestOperations(r.Context(), qcx, indexName, r.Body)
-	if err != nil {
-		qcx.Abort()
-		switch e := err.(type) {
-		case RedirectError:
-			http.Redirect(w, r, e.HostPort+r.URL.Path, http.StatusPermanentRedirect)
-			return
-		}
-	}
-	err = qcx.Finish()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("ingesting: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	resp := successResponse{h: h, Name: indexName}
-	resp.write(w, err)
-}
-
-type ingestSpec struct {
-	IndexName      string      `json:"index-name"`
-	IndexAction    string      `json:"index-action"`
-	FieldAction    string      `json:"field-action"`
-	PrimaryKeyType string      `json:"primary-key-type"`
-	Fields         []fieldSpec `json:"fields"`
-}
-
-type fieldSpec struct {
-	FieldName    string          `json:"field-name"`
-	FieldType    string          `json:"field-type"`
-	FieldOptions fieldOptionSpec `json:"field-options"`
-}
-
-type fieldOptionSpec struct {
-	EnforceMutualExclusion bool       `json:"enforce-mutual-exclusion"`
-	CacheType              *string    `json:"cache-type"`
-	CacheSize              *uint32    `json:"cache-size"`
-	Scale                  *int64     `json:"scale"`
-	Epoch                  *time.Time `json:"epoch"`
-	Unit                   *string    `json:"unit"`
-	TimeQuantum            *string    `json:"time-quantum"`
-	TTL                    *string    `json:"ttl"`
-}
-
-func fieldSpecToFieldOption(fSpec fieldSpec) fieldOptions {
-	opt := fieldOptions{}
-	// map fSpec type name to pilosa type name
-
-	// a string field could be a string set, mutex or time quantum
-	if fSpec.FieldOptions.TimeQuantum != nil {
-		opt.Type = "time"
-	} else if fSpec.FieldOptions.EnforceMutualExclusion {
-		opt.Type = "mutex"
-	} else {
-		opt.Type = "set"
-	}
-
-	// for other field types, there's a one-to-one mapping
-	if fSpec.FieldType != "string" && fSpec.FieldType != "id" {
-		opt.Type = fSpec.FieldType
-	}
-
-	if fSpec.FieldType == "string" {
-		var keys bool = true
-		opt.Keys = &keys
-	}
-	opt.CacheType = fSpec.FieldOptions.CacheType
-	opt.CacheSize = fSpec.FieldOptions.CacheSize
-	opt.Scale = fSpec.FieldOptions.Scale
-	opt.Epoch = fSpec.FieldOptions.Epoch
-	opt.TimeUnit = fSpec.FieldOptions.Unit
-	if fSpec.FieldOptions.TimeQuantum != nil {
-		timeQuantumVal := TimeQuantum(*fSpec.FieldOptions.TimeQuantum)
-		opt.TimeQuantum = &timeQuantumVal
-	}
-	opt.TTL = fSpec.FieldOptions.TTL
-
-	return opt
-}
-
-func (h *Handler) handleIngestSchema(w http.ResponseWriter, r *http.Request) {
-	if !validHeaderAcceptJSON(r.Header) {
-		http.Error(w, "JSON only acceptable response", http.StatusNotAcceptable)
-		return
-	}
-
-	resp := successResponse{h: h}
-
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	schema := ingestSpec{}
-	// if a key in cleanupIndexes points to a 0-length slice, the
-	// entire index should be cleaned; otherwise, only the named
-	// fields within that index should be cleaned.
-	cleanupIndexes := map[string][]string{}
-	var schemaErr error
-	defer func() {
-		// we set schemaErr in any case where we need to do cleanup
-		if schemaErr != nil {
-			for index, fields := range cleanupIndexes {
-				if len(fields) == 0 {
-					err := h.api.DeleteIndex(r.Context(), index)
-					if err != nil {
-						h.logger.Printf("deleting index %q after schema err: %v", index, err)
-					}
-				} else {
-					for _, field := range fields {
-						err := h.api.DeleteField(r.Context(), index, field)
-						if err != nil {
-							h.logger.Printf("deleting field %q from index %q after schema err: %v", field, index, err)
-						}
-					}
-				}
-			}
-		}
-	}()
-	for dec.More() {
-		err := dec.Decode(&schema)
-		if err != nil {
-			resp.write(w, err)
-			return
-		}
-		index, fields, err := h.api.ApplyOneIngestSchema(r.Context(), &schema)
-		if err != nil {
-			switch e := err.(type) {
-			case RedirectError:
-				http.Redirect(w, r, e.HostPort+r.URL.Path, http.StatusPermanentRedirect)
-				return
-			default:
-				// if a previous schema created things, clean them up...
-				schemaErr = err
-				resp.write(w, err)
-				return
-			}
-		}
-		// we only have one slot to report these, sorry.
-		resp.Name = index.Name()
-		resp.CreatedAt = index.CreatedAt()
-		cleanupIndexes[index.Name()] = fields
-	}
-	// if we got here, we have a cleanupIndexes which we want to return,
-	// so we want to do that *instead* of the successResponse we'd be
-	// using otherwise (ironically, to indicate an error)
-	var mapBody []byte
-	var err error
-	if mapBody, err = json.Marshal(cleanupIndexes); err != nil {
-		resp.write(w, err)
-	}
-	if _, err = w.Write(mapBody); err != nil {
-		h.logger.Printf("error trying to write response: %v", err)
-	}
 }
 
 type postFieldRequest struct {
@@ -2295,7 +2416,6 @@ func (h *Handler) doTransactionResponse(w http.ResponseWriter, err error, trns *
 	if err != nil {
 		h.logger.Errorf("encoding transaction response: %v", err)
 	}
-
 }
 
 func (h *Handler) handleGetTransaction(w http.ResponseWriter, r *http.Request) {
@@ -2373,7 +2493,7 @@ func (h *Handler) handleGetIndexShardSnapshot(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	rc, err := h.api.IndexShardSnapshot(r.Context(), indexName, shard)
+	rc, err := h.api.IndexShardSnapshot(r.Context(), indexName, shard, false)
 	if err != nil {
 		switch errors.Cause(err) {
 		case ErrIndexNotFound:
@@ -2445,6 +2565,8 @@ func (h *Handler) readURLQueryRequest(r *http.Request) (*QueryRequest, error) {
 		return nil, errors.New("invalid shard argument")
 	}
 
+	remote := parseBool(q.Get("remote"))
+
 	// Optional profiling
 	profile := false
 	profileString := q.Get("profile")
@@ -2457,9 +2579,14 @@ func (h *Handler) readURLQueryRequest(r *http.Request) (*QueryRequest, error) {
 
 	return &QueryRequest{
 		Query:   query,
+		Remote:  remote,
 		Shards:  shards,
 		Profile: profile,
 	}, nil
+}
+
+func parseBool(a string) bool {
+	return strings.ToLower(a) == "true"
 }
 
 // writeQueryResponse writes the response from the executor to w.
@@ -2668,62 +2795,12 @@ func (h *Handler) handleGetNodes(w http.ResponseWriter, r *http.Request) {
 
 // handleGetFragmentBlockData handles GET /internal/fragment/block/data requests.
 func (h *Handler) handleGetFragmentBlockData(w http.ResponseWriter, r *http.Request) {
-	buf, err := h.api.FragmentBlockData(r.Context(), r.Body)
-	if err != nil {
-		if _, ok := err.(BadRequestError); ok {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-		} else if errors.Cause(err) == ErrFragmentNotFound {
-			http.Error(w, err.Error(), http.StatusNotFound)
-		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-		return
-	}
-
-	// Write response.
-	w.Header().Set("Content-Type", "application/protobuf")
-	w.Header().Set("Content-Length", strconv.Itoa(len(buf)))
-	_, err = w.Write(buf)
-	if err != nil {
-		h.logger.Errorf("writing fragment/block/data response: %v", err)
-	}
+	http.Error(w, "fragment blocks feature removed", http.StatusNotFound)
 }
 
 // handleGetFragmentBlocks handles GET /internal/fragment/blocks requests.
 func (h *Handler) handleGetFragmentBlocks(w http.ResponseWriter, r *http.Request) {
-	if !validHeaderAcceptJSON(r.Header) {
-		http.Error(w, "JSON only acceptable response", http.StatusNotAcceptable)
-		return
-	}
-	// Read shard parameter.
-	q := r.URL.Query()
-	shard, err := strconv.ParseUint(q.Get("shard"), 10, 64)
-	if err != nil {
-		http.Error(w, "shard required", http.StatusBadRequest)
-		return
-	}
-
-	blocks, err := h.api.FragmentBlocks(r.Context(), q.Get("index"), q.Get("field"), q.Get("view"), shard)
-	if err != nil {
-		if errors.Cause(err) == ErrFragmentNotFound {
-			http.Error(w, err.Error(), http.StatusNotFound)
-		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-		return
-	}
-
-	// Encode response.
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(getFragmentBlocksResponse{
-		Blocks: blocks,
-	}); err != nil {
-		h.logger.Errorf("block response encoding error: %s", err)
-	}
-}
-
-type getFragmentBlocksResponse struct {
-	Blocks []FragmentBlock `json:"blocks"`
+	http.Error(w, "fragment blocks feature removed", http.StatusNotFound)
 }
 
 // handleGetFragmentData handles GET /internal/fragment/data requests.
@@ -2759,8 +2836,15 @@ func (h *Handler) handleGetTranslateData(w http.ResponseWriter, r *http.Request)
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
+		tx, err := p.Begin(false)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer tx.Rollback()
+
 		// Stream translate data to response body.
-		if _, err := p.WriteTo(w); err != nil {
+		if _, err := tx.WriteTo(w); err != nil {
 			h.logger.Errorf("error streaming translation data: %s", err)
 		}
 		return
@@ -2785,8 +2869,14 @@ func (h *Handler) handleGetTranslateData(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	tx, err := p.Begin(false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
 	// Stream translate partition to response body.
-	if _, err := p.WriteTo(w); err != nil {
+	if _, err := tx.WriteTo(w); err != nil {
 		h.logger.Errorf("error streaming translation data: %s", err)
 	}
 }
@@ -2817,8 +2907,9 @@ const (
 
 // parseUint64Slice returns a slice of uint64s from a comma-delimited string.
 func parseUint64Slice(s string) ([]uint64, error) {
-	var a []uint64
-	for _, str := range strings.Split(s, ",") {
+	ss := strings.Split(s, ",")
+	a := make([]uint64, 0, len(ss))
+	for _, str := range ss {
 		// Ignore blanks.
 		if str == "" {
 			continue
@@ -2997,7 +3088,6 @@ func GetHTTPClient(t *tls.Config, opts ...ClientOption) *http.Client {
 
 // handlePostImportAtomicRecord handles /import-atomic-record requests
 func (h *Handler) handlePostImportAtomicRecord(w http.ResponseWriter, r *http.Request) {
-
 	// Verify that request is only communicating over protobufs.
 	if error, code := validateProtobufHeader(r); error != "" {
 		http.Error(w, error, code)
@@ -3266,7 +3356,7 @@ func (h *Handler) handlePostImportRoaring(w http.ResponseWriter, r *http.Request
 	ctx := r.Context()
 
 	// Read entire body.
-	span, _ := tracing.StartSpanFromContext(ctx, "ioutil.ReadAll-Body")
+	span, _ := tracing.StartSpanFromContext(ctx, "io.ReadAll-Body")
 	body, err := readBody(r)
 	span.LogKV("bodySize", len(body))
 	span.Finish()
@@ -3339,7 +3429,7 @@ func (h *Handler) handlePostShardImportRoaring(w http.ResponseWriter, r *http.Re
 	ctx := r.Context()
 
 	// Read entire body.
-	span, _ := tracing.StartSpanFromContext(ctx, "ioutil.ReadAll-Body")
+	span, _ := tracing.StartSpanFromContext(ctx, "io.ReadAll-Body")
 	body, err := readBody(r)
 	span.LogKV("bodySize", len(body))
 	span.Finish()
@@ -3393,52 +3483,6 @@ func (h *Handler) handlePostShardImportRoaring(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		h.logger.Errorf("writing shard-import-roaring response: %v", err)
 		return
-	}
-}
-
-// handlePostIngestNode is the internal endpoint taking already-translated
-// ingest operations, sorted by shard, for a single node.
-func (h *Handler) handlePostIngestNode(w http.ResponseWriter, r *http.Request) {
-	// Verify that request is only communicating over protobufs.
-	if error, code := validateProtobufHeader(r); error != "" {
-		http.Error(w, error, code)
-		return
-	}
-
-	ctx := r.Context()
-
-	// Read entire body.
-	span, _ := tracing.StartSpanFromContext(ctx, "ioutil.ReadAll-Body")
-	body, err := readBody(r)
-	span.LogKV("bodySize", len(body))
-	span.Finish()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	req := &ingest.ShardedRequest{}
-	span, _ = tracing.StartSpanFromContext(ctx, "Unmarshal")
-	err = h.serializer.Unmarshal(body, req)
-	span.Finish()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	urlVars := mux.Vars(r)
-	indexName := urlVars["index"]
-
-	qcx := h.api.Txf().NewQcx()
-	err = h.api.IngestNodeOperations(r.Context(), qcx, indexName, req)
-	if err == nil {
-		err = qcx.Finish()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("ingesting: %v", err), http.StatusInternalServerError)
-		}
-	} else {
-		http.Error(w, fmt.Sprintf("ingesting: %v", err), http.StatusInternalServerError)
-		qcx.Abort()
 	}
 }
 
@@ -3613,7 +3657,6 @@ func (h *Handler) handleFindOrCreateKeys(w http.ResponseWriter, r *http.Request,
 		translations, err = h.api.CreateIndexKeys(r.Context(), indexName, keys...)
 	case !requireField && !create:
 		translations, err = h.api.FindIndexKeys(r.Context(), indexName, keys...)
-
 	}
 	if err != nil {
 		http.Error(w, fmt.Sprintf("translating keys: %v", err), http.StatusInternalServerError)
@@ -3710,16 +3753,16 @@ func (h *Handler) handleReserveIDs(w http.ResponseWriter, r *http.Request) {
 
 	ids, err := h.api.ReserveIDs(req.Key, req.Session, req.Offset, req.Count)
 	if err != nil {
-		var esync ErrIDOffsetDesync
+		var esync IDOffsetDesyncError
 		if errors.As(err, &esync) {
 			w.Header().Add("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			err = json.NewEncoder(w).Encode(struct {
-				ErrIDOffsetDesync
+				IDOffsetDesyncError
 				Err string `json:"error"`
 			}{
-				ErrIDOffsetDesync: esync,
-				Err:               err.Error(),
+				IDOffsetDesyncError: esync,
+				Err:                 err.Error(),
 			})
 			if err != nil {
 				h.logger.Debugf("failed to send desync error: %v", err)
@@ -3808,6 +3851,7 @@ func (h *Handler) handleRestoreIDAlloc(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK")) //nolint:errcheck
 }
+
 func (h *Handler) handlePostRestore(w http.ResponseWriter, r *http.Request) {
 	indexName, ok := mux.Vars(r)["index"]
 	if !ok {
@@ -3825,10 +3869,66 @@ func (h *Handler) handlePostRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := context.Background()
-	//validate shard for this node
+	// validate shard for this node
 	err = h.api.RestoreShard(ctx, indexName, shard, r.Body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to restore shard %v %v err:%v", indexName, shard, err), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Add("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK")) //nolint:errcheck
+}
+
+// handleDeleteDataframe handles DELETE /index/dataframe request.
+func (h *Handler) handleDeleteDataframe(w http.ResponseWriter, r *http.Request) {
+	if !h.api.server.dataframeEnabled {
+		http.Error(w, "Dataframe is disabled", http.StatusBadRequest)
+		return
+	}
+	if !validHeaderAcceptJSON(r.Header) {
+		http.Error(w, "JSON only acceptable response", http.StatusNotAcceptable)
+		return
+	}
+
+	indexName := mux.Vars(r)["index"]
+
+	resp := successResponse{h: h}
+	err := h.api.DeleteDataframe(r.Context(), indexName)
+	resp.write(w, err)
+}
+
+func (h *Handler) handlePostDataframeRestore(w http.ResponseWriter, r *http.Request) {
+	indexName, ok := mux.Vars(r)["index"]
+	if !ok {
+		http.Error(w, "index name is required", http.StatusBadRequest)
+		return
+	}
+	shardID, ok := mux.Vars(r)["shardID"]
+	if !ok {
+		http.Error(w, "shardID is required", http.StatusBadRequest)
+		return
+	}
+	shard, err := strconv.ParseUint(shardID, 10, 64)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to parse shard %v %v err:%v", indexName, shardID, err), http.StatusBadRequest)
+		return
+	}
+	idx, err := h.api.Index(r.Context(), indexName)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Index %s Not Found", indexName), http.StatusNotFound)
+		return
+	}
+	filename := idx.GetDataFramePath(shard) + h.api.server.executor.TableExtension()
+	dest, err := os.Create(filename)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to create restore dataframe shard %v %v err:%v", indexName, shard, err), http.StatusBadRequest)
+		return
+	}
+	_, err = io.Copy(dest, r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to copy restore dataframe shard %v %v err:%v", indexName, shard, err), http.StatusBadRequest)
 		return
 	}
 
@@ -3964,4 +4064,247 @@ func getTokens(r *http.Request) (string, string) {
 	}
 
 	return access, refresh
+}
+
+func (h *Handler) handleGetDirective(w http.ResponseWriter, r *http.Request) {
+	if !validHeaderAcceptJSON(r.Header) {
+		http.Error(w, "JSON only acceptable response", http.StatusNotAcceptable)
+		return
+	}
+
+	applied, err := h.api.DirectiveApplied(r.Context())
+	if err != nil {
+		http.Error(w, "getting directive applied error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp := struct {
+		Applied bool `json:"applied"`
+	}{
+		Applied: applied,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		h.logger.Errorf("write status response error: %s", err)
+	}
+}
+
+func (h *Handler) handlePostDirective(w http.ResponseWriter, r *http.Request) {
+	if !validHeaderAcceptJSON(r.Header) {
+		http.Error(w, "JSON only acceptable response", http.StatusNotAcceptable)
+		return
+	}
+
+	body := r.Body
+	defer body.Close()
+
+	d := &dax.Directive{}
+	if err := json.NewDecoder(body).Decode(d); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := h.api.Directive(r.Context(), d); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// POST /snapshot/shard-data
+func (h *Handler) handlePostSnapshotShardData(w http.ResponseWriter, r *http.Request) {
+	if !validHeaderAcceptJSON(r.Header) {
+		http.Error(w, "JSON only acceptable response", http.StatusNotAcceptable)
+		return
+	}
+
+	body := r.Body
+	defer body.Close()
+
+	req := &dax.SnapshotShardDataRequest{}
+	if err := json.NewDecoder(body).Decode(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := h.api.SnapshotShardData(r.Context(), req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// POST /snapshot/table-keys
+func (h *Handler) handlePostSnapshotTableKeys(w http.ResponseWriter, r *http.Request) {
+	if !validHeaderAcceptJSON(r.Header) {
+		http.Error(w, "JSON only acceptable response", http.StatusNotAcceptable)
+		return
+	}
+
+	body := r.Body
+	defer body.Close()
+
+	req := &dax.SnapshotTableKeysRequest{}
+	if err := json.NewDecoder(body).Decode(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := h.api.SnapshotTableKeys(r.Context(), req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// POST /snapshot/field-keys
+func (h *Handler) handlePostSnapshotFieldKeys(w http.ResponseWriter, r *http.Request) {
+	if !validHeaderAcceptJSON(r.Header) {
+		http.Error(w, "JSON only acceptable response", http.StatusNotAcceptable)
+		return
+	}
+
+	body := r.Body
+	defer body.Close()
+
+	req := &dax.SnapshotFieldKeysRequest{}
+	if err := json.NewDecoder(body).Decode(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := h.api.SnapshotFieldKeys(r.Context(), req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// GET /health
+func (h *Handler) handleGetHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
+
+func init() {
+	gob.Register(arrow.PrimitiveTypes.Int64)
+	gob.Register(arrow.PrimitiveTypes.Float64)
+	gob.Register(arrow.BinaryTypes.String)
+}
+
+// EXPERIMENTAL API MAY CHANGE
+
+func (h *Handler) handleGetDataframeSchema(w http.ResponseWriter, r *http.Request) {
+	if !h.api.server.dataframeEnabled {
+		http.Error(w, "Dataframe is disabled", http.StatusBadRequest)
+		return
+	}
+	indexName, ok := mux.Vars(r)["index"]
+	if !ok {
+		http.Error(w, "index name is required", http.StatusBadRequest)
+		return
+	}
+	parts, err := h.api.GetDataframeSchema(r.Context(), indexName)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("%v", err), http.StatusBadRequest)
+		return
+	}
+
+	if err := json.NewEncoder(w).Encode(parts); err != nil {
+		h.logger.Errorf("dataframe schema err: %s", err)
+	}
+}
+
+func (h *Handler) handleGetDataframe(w http.ResponseWriter, r *http.Request) {
+	if !h.api.server.dataframeEnabled {
+		http.Error(w, "Dataframe is disabled", http.StatusBadRequest)
+		return
+	}
+	indexName, ok := mux.Vars(r)["index"]
+
+	if !ok {
+		http.Error(w, "index name is required", http.StatusBadRequest)
+		return
+	}
+	shardString, ok := mux.Vars(r)["shard"]
+	if !ok {
+		http.Error(w, "shard is required", http.StatusBadRequest)
+		return
+	}
+	shard, err := strconv.ParseUint(shardString, 10, 64)
+	if err != nil {
+		http.Error(w, "shard should be an unsigned integer", http.StatusBadRequest)
+		return
+	}
+	idx, err := h.api.Index(r.Context(), indexName)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Index %s Not Found", indexName), http.StatusNotFound)
+		return
+	}
+	filename := idx.GetDataFramePath(shard) + h.api.server.executor.TableExtension()
+	http.ServeFile(w, r, filename)
+}
+
+func (h *Handler) handlePostDataframe(w http.ResponseWriter, r *http.Request) {
+	if !h.api.server.dataframeEnabled {
+		http.Error(w, "Dataframe is disabled", http.StatusBadRequest)
+		return
+	}
+	// TODO(twg) 2022/09/29 validate the request
+	indexName, ok := mux.Vars(r)["index"]
+	if !ok {
+		http.Error(w, "index name is required", http.StatusBadRequest)
+		return
+	}
+	shardString, ok := mux.Vars(r)["shard"]
+	if !ok {
+		http.Error(w, "shard is required", http.StatusBadRequest)
+		return
+	}
+	shard, err := strconv.ParseUint(shardString, 10, 64)
+	if err != nil {
+		http.Error(w, "shard should be an unsigned integer", http.StatusBadRequest)
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		http.Error(w, "reading body", http.StatusBadRequest)
+		return
+	}
+	blob := bytes.NewReader(body)
+	dec := gob.NewDecoder(blob)
+	var changesetRequest ChangesetRequest
+	err = dec.Decode(&changesetRequest)
+	if err != nil {
+		http.Error(w, "decoding request", http.StatusBadRequest)
+		return
+	}
+	err = h.api.ApplyDataframeChangeset(r.Context(), indexName, &changesetRequest, shard)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("err:%v", err), http.StatusBadRequest)
+		return
+	}
+	msg := ""
+
+	resp := struct {
+		Index string
+		Err   string
+	}{
+		Index: indexName,
+		Err:   msg,
+	}
+	w.Header().Add("Content-Type", "application/json")
+	err = json.NewEncoder(w).Encode(resp)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+}
+
+func (h *Handler) DiscardHTTPServerLogs() {
+	h.server.ErrorLog = log.New(io.Discard, "", 0)
 }

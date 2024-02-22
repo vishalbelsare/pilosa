@@ -69,6 +69,8 @@ type (
 		Commit(ctx context.Context) error
 
 		Data() []interface{}
+
+		Schema() interface{}
 	}
 
 	// OffsetStreamRecord is an extension of the record type which also tracks offsets within streams.
@@ -841,6 +843,26 @@ func (t TimestampField) PilosafyVal(val interface{}) (interface{}, error) {
 		tsAsVal := TimestampToVal(t.granularity(), ts)
 
 		dur = tsAsVal - epochAsVal
+	} else if _, ok := val.([]byte); ok {
+		valAsString := string(val.([]byte)[:])
+		// try to convert as time string
+		ts, err := timeFromTimestring(valAsString, t.layout())
+		if err != nil {
+			// if that doesn't work, maybe it's an int represented as a string
+			valAsInt, err := strconv.ParseInt(valAsString, 0, 64)
+			if err == nil {
+				return valAsInt - epochAsVal, nil
+			} else {
+				return nil, errors.Wrap(err, "converting TimestampField")
+			}
+		}
+		if err := validateTimestamp(t.granularity(), ts); err != nil {
+			return nil, errors.Wrap(ErrTimestampOutOfRange, "validating timestamp")
+		}
+
+		tsAsVal := TimestampToVal(t.granularity(), ts)
+
+		dur = tsAsVal - epochAsVal
 	} else {
 		valAsInt, err := toInt64(val)
 		if err != nil {
@@ -893,10 +915,10 @@ func validateTimestamp(unit Unit, ts time.Time) error {
 	return nil
 }
 
-//  validateDuration checks if the duration will overflow. Users can provide a custom epoch but
-//  Featurebase will ultimately convert this to some duration relative to the Unix epoch.
-//  So if the custom epoch + the provided value in the desired units is too far from
-//  Unix epoch such that it causes an interger overflow, this will return an error.
+// validateDuration checks if the duration will overflow. Users can provide a custom epoch but
+// Featurebase will ultimately convert this to some duration relative to the Unix epoch.
+// So if the custom epoch + the provided value in the desired units is too far from
+// Unix epoch such that it causes an interger overflow, this will return an error.
 func validateDuration(dur int64, offset int64, granularity Unit) error {
 	var minInt, maxInt int64
 	switch granularity {
@@ -1131,11 +1153,16 @@ func toBool(val interface{}) (bool, error) {
 		}
 		return vt != 0, nil
 	case string:
-		switch strings.ToLower(vt) {
+		vt = strings.ToLower(vt)
+		vt = strings.TrimSpace(vt)
+		switch vt {
 		case "", "0", "f", "false":
 			return false, nil
+		case "1", "t", "true":
+			return true, nil
 		}
-		return true, nil
+		return false, errors.Errorf("couldn't convert %v of %[1]T to bool", vt)
+
 	default:
 		if vint, err := toInt64(val); err == nil {
 			return vint != 0, nil
@@ -1190,6 +1217,8 @@ func toInt64(val interface{}) (int64, error) {
 			return 0, err
 		}
 		return v, nil
+	case []byte:
+		return toInt64(string(vt[:]))
 	default:
 		return 0, errors.Errorf("couldn't convert %v of %[1]T to int64", vt)
 	}
@@ -1223,11 +1252,14 @@ func toStringArray(val interface{}) ([]string, error) {
 	case []interface{}:
 		ret := make([]string, len(vt))
 		for i, v := range vt {
-			vs, ok := v.(string)
-			if !ok {
+			switch v := v.(type) {
+			case []byte:
+				ret[i] = string(v[:])
+			case string:
+				ret[i] = v
+			default:
 				return nil, errors.Errorf("couldn't convert []interface{} to []string, value %v of type %[1]T at %d", v, i)
 			}
-			ret[i] = vs
 		}
 		return ret, nil
 	default:
@@ -1304,3 +1336,51 @@ func (f Fields) ContainsBool() bool {
 	}
 	return false
 }
+
+// SchemaManager is meant to be an interface for managing schema information;
+// i.e. for interacting with a single source of truth for schema information,
+// like the Serverless Schemar. But... it currently contains methods which are
+// not related to schema because the first goal was just to introduce an
+// interface in ingest.go for any methods being called on *m.client. We don't
+// want a FeatureBase client directly called from ingest, rather, we want to
+// call these interface methods and allow for different implementations (such as
+// a Serverless implementation which uses the Schemar in Serverless as opposed
+// to a FeatureBase node or cluster).
+type SchemaManager interface {
+	StartTransaction(id string, timeout time.Duration, exclusive bool, requestTimeout time.Duration) (*pilosacore.Transaction, error)
+	FinishTransaction(id string) (*pilosacore.Transaction, error)
+	Schema() (*pilosaclient.Schema, error)
+	SyncIndex(index *pilosaclient.Index) error
+	DeleteIndex(index *pilosaclient.Index) error
+	Status() (pilosaclient.Status, error)
+	SetAuthToken(string)
+}
+
+// Ensure type implements interface.
+var _ SchemaManager = &nopSchemaManager{}
+
+// NopSchemaManager is an implementation of the SchemaManager interface that
+// doesn't do anything.
+var NopSchemaManager SchemaManager = &nopSchemaManager{}
+
+type nopSchemaManager struct{}
+
+func (n *nopSchemaManager) StartTransaction(id string, timeout time.Duration, exclusive bool, requestTimeout time.Duration) (*pilosacore.Transaction, error) {
+	return nil, nil
+}
+func (n *nopSchemaManager) FinishTransaction(id string) (*pilosacore.Transaction, error) {
+	return nil, nil
+}
+func (n *nopSchemaManager) Schema() (*pilosaclient.Schema, error) {
+	return pilosaclient.NewSchema(), nil
+}
+func (n *nopSchemaManager) SyncIndex(index *pilosaclient.Index) error {
+	return nil
+}
+func (n *nopSchemaManager) DeleteIndex(index *pilosaclient.Index) error {
+	return nil
+}
+func (n *nopSchemaManager) Status() (pilosaclient.Status, error) {
+	return pilosaclient.Status{}, nil
+}
+func (n *nopSchemaManager) SetAuthToken(token string) {}

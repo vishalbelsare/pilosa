@@ -3,7 +3,7 @@ package common
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 	"sync/atomic"
 
@@ -43,11 +43,14 @@ func LaunchKafkaEventConfirmer(producer *confluent.Producer, finished *int32, it
 	}()
 	return doneChan
 }
+
+// For a list of confluent consumer configuraiton options, go here:
+// https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md
 func SetupConfluent(m *idk.ConfluentCommand) (*confluent.ConfigMap, error) {
 	var err error
 	configMap := &confluent.ConfigMap{}
 	if m.KafkaConfiguration != "" {
-		file, er := ioutil.ReadFile(m.KafkaConfiguration)
+		file, er := os.ReadFile(m.KafkaConfiguration)
 		if er != nil {
 			return nil, er
 		}
@@ -84,7 +87,7 @@ func SetupConfluent(m *idk.ConfluentCommand) (*confluent.ConfigMap, error) {
 		}
 	}
 
-	//SSL
+	// SSL
 	if m.KafkaSslCaLocation != "" {
 		err = configMap.SetKey("ssl.ca.location", m.KafkaSslCaLocation)
 		if err != nil {
@@ -121,7 +124,7 @@ func SetupConfluent(m *idk.ConfluentCommand) (*confluent.ConfigMap, error) {
 		}
 	}
 
-	//SSL
+	// SSL
 	if m.KafkaSslCaLocation != "" {
 		err = configMap.SetKey("ssl.ca.location", m.KafkaSslCaLocation)
 		if err != nil {
@@ -187,5 +190,32 @@ func SetupConfluent(m *idk.ConfluentCommand) (*confluent.ConfigMap, error) {
 		}
 	}
 
+	if m.KafkaGroupInstanceId != "" {
+		err = configMap.SetKey("group.instance.id", m.KafkaGroupInstanceId)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if m.KafkaMaxPollInterval > 0 {
+		err = configMap.SetKey("max.poll.interval.ms", m.KafkaMaxPollInterval)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if m.KafkaSessionTimeout > 0 {
+		err = configMap.SetKey("session.timeout.ms", m.KafkaSessionTimeout)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if m.KafkaSocketKeepaliveEnable != "" {
+		err = configMap.SetKey("socket.keepalive.enable", m.KafkaSocketKeepaliveEnable)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return configMap, nil
 }

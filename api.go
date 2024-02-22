@@ -12,7 +12,6 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"net/url"
 	"os"
@@ -23,14 +22,19 @@ import (
 	"sync"
 	"time"
 
+	fbcontext "github.com/featurebasedb/featurebase/v3/context"
+	"github.com/featurebasedb/featurebase/v3/dax"
+	"github.com/featurebasedb/featurebase/v3/dax/computer"
+	"github.com/featurebasedb/featurebase/v3/dax/storage"
 	"github.com/featurebasedb/featurebase/v3/disco"
-	"github.com/featurebasedb/featurebase/v3/ingest"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/featurebasedb/featurebase/v3/rbf"
+	"github.com/prometheus/client_golang/prometheus"
 
 	//"github.com/featurebasedb/featurebase/v3/pg"
 	"github.com/featurebasedb/featurebase/v3/pql"
 	"github.com/featurebasedb/featurebase/v3/roaring"
-	"github.com/featurebasedb/featurebase/v3/stats"
+	planner_types "github.com/featurebasedb/featurebase/v3/sql3/planner/types"
 	"github.com/featurebasedb/featurebase/v3/tracing"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -52,10 +56,22 @@ type API struct {
 	importWork           chan importJob
 
 	Serializer Serializer
+
+	serverlessStorage *storage.ResourceManager
+
+	directiveWorkerPoolSize int
+
+	// isComputeNode is set to true if this node is running as a DAX compute
+	// node.
+	isComputeNode bool
 }
 
 func (api *API) Holder() *Holder {
 	return api.holder
+}
+
+func (api *API) logger() logger.Logger {
+	return api.server.logger
 }
 
 // apiOption is a functional option type for pilosa.API
@@ -71,9 +87,30 @@ func OptAPIServer(s *Server) apiOption {
 	}
 }
 
+func OptAPIServerlessStorage(mm *storage.ResourceManager) apiOption {
+	return func(a *API) error {
+		a.serverlessStorage = mm
+		return nil
+	}
+}
+
 func OptAPIImportWorkerPoolSize(size int) apiOption {
 	return func(a *API) error {
 		a.importWorkerPoolSize = size
+		return nil
+	}
+}
+
+func OptAPIDirectiveWorkerPoolSize(size int) apiOption {
+	return func(a *API) error {
+		a.directiveWorkerPoolSize = size
+		return nil
+	}
+}
+
+func OptAPIIsComputeNode(is bool) apiOption {
+	return func(a *API) error {
+		a.isComputeNode = is
 		return nil
 	}
 }
@@ -82,6 +119,8 @@ func OptAPIImportWorkerPoolSize(size int) apiOption {
 func NewAPI(opts ...apiOption) (*API, error) {
 	api := &API{
 		importWorkerPoolSize: 2,
+
+		directiveWorkerPoolSize: 2,
 	}
 
 	for _, opt := range opts {
@@ -105,7 +144,7 @@ func NewAPI(opts ...apiOption) (*API, error) {
 	return api, nil
 }
 
-// Setter for API options.
+// SetAPIOptions applies the given functional options to the API.
 func (api *API) SetAPIOptions(opts ...apiOption) error {
 	for _, opt := range opts {
 		err := opt(api)
@@ -119,17 +158,9 @@ func (api *API) SetAPIOptions(opts ...apiOption) error {
 // validAPIMethods specifies the api methods that are valid for each
 // cluster state.
 var validAPIMethods = map[disco.ClusterState]map[apiMethod]struct{}{
-	disco.ClusterStateStarting: methodsCommon,
 	disco.ClusterStateNormal:   appendMap(methodsCommon, methodsNormal),
-	// Ideally, this would be just `appendMap(methodsCommon, methodsDegraded)`,
-	// but in an attempt to reduce the influence that state (determined by etcd)
-	// has on a node under load, this is set to effectively allow all requests
-	// in a DEGRADED state.
-	disco.ClusterStateDegraded: appendMap(methodsCommon, methodsNormal),
-	// Ideally, this would be just `methodsCommon`, but in an attempt to reduce
-	// the influence that state (determined by etcd) has on a node under load,
-	// this is set to effectively allow all requests in a DOWN state.
-	disco.ClusterStateDown: appendMap(methodsCommon, methodsNormal),
+	disco.ClusterStateDegraded: appendMap(methodsCommon, methodsDegraded),
+	disco.ClusterStateDown:     methodsCommon,
 }
 
 func appendMap(a, b map[apiMethod]struct{}) map[apiMethod]struct{} {
@@ -199,14 +230,14 @@ func (api *API) query(ctx context.Context, req *QueryRequest) (QueryResponse, er
 	}
 
 	// TODO can we get rid of exec options and pass the QueryRequest directly to executor?
-	execOpts := &execOptions{
+	execOpts := &ExecOptions{
 		Remote:        req.Remote,
 		Profile:       req.Profile,
 		PreTranslated: req.PreTranslated,
 		EmbeddedData:  req.EmbeddedData, // precomputed values that needed to be passed with the request
 		MaxMemory:     req.MaxMemory,
 	}
-	resp, err := api.server.executor.Execute(ctx, req.Index, q, req.Shards, execOpts)
+	resp, err := api.server.executor.Execute(ctx, dax.StringTableKeyer(req.Index), q, req.Shards, execOpts)
 	if err != nil {
 		return QueryResponse{}, errors.Wrap(err, "executing")
 	}
@@ -224,14 +255,20 @@ func (api *API) CreateIndex(ctx context.Context, indexName string, options Index
 	span, _ := tracing.StartSpanFromContext(ctx, "API.CreateIndex")
 	defer span.Finish()
 
+	// get the requestUserID from the context -- assumes the http handler has populated this from
+	// authN/Z info
+	requestUserID, _ := fbcontext.UserID(ctx) // requestUserID is "" if not in ctx
+
 	if err := api.validate(apiCreateIndex); err != nil {
 		return nil, errors.Wrap(err, "validating api method")
 	}
 
 	// Populate the create index message.
+	ts := timestamp()
 	cim := &CreateIndexMessage{
 		Index:     indexName,
-		CreatedAt: timestamp(),
+		CreatedAt: ts,
+		Owner:     requestUserID,
 		Meta:      options,
 	}
 
@@ -241,7 +278,7 @@ func (api *API) CreateIndex(ctx context.Context, indexName string, options Index
 		return nil, errors.Wrap(err, "creating index")
 	}
 
-	api.holder.Stats.Count(MetricCreateIndex, 1, 1.0)
+	CounterCreateIndex.Inc()
 	return index, nil
 }
 
@@ -261,6 +298,31 @@ func (api *API) Index(ctx context.Context, indexName string) (*Index, error) {
 	return index, nil
 }
 
+func (api *API) DeleteDataframe(ctx context.Context, indexName string) error {
+	span, _ := tracing.StartSpanFromContext(ctx, "API.DeleteDataframe")
+	defer span.Finish()
+
+	if err := api.validate(apiDeleteDataframe); err != nil {
+		return errors.Wrap(err, "validating api method")
+	}
+	// Delete index from the holder.
+	err := api.holder.DeleteDataframe(indexName)
+	if err != nil {
+		return errors.Wrap(err, "deleting index")
+	}
+	// Send the delete index message to all nodes.
+	err = api.server.SendSync(
+		&DeleteDataframeMessage{
+			Index: indexName,
+		})
+	if err != nil {
+		api.server.logger.Errorf("problem sending DeleteIndex message: %s", err)
+		return errors.Wrap(err, "sending DeleteIndex message")
+	}
+	CounterDeleteDataframe.Inc()
+	return nil
+}
+
 // DeleteIndex removes the named index. If the index is not found it does
 // nothing and returns no error.
 func (api *API) DeleteIndex(ctx context.Context, indexName string) error {
@@ -276,6 +338,14 @@ func (api *API) DeleteIndex(ctx context.Context, indexName string) error {
 	if err != nil {
 		return errors.Wrap(err, "deleting index")
 	}
+
+	// Remove from writelogger/snapshotter if serverless.
+	if api.isComputeNode {
+		if err := api.serverlessStorage.RemoveTable(dax.TableKey(indexName).QualifiedTableID()); err != nil {
+			return errors.Wrapf(err, "removing table from serverless storage: %s", indexName)
+		}
+	}
+
 	// Send the delete index message to all nodes.
 	err = api.server.SendSync(
 		&DeleteIndexMessage{
@@ -292,13 +362,13 @@ func (api *API) DeleteIndex(ctx context.Context, indexName string) error {
 			return errors.Wrap(err, "deleting id allocation for index")
 		}
 	}
-	api.holder.Stats.Count(MetricDeleteIndex, 1, 1.0)
+	CounterDeleteIndex.Inc()
 	return nil
 }
 
 // CreateField makes the named field in the named index with the given options.
-// This method currently only takes a single functional option, but that may be
-// changed in the future to support multiple options.
+//
+// The resulting field will always have TrackExistence set.
 func (api *API) CreateField(ctx context.Context, indexName string, fieldName string, opts ...FieldOption) (*Field, error) {
 	span, _ := tracing.StartSpanFromContext(ctx, "API.CreateField")
 	defer span.Finish()
@@ -307,6 +377,15 @@ func (api *API) CreateField(ctx context.Context, indexName string, fieldName str
 		return nil, errors.Wrap(err, "validating api method")
 	}
 
+	// get the requestUserID from the context -- assumes the http handler has populated this from
+	// authN/Z info
+	requestUserID, _ := fbcontext.UserID(ctx) // requestUserID is "" if not in ctx
+
+	// newFieldOptions is also used in the path through the index creating
+	// a field from an update from DAX, so it can't assume it can always
+	// override this. But we're the call path for creating new fields, and
+	// new fields should always have TrackExistence on.
+	opts = append(opts, OptFieldTrackExistence())
 	// Apply and validate functional options.
 	fo, err := newFieldOptions(opts...)
 	if err != nil {
@@ -324,11 +403,12 @@ func (api *API) CreateField(ctx context.Context, indexName string, fieldName str
 		Index:     indexName,
 		Field:     fieldName,
 		CreatedAt: timestamp(),
+		Owner:     requestUserID,
 		Meta:      fo,
 	}
 
 	// Create field.
-	field, err := index.CreateField(fieldName, opts...)
+	field, err := index.CreateField(fieldName, requestUserID, opts...)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating field")
 	}
@@ -339,7 +419,7 @@ func (api *API) CreateField(ctx context.Context, indexName string, fieldName str
 		return nil, errors.Wrap(err, "sending CreateField message")
 	}
 
-	api.holder.Stats.CountWithCustomTags(MetricCreateField, 1, 1.0, []string{fmt.Sprintf("index:%s", indexName)})
+	CounterCreateField.With(prometheus.Labels{"index": indexName})
 	return field, nil
 }
 
@@ -358,7 +438,11 @@ func (api *API) UpdateField(ctx context.Context, indexName, fieldName string, up
 		return newNotFoundError(ErrIndexNotFound, indexName)
 	}
 
-	cfm, err := index.UpdateField(ctx, fieldName, update)
+	// get the requestUserID from the context -- assumes the http handler has populated this from
+	// authN/Z info
+	requestUserID, _ := fbcontext.UserID(ctx)
+
+	cfm, err := index.UpdateField(ctx, fieldName, requestUserID, update)
 	if err != nil {
 		return errors.Wrap(err, "updating field")
 	}
@@ -415,16 +499,9 @@ func importWorker(importWork chan importJob) {
 	for j := range importWork {
 		err := func() (err0 error) {
 			for viewName, viewData := range j.req.Views {
-				// The logic here corresponds to the logic in fragment.cleanViewName().
-				// Unfortunately, the logic in that method is not completely exclusive
-				// (i.e. an "other" view named with format YYYYMMDD would be handled
-				// incorrectly). One way to address this would be to change the logic
-				// overall so there weren't conflicts. For now, we just
-				// rely on the field type to inform the intended view name.
-				if viewName == "" {
-					viewName = viewStandard
-				} else if j.field.Type() == FieldTypeTime {
-					viewName = fmt.Sprintf("%s_%s", viewStandard, viewName)
+				viewName, err0 = j.field.cleanupViewName(viewName)
+				if err0 != nil {
+					return err0
 				}
 				if len(viewData) == 0 {
 					return fmt.Errorf("no data to import for view: %s", viewName)
@@ -484,7 +561,6 @@ func importWorker(importWork chan importJob) {
 						}
 
 						err := j.field.importRoaring(j.ctx, tx, data, j.shard, viewName, doClear)
-
 						if err != nil {
 							return errors.Wrap(err, "importing standard roaring")
 						}
@@ -548,9 +624,18 @@ func (api *API) ImportRoaring(ctx context.Context, indexName, fieldName string, 
 		return errors.Wrap(err, "validating api method")
 	}
 
+	api.server.logger.Debugf("ImportRoaring: %v %v %v", indexName, fieldName, shard)
 	index, field, err := api.indexField(indexName, fieldName, shard)
 	if index == nil || field == nil {
 		return err
+	}
+
+	// This node only handles the shard(s) that it owns.
+	if api.isComputeNode {
+		directive := api.holder.Directive()
+		if !shardInShards(dax.ShardNum(shard), directive.ComputeShards(dax.TableKey(index.Name()))) {
+			return errors.Errorf("import request shard is not supported (roaring): %d", shard)
+		}
 	}
 
 	if err = req.ValidateWithTimestamp(index.CreatedAt(), field.CreatedAt()); err != nil {
@@ -602,6 +687,38 @@ func (api *API) ImportRoaring(ctx context.Context, indexName, fieldName string, 
 
 		// Exit once all nodes are processed.
 		if maxNode == len(nodes) {
+			if api.isComputeNode && !req.SuppressLog {
+				// Write the request to the write logger.
+				partition := disco.ShardToShardPartition(indexName, shard, disco.DefaultPartitionN)
+				msg := &computer.ImportRoaringMessage{
+					Table:           indexName,
+					Field:           fieldName,
+					Partition:       partition,
+					Shard:           shard,
+					Clear:           req.Clear,
+					Action:          req.Action,
+					Block:           req.Block,
+					UpdateExistence: req.UpdateExistence,
+					Views:           req.Views,
+				}
+
+				tkey := dax.TableKey(indexName)
+				qtid := tkey.QualifiedTableID()
+				partitionNum := dax.PartitionNum(partition)
+				shardNum := dax.ShardNum(shard)
+
+				b, err := computer.MarshalLogMessage(msg, computer.EncodeTypeJSON)
+				if err != nil {
+					return errors.Wrap(err, "marshalling log message")
+				}
+
+				resource := api.serverlessStorage.GetShardResource(qtid, partitionNum, shardNum)
+				err = resource.Append(b)
+				if err != nil {
+					return errors.Wrap(err, "appending shard data") // TODO do we need to set err0 or something?
+				}
+			}
+
 			return qcx.Finish()
 		}
 	}
@@ -639,7 +756,7 @@ func (api *API) DeleteField(ctx context.Context, indexName string, fieldName str
 		api.server.logger.Errorf("problem sending DeleteField message: %s", err)
 		return errors.Wrap(err, "sending DeleteField message")
 	}
-	api.holder.Stats.CountWithCustomTags(MetricDeleteField, 1, 1.0, []string{fmt.Sprintf("index:%s", indexName)})
+	CounterDeleteField.With(prometheus.Labels{"index": indexName})
 	return nil
 }
 
@@ -671,7 +788,7 @@ func (api *API) DeleteAvailableShard(_ context.Context, indexName, fieldName str
 		api.server.logger.Errorf("problem sending DeleteAvailableShard message: %s", err)
 		return errors.Wrap(err, "sending DeleteAvailableShard message")
 	}
-	api.holder.Stats.CountWithCustomTags(MetricDeleteAvailableShard, 1, 1.0, []string{fmt.Sprintf("index:%s", indexName)})
+	CounterDeleteAvailableShard.With(prometheus.Labels{"index": indexName}).Inc()
 	return nil
 }
 
@@ -750,9 +867,25 @@ func (api *API) ExportCSV(ctx context.Context, indexName string, fieldName strin
 		return cw.Write([]string{rowStr, colStr})
 	}
 
-	// Iterate over each column.
-	if err := f.forEachBit(tx, fn); err != nil {
-		return errors.Wrap(err, "writing CSV")
+	citer, _, err := tx.ContainerIterator(indexName, fieldName, viewStandard, shard, 0)
+	if err != nil {
+		return err
+	}
+	var row, hi uint64
+	var failed error
+	process := func(u uint16) {
+		if err := fn(row, hi|uint64(u)); err != nil {
+			failed = err
+		}
+	}
+	for citer.Next() {
+		key, c := citer.Value()
+		hi = key << 16
+		row, hi = (hi / ShardWidth), (shard*ShardWidth)+(hi%ShardWidth)
+		roaring.ContainerCallback(c, process)
+		if failed != nil {
+			return errors.Wrap(err, "writing CSV")
+		}
 	}
 
 	// Ensure data is flushed.
@@ -792,66 +925,6 @@ func (api *API) PartitionNodes(ctx context.Context, partitionID int) ([]*disco.N
 	return snap.PartitionNodes(partitionID), nil
 }
 
-// FragmentBlockData is an endpoint for internal usage. It is not guaranteed to
-// return anything useful. Currently it returns protobuf encoded row and column
-// ids from a "block" which is a subdivision of a fragment.
-func (api *API) FragmentBlockData(ctx context.Context, body io.Reader) (_ []byte, err error) {
-	span, _ := tracing.StartSpanFromContext(ctx, "API.FragmentBlockData")
-	defer span.Finish()
-
-	if err := api.validate(apiFragmentBlockData); err != nil {
-		return nil, errors.Wrap(err, "validating api method")
-	}
-
-	reqBytes, err := ioutil.ReadAll(body)
-	if err != nil {
-		return nil, NewBadRequestError(errors.Wrap(err, "read body error"))
-	}
-	var req BlockDataRequest
-	if err := api.Serializer.Unmarshal(reqBytes, &req); err != nil {
-		return nil, NewBadRequestError(errors.Wrap(err, "unmarshal body error"))
-	}
-
-	// Retrieve fragment from holder.
-	f := api.holder.fragment(req.Index, req.Field, req.View, req.Shard)
-	if f == nil {
-		return nil, ErrFragmentNotFound
-	}
-
-	var resp = BlockDataResponse{}
-	resp.RowIDs, resp.ColumnIDs, err = f.blockData(int(req.Block))
-	if err != nil {
-		return nil, err
-	}
-
-	// Encode response.
-	buf, err := api.Serializer.Marshal(&resp)
-	if err != nil {
-		return nil, errors.Wrap(err, "merge block response encoding error")
-	}
-
-	return buf, nil
-}
-
-// FragmentBlocks returns the checksums and block ids for all blocks in the specified fragment.
-func (api *API) FragmentBlocks(ctx context.Context, indexName, fieldName, viewName string, shard uint64) ([]FragmentBlock, error) {
-	span, _ := tracing.StartSpanFromContext(ctx, "API.FragmentBlocks")
-	defer span.Finish()
-
-	if err := api.validate(apiFragmentBlocks); err != nil {
-		return nil, errors.Wrap(err, "validating api method")
-	}
-
-	// Retrieve fragment from holder.
-	f := api.holder.fragment(indexName, fieldName, viewName, shard)
-	if f == nil {
-		return nil, ErrFragmentNotFound
-	}
-
-	// Retrieve blocks.
-	return f.Blocks()
-}
-
 // FragmentData returns all data in the specified fragment.
 func (api *API) FragmentData(ctx context.Context, indexName, fieldName, viewName string, shard uint64) (io.WriterTo, error) {
 	span, _ := tracing.StartSpanFromContext(ctx, "API.FragmentData")
@@ -879,7 +952,7 @@ func (r RedirectError) Error() string {
 }
 
 // TranslateData returns all translation data in the specified partition.
-func (api *API) TranslateData(ctx context.Context, indexName string, partition int) (io.WriterTo, error) {
+func (api *API) TranslateData(ctx context.Context, indexName string, partition int) (TranslateStore, error) {
 	span, _ := tracing.StartSpanFromContext(ctx, "API.TranslateData")
 	defer span.Finish()
 
@@ -934,7 +1007,7 @@ func (api *API) TranslateData(ctx context.Context, indexName string, partition i
 }
 
 // FieldTranslateData returns all translation data in the specified field.
-func (api *API) FieldTranslateData(ctx context.Context, indexName, fieldName string) (io.WriterTo, error) {
+func (api *API) FieldTranslateData(ctx context.Context, indexName, fieldName string) (TranslateStore, error) {
 	span, _ := tracing.StartSpanFromContext(ctx, "API.FieldTranslateData")
 	defer span.Finish()
 	if err := api.validate(apiFieldTranslateData); err != nil {
@@ -1016,7 +1089,7 @@ func (api *API) ClusterMessage(ctx context.Context, reqBody io.Reader) error {
 	}
 
 	// Read entire body.
-	body, err := ioutil.ReadAll(reqBody)
+	body, err := io.ReadAll(reqBody)
 	if err != nil {
 		return errors.Wrap(err, "reading body")
 	}
@@ -1071,6 +1144,39 @@ func (api *API) Schema(ctx context.Context, withViews bool) ([]*IndexInfo, error
 	return api.holder.limitedSchema()
 }
 
+// IndexInfo returns the same information as Schema(), but only for a single
+// index.
+func (api *API) IndexInfo(ctx context.Context, name string) (*IndexInfo, error) {
+	schema, err := api.Schema(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, idx := range schema {
+		if idx.Name == name {
+			return idx, nil
+		}
+	}
+
+	return nil, ErrIndexNotFound
+}
+
+// FieldInfo returns the same information as Schema(), but only for a single
+// field.
+func (api *API) FieldInfo(ctx context.Context, indexName, fieldName string) (*FieldInfo, error) {
+	idx, err := api.IndexInfo(ctx, indexName)
+	if err != nil {
+		return nil, err
+	}
+
+	fld := idx.Field(fieldName)
+	if fld == nil {
+		return nil, ErrFieldNotFound
+	}
+
+	return fld, nil
+}
+
 // ApplySchema takes the given schema and applies it across the
 // cluster (if remote is false), or just to this node (if remote is
 // true). This is designed for the use case of replicating a schema
@@ -1091,164 +1197,6 @@ func (api *API) ApplySchema(ctx context.Context, s *Schema, remote bool) error {
 	}
 
 	return nil
-}
-
-// applyOneIngestSchema applies a single ingestSpec, which specifies operations on
-// a single index and possibly fields. If it is successful, it returns the name
-// of the index and an empty slice (if it created the index), or the name of the
-// index and a slice of the fields within that index that it created. If it
-// is unsuccessful, it tries to delete whatever it created.
-//
-// The intended idiom is that if the returned list of fields isn't empty, the index
-// already existed and only those fields need to be cleaned up in the event of
-// a later error, but if the list of fields is empty, the entire index was new,
-// and should be cleaned up, in which case there's no need to track or delete
-// the specific fields separately.
-func (api *API) ApplyOneIngestSchema(ctx context.Context, schema *ingestSpec) (index *Index, returnedFields []string, err error) {
-	if api.PrimaryNode().ID != api.NodeID() {
-		return nil, nil, RedirectError{
-			HostPort: api.PrimaryNode().URI.Normalize(),
-			error:    "request made to non-primary node",
-		}
-	}
-
-	// create index
-	indexName := schema.IndexName
-	var createdFields []string
-	var useKeys bool
-	switch schema.PrimaryKeyType {
-	case "string":
-		useKeys = true
-	case "uint":
-		useKeys = false
-	default:
-		return nil, nil, fmt.Errorf("invalid primary key type %q", schema.PrimaryKeyType)
-	}
-	opts := IndexOptions{
-		Keys:           useKeys,
-		TrackExistence: true,
-	}
-	createdIndex := false
-
-	// We check this up here because, if there's at least one field but we don't know what to do with
-	// it, we will necessarily fail, which means we'd delete the index anyway, so there's no point in
-	// trying to create it. We don't care about this if there's no fields specified.
-	if len(schema.Fields) > 0 {
-		switch schema.FieldAction {
-		case "create", "ensure", "require":
-			// do nothing
-		case "":
-			schema.FieldAction = schema.IndexAction
-		default:
-			return nil, nil, fmt.Errorf("invalid field-action %q, expecting create/ensure/require", schema.FieldAction)
-		}
-	}
-
-	switch schema.IndexAction {
-	case "ensure", "require":
-		index, err = api.Index(ctx, indexName)
-		if err != nil {
-			if _, ok := err.(NotFoundError); !ok {
-				return nil, nil, fmt.Errorf("checking for existing index %q: %w", indexName, err)
-			} else {
-				err = nil
-			}
-		}
-		if index != nil {
-			existingOpts := index.Options()
-			if existingOpts != opts {
-				return nil, nil, fmt.Errorf("index %q options mismatch: schema %#v, existing %#v", indexName, opts, existingOpts)
-			}
-			break
-		}
-		if schema.IndexAction == "require" {
-			return nil, nil, fmt.Errorf("index %q does not exist", indexName)
-		}
-		fallthrough
-	case "create":
-		index, err = api.CreateIndex(ctx, indexName, opts)
-		if err != nil {
-			return nil, nil, err
-		}
-		createdIndex = true
-	default:
-		return nil, nil, fmt.Errorf("invalid index-action %q, need create/ensure/require", schema.IndexAction)
-	}
-
-	// Now we might have an index, so we need our cleanup code.
-	defer func() {
-		if err == nil {
-			return
-		}
-		if createdIndex {
-			err := api.DeleteIndex(ctx, indexName)
-			if err != nil {
-
-				api.server.logger.Printf("trying to undo failed index %q creation: %v", indexName, err)
-			}
-			return
-		}
-		for _, field := range createdFields {
-			err := api.DeleteField(ctx, indexName, field)
-			if err != nil {
-				api.server.logger.Printf("trying to undo failed field %q creation in index %q: %v", field, indexName, err)
-			}
-		}
-	}()
-
-	// create all the fields specified in the index
-	for _, fSpec := range schema.Fields {
-		fieldName := fSpec.FieldName
-		opt := fieldSpecToFieldOption(fSpec)
-		err = opt.validate()
-		if err != nil {
-			return nil, nil, err
-		}
-		switch schema.FieldAction {
-		case "ensure", "require":
-			field, schemaErr := api.Field(ctx, indexName, fieldName)
-			if schemaErr != nil {
-				// NotFoundError is fine
-				if _, ok := schemaErr.(NotFoundError); !ok {
-					return nil, nil, fmt.Errorf("checking for existing field %q in %q: %w", fieldName, indexName, err)
-				}
-			}
-			if field != nil {
-				existing := field.Options()
-				if opt.Type != existing.Type {
-					return nil, nil, fmt.Errorf("existing field %q is %q, not %q", fieldName, existing.Type, opt.Type)
-				}
-				if ((opt.Keys != nil) && *opt.Keys) != existing.Keys {
-					if existing.Keys {
-						return nil, nil, fmt.Errorf("existing field %q in %q uses keys", fieldName, indexName)
-					} else {
-						return nil, nil, fmt.Errorf("existing field %q in %q doesn't use keys", fieldName, indexName)
-					}
-				}
-				// TODO: verify compatibility of other field opts, this is sorta hard
-				break
-			}
-			if schema.FieldAction == "require" {
-				return nil, nil, fmt.Errorf("field %q does not exist in %q", fieldName, indexName)
-			}
-			fallthrough
-		case "create":
-			fos := fieldOptionsToFunctionalOpts(opt)
-			_, err = api.CreateField(ctx, indexName, fieldName, fos...)
-			if err != nil {
-				return nil, nil, fmt.Errorf("creating field %q in %q: %v", fieldName, indexName, err)
-			}
-			createdFields = append(createdFields, fieldName)
-		}
-	}
-
-	// we don't report the fields back, so we can distinguish "created index"
-	// from "created fields within index"
-	if createdIndex {
-		createdFields = nil
-	}
-
-	return index, createdFields, nil
 }
 
 // Views returns the views in the given field.
@@ -1308,8 +1256,13 @@ func (api *API) DeleteView(ctx context.Context, indexName string, fieldName stri
 	return errors.Wrap(err, "sending DeleteView message")
 }
 
-// IndexShardSnapshot returns a reader that contains the contents of an RBF snapshot for an index/shard.
-func (api *API) IndexShardSnapshot(ctx context.Context, indexName string, shard uint64) (io.ReadCloser, error) {
+// IndexShardSnapshot returns a reader that contains the contents of
+// an RBF snapshot for an index/shard. When snapshotting for
+// serverless, we need to be able to transactionally move the write
+// log to the new version, so we expose writeTx to allow the caller to
+// request a write transaction for the snapshot even though we'll just
+// be reading inside RBF.
+func (api *API) IndexShardSnapshot(ctx context.Context, indexName string, shard uint64, writeTx bool) (io.ReadCloser, error) {
 	span, _ := tracing.StartSpanFromContext(ctx, "API.IndexShardSnapshot")
 	defer span.Finish()
 
@@ -1320,7 +1273,7 @@ func (api *API) IndexShardSnapshot(ctx context.Context, indexName string, shard 
 	}
 
 	// Start transaction.
-	tx := index.holder.txf.NewTx(Txo{Index: index, Shard: shard})
+	tx := index.holder.txf.NewTx(Txo{Index: index, Shard: shard, Write: writeTx})
 
 	// Ensure transaction is an RBF transaction.
 	rtx, ok := tx.(*RBFTx)
@@ -1361,7 +1314,7 @@ type ImportOptions struct {
 	Clear          bool
 	IgnoreKeyCheck bool
 	Presorted      bool
-	fullySorted    bool // format-aware sorting, internal use only please.
+	suppressLog    bool
 
 	// test Tx atomicity if > 0
 	SimPowerLossAfter int
@@ -1395,10 +1348,16 @@ func OptImportOptionsPresorted(b bool) ImportOption {
 	}
 }
 
+func OptImportOptionsSuppressLog(b bool) ImportOption {
+	return func(o *ImportOptions) error {
+		o.suppressLog = b
+		return nil
+	}
+}
+
 var ErrAborted = fmt.Errorf("error: update was aborted")
 
 func (api *API) ImportAtomicRecord(ctx context.Context, qcx *Qcx, req *AtomicRecord, opts ...ImportOption) error {
-
 	simPowerLoss := false
 	lossAfter := -1
 	var opt ImportOptions
@@ -1485,10 +1444,70 @@ func (api *API) Import(ctx context.Context, qcx *Qcx, req *ImportRequest, opts .
 	if err != nil {
 		return errors.Wrap(err, "setting up import options")
 	}
+
+	/////////////////////////////////////////////////////////////////////////////
+	// We build the ImportMessage here BEFORE the call to api.ImportWithTx(),
+	// because something in that method is modifying the values of req, so if we
+	// build ImportMessage after the call to api.ImportWithTx(), then the values
+	// that get logged are incorrect. An example I saw were RowIDS going from:
+	// shard 0 [1, 2, 3]
+	// shard 4 [0]
+	//
+	// to:
+	// shard 0 [1048577, 2097154, 3145731]
+	// shard 4 [1]
+	//
+	// which seem to be the offset in the field shard bitmap.
+	var partition int
+	var msg *computer.ImportMessage
+	if api.isComputeNode && !options.suppressLog {
+		partition = disco.ShardToShardPartition(req.Index, req.Shard, disco.DefaultPartitionN)
+		msg = &computer.ImportMessage{
+			Table:      req.Index,
+			Field:      req.Field,
+			Partition:  partition,
+			Shard:      req.Shard,
+			RowIDs:     make([]uint64, len(req.RowIDs)),
+			ColumnIDs:  make([]uint64, len(req.ColumnIDs)),
+			RowKeys:    make([]string, len(req.RowKeys)),
+			ColumnKeys: make([]string, len(req.ColumnKeys)),
+			Timestamps: make([]int64, len(req.Timestamps)),
+			Clear:      req.Clear,
+
+			IgnoreKeyCheck: options.IgnoreKeyCheck,
+			Presorted:      options.Presorted,
+		}
+		copy(msg.RowIDs, req.RowIDs)
+		copy(msg.ColumnIDs, req.ColumnIDs)
+		copy(msg.RowKeys, req.RowKeys)
+		copy(msg.ColumnKeys, req.ColumnKeys)
+		copy(msg.Timestamps, req.Timestamps)
+	}
+	/////////////////////////////////////////////////////////////////////////////
+
 	err = api.ImportWithTx(ctx, qcx, req, options)
 	if err != nil {
 		return err
 	}
+
+	if api.isComputeNode && !options.suppressLog {
+		tkey := dax.TableKey(req.Index)
+		qtid := tkey.QualifiedTableID()
+		partitionNum := dax.PartitionNum(partition)
+		shardNum := dax.ShardNum(req.Shard)
+
+		b, err := computer.MarshalLogMessage(msg, computer.EncodeTypeJSON)
+		if err != nil {
+			return errors.Wrap(err, "marshalling log message")
+		}
+
+		resource := api.serverlessStorage.GetShardResource(qtid, partitionNum, shardNum)
+		err = resource.Append(b)
+		if err != nil {
+			return errors.Wrap(err, "appending shard data") // TODO do we need to set err0 or something?
+		}
+	}
+
 	return nil
 }
 
@@ -1504,6 +1523,14 @@ func (api *API) ImportWithTx(ctx context.Context, qcx *Qcx, req *ImportRequest, 
 	idx, field, err := api.indexField(req.Index, req.Field, req.Shard)
 	if err != nil {
 		return errors.Wrap(err, "getting index and field")
+	}
+
+	// This node only handles the shard(s) that it owns.
+	if api.isComputeNode {
+		directive := api.holder.Directive()
+		if !shardInShards(dax.ShardNum(req.Shard), directive.ComputeShards(dax.TableKey(idx.Name()))) {
+			return errors.Errorf("import request shard is not supported (with tx): %d", req.Shard)
+		}
 	}
 
 	if err := req.ValidateWithTimestamp(idx.CreatedAt(), field.CreatedAt()); err != nil {
@@ -1611,6 +1638,12 @@ func (api *API) ImportWithTx(ctx context.Context, qcx *Qcx, req *ImportRequest, 
 // across many fields in a single shard. It can both set and clear
 // bits and updates caches/bitDepth as appropriate, although only the
 // bitmap parts happen truly transactionally.
+//
+// This function does not attempt to do existence tracking, because
+// it can't; there's no way to distinguish empty sets from not setting
+// bits. As a result, users of this endpoint are responsible for
+// providing corrected existence views for fields with existence
+// tracking. Our batch API does that.
 func (api *API) ImportRoaringShard(ctx context.Context, indexName string, shard uint64, req *ImportRoaringShardRequest) error {
 	index, err := api.Index(ctx, indexName)
 	if err != nil {
@@ -1629,7 +1662,8 @@ func (api *API) ImportRoaringShard(ctx context.Context, indexName string, shard 
 	defer finisher(&err1)
 
 	if !req.Remote {
-		return errors.New("forwarding unimplemented on this endpoint")
+		err1 = errors.New("forwarding unimplemented on this endpoint")
+		return err1
 	}
 
 	for _, viewUpdate := range req.Views {
@@ -1640,7 +1674,7 @@ func (api *API) ImportRoaringShard(ctx context.Context, indexName string, shard 
 		}
 
 		fieldType := field.Options().Type
-		if err1 = cleanupView(fieldType, &viewUpdate); err1 != nil {
+		if viewUpdate.View, err1 = field.cleanupViewName(viewUpdate.View); err1 != nil {
 			return err1
 		}
 
@@ -1693,27 +1727,42 @@ func (api *API) ImportRoaringShard(ctx context.Context, indexName string, shard 
 		}
 	}
 
-	return nil
-}
+	if api.isComputeNode && !req.SuppressLog {
+		partition := disco.ShardToShardPartition(indexName, shard, disco.DefaultPartitionN)
+		msg := &computer.ImportRoaringShardMessage{
+			Table:     indexName,
+			Partition: partition,
+			Shard:     shard,
+			Views:     make([]computer.RoaringUpdate, len(req.Views)),
+		}
+		for i, view := range req.Views {
+			msg.Views[i] = computer.RoaringUpdate{
+				Field:        view.Field,
+				View:         view.View,
+				Clear:        view.Clear,
+				Set:          view.Set,
+				ClearRecords: view.ClearRecords,
+			}
+		}
 
-func cleanupView(fieldType string, viewUpdate *RoaringUpdate) error {
-	// TODO wouldn't hurt to have consolidated logic somewhere for validating view names.
-	switch fieldType {
-	case FieldTypeSet, FieldTypeTime:
-		if viewUpdate.View == "" {
-			viewUpdate.View = "standard"
+		tkey := dax.TableKey(indexName)
+		qtid := tkey.QualifiedTableID()
+		partitionNum := dax.PartitionNum(partition)
+		shardNum := dax.ShardNum(shard)
+
+		b, err := computer.MarshalLogMessage(msg, computer.EncodeTypeJSON)
+		if err != nil {
+			err1 = errors.Wrap(err, "marshalling log message")
+			return err1
 		}
-		// add 'standard_' if we just have a time... this is how IDK works by default
-		if fieldType == FieldTypeTime && !strings.HasPrefix(viewUpdate.View, viewStandard) {
-			viewUpdate.View = fmt.Sprintf("%s_%s", viewStandard, viewUpdate.View)
-		}
-	case FieldTypeInt, FieldTypeDecimal, FieldTypeTimestamp:
-		if viewUpdate.View == "" {
-			viewUpdate.View = "bsig_" + viewUpdate.Field
-		} else if viewUpdate.View != "bsig_"+viewUpdate.Field {
-			return NewBadRequestError(errors.Errorf("invalid view name (%s) for field %s of type %s", viewUpdate.View, viewUpdate.Field, fieldType))
+
+		resource := api.serverlessStorage.GetShardResource(qtid, partitionNum, shardNum)
+		err1 = errors.Wrap(resource.Append(b), "appending shard data")
+		if err1 != nil {
+			return err1
 		}
 	}
+
 	return nil
 }
 
@@ -1728,7 +1777,65 @@ func (api *API) ImportValue(ctx context.Context, qcx *Qcx, req *ImportValueReque
 	if err != nil {
 		return errors.Wrap(err, "setting up import options")
 	}
-	return api.ImportValueWithTx(ctx, qcx, req, options)
+
+	/////////////////////////////////////////////////////////////////////////////
+	// We build the ImportValueMessage here BEFORE the call to
+	// api.ImportValueWithTx() because we don't trust that req doesn't get
+	// changed out from under us. See the similar comment in the API.Import()
+	// method above.
+	var partition int
+	var msg *computer.ImportValueMessage
+	if api.isComputeNode && !options.suppressLog {
+		partition = disco.ShardToShardPartition(req.Index, req.Shard, disco.DefaultPartitionN)
+		msg = &computer.ImportValueMessage{
+			Table:           req.Index,
+			Field:           req.Field,
+			Partition:       partition,
+			Shard:           req.Shard,
+			ColumnIDs:       make([]uint64, len(req.ColumnIDs)),
+			ColumnKeys:      make([]string, len(req.ColumnKeys)),
+			Values:          make([]int64, len(req.Values)),
+			FloatValues:     make([]float64, len(req.FloatValues)),
+			TimestampValues: make([]time.Time, len(req.TimestampValues)),
+			StringValues:    make([]string, len(req.StringValues)),
+			Clear:           req.Clear,
+
+			IgnoreKeyCheck: options.IgnoreKeyCheck,
+			Presorted:      options.Presorted,
+		}
+		copy(msg.ColumnIDs, req.ColumnIDs)
+		copy(msg.ColumnKeys, req.ColumnKeys)
+		copy(msg.Values, req.Values)
+		copy(msg.FloatValues, req.FloatValues)
+		copy(msg.TimestampValues, req.TimestampValues)
+		copy(msg.StringValues, req.StringValues)
+	}
+	/////////////////////////////////////////////////////////////////////////////
+
+	if err := api.ImportValueWithTx(ctx, qcx, req, options); err != nil {
+		return errors.Wrap(err, "importing value with tx")
+	}
+
+	if api.isComputeNode && !options.suppressLog {
+		// Get the current version for shard.
+		tkey := dax.TableKey(req.Index)
+		qtid := tkey.QualifiedTableID()
+		partitionNum := dax.PartitionNum(partition)
+		shardNum := dax.ShardNum(req.Shard)
+		b, err := computer.MarshalLogMessage(msg, computer.EncodeTypeJSON)
+		if err != nil {
+			return errors.Wrap(err, "marshalling log message")
+		}
+
+		resource := api.serverlessStorage.GetShardResource(qtid, partitionNum, shardNum)
+		err = resource.Append(b)
+		if err != nil {
+			return errors.Wrap(err, "appending shard data") // TODO do we need to set err0 or something?
+		}
+
+	}
+
+	return nil
 }
 
 // ImportValueWithTx bulk imports values into a particular field.
@@ -1749,19 +1856,24 @@ func (api *API) ImportValueWithTx(ctx context.Context, qcx *Qcx, req *ImportValu
 		return nil
 	}
 
+	api.server.logger.Debugf("ImportValueWithTx: %v %v %v", req.Index, req.Field, req.Shard)
 	idx, field, err := api.indexField(req.Index, req.Field, req.Shard)
 	if err != nil {
 		return errors.Wrap(err, fmt.Sprintf("getting index '%v' and field '%v'; shard=%v", req.Index, req.Field, req.Shard))
+	}
+
+	// This node only handles the shard(s) that it owns.
+	if api.isComputeNode {
+		directive := api.holder.Directive()
+		if !shardInShards(dax.ShardNum(req.Shard), directive.ComputeShards(dax.TableKey(idx.Name()))) {
+			return errors.Errorf("import request shard is not supported (value with tx): %d", req.Shard)
+		}
 	}
 
 	if err := req.ValidateWithTimestamp(idx.CreatedAt(), field.CreatedAt()); err != nil {
 		return errors.Wrap(err, "validating import value request")
 	}
 
-	idx, field, err = api.indexField(req.Index, req.Field, req.Shard)
-	if err != nil {
-		return errors.Wrap(err, "getting index and field")
-	}
 	span.LogKV(
 		"index", req.Index,
 		"field", req.Field)
@@ -1870,6 +1982,8 @@ func (api *API) ImportValueWithTx(ctx context.Context, qcx *Qcx, req *ImportValu
 				subreq.Values = req.Values[start:i]
 			} else if req.FloatValues != nil {
 				subreq.FloatValues = req.FloatValues[start:i]
+			} else if req.TimestampValues != nil {
+				subreq.TimestampValues = req.TimestampValues[start:i]
 			}
 			guard <- struct{}{} // would block if guard channel is already filled
 			eg.Go(func() error {
@@ -1905,283 +2019,20 @@ func (api *API) ImportValueWithTx(ctx context.Context, qcx *Qcx, req *ImportValu
 	return nil
 }
 
-// ingestNodeOperationsForFields does the actual work of applying operations
-// to a given index with a map of known fields and an already-parsed
-// ShardedRequest. This is used locally on the node that first receives
-// the request, after it does the parsing, and on other nodes because the
-// format they get is already that rather than JSON, so it's the common
-// path *after* key translation and sorting into shards.
-func (api *API) ingestNodeOperationsForFields(ctx context.Context, qcx *Qcx, index *Index, knownFields map[string]*Field, req *ingest.ShardedRequest) error {
-	eg, ctx := errgroup.WithContext(ctx)
-	for shard, ops := range req.Ops {
-		// create new local copies of these values so the goroutine uses these
-		// copies, and doesn't read the actual loop variables, which are being
-		// changed by the loop.
-		shard, ops := shard, ops
-		eg.Go(func() error {
-			return api.applyOperations(ctx, qcx, index, shard, knownFields, ops)
-		})
-	}
-	return eg.Wait()
-}
-
-// IngestNodeOperations handles protobuf-formatted data which does not need
-// key translation and is applicable to this specific node.
-func (api *API) IngestNodeOperations(ctx context.Context, qcx *Qcx, indexName string, req *ingest.ShardedRequest) error {
-	index := api.holder.Index(indexName)
-	if index == nil {
-		api.server.logger.Errorf("ingest: no such index %q", indexName)
-		return newNotFoundError(ErrIndexNotFound, indexName)
-	}
-	fields := index.Fields()
-	knownFields := map[string]*Field{}
-	for _, field := range fields {
-		knownFields[field.name] = field
-	}
-	return api.ingestNodeOperationsForFields(ctx, qcx, index, knownFields, req)
-}
-
-// IngestOperations handles JSON-formatted data which may need key translation
-// and may be for any or all nodes.
-func (api *API) IngestOperations(ctx context.Context, qcx *Qcx, indexName string, stream io.Reader) error {
-	span, _ := tracing.StartSpanFromContext(ctx, "API.IngestOperations")
-	defer span.Finish()
-
-	if api.PrimaryNode().ID != api.NodeID() {
-		return RedirectError{
-			HostPort: api.PrimaryNode().URI.Normalize(),
-			error:    "request made to non-primary node",
-		}
-	}
-
-	if err := api.validate(apiIngestOperations); err != nil {
-		return errors.Wrap(err, "validating api method")
-	}
-
-	// Find the Index.
-	index := api.holder.Index(indexName)
-	if index == nil {
-		api.server.logger.Errorf("ingest: no such index %q", indexName)
-		return newNotFoundError(ErrIndexNotFound, indexName)
-	}
-	fields := index.Fields()
-	var indexKeys ingest.KeyTranslator
-	if index.Keys() {
-		indexKeys = newIngestKeyTranslatorFromCluster(ctx, api.cluster, indexName)
-	}
-	codec, err := ingest.NewJSONCodec(indexKeys)
-	if err != nil {
-		return errors.Wrap(err, "creating JSON codec")
-	}
-	knownFields := map[string]*Field{}
-	for _, field := range fields {
-		var keys ingest.KeyTranslator
-		if field.usesKeys {
-			keys = newIngestKeyTranslatorFromStore(field.translateStore)
-		}
-		knownFields[field.name] = field
-		switch field.Type() {
-		case "set":
-			if err = codec.AddSetField(field.name, keys); err != nil {
-				return fmt.Errorf("adding set field to codec: %w", err)
-			}
-		case "time":
-			if err = codec.AddTimeQuantumField(field.name, keys); err != nil {
-				return fmt.Errorf("adding time quantum field to codec: %w", err)
-			}
-		case "mutex":
-			if err = codec.AddMutexField(field.name, keys); err != nil {
-				return fmt.Errorf("adding mutex field to codec: %w", err)
-			}
-		case "bool":
-			if err = codec.AddBoolField(field.name); err != nil {
-				return fmt.Errorf("adding bool field to codec: %w", err)
-			}
-		case "int":
-			if err = codec.AddIntField(field.name, keys); err != nil {
-				return fmt.Errorf("adding int field to codec: %w", err)
-			}
-		case "decimal":
-			if err = codec.AddDecimalField(field.name, field.options.Scale); err != nil {
-				return fmt.Errorf("adding decimal field to codec: %w", err)
-			}
-		case "timestamp":
-			if err = codec.AddTimestampField(field.name, field.options.TimeUnit, field.options.Base); err != nil {
-				return fmt.Errorf("adding timestamp field to codec: %w", err)
-			}
-		default:
-			return fmt.Errorf("unhandled field type %q", field.Type())
-		}
-	}
-	req, err := codec.Parse(stream)
-	if err != nil {
-		return errors.Wrap(err, "parsing input data")
-	}
-	sharded, err := codec.RequestByShard(req)
-	if err != nil {
-		return errors.Wrap(err, "sharding input data")
-	}
-	// now that we have this, let's assign the shards to nodes
-	snap := api.cluster.NewSnapshot()
-	// oh hey an easy case: we're presumably the only node
-	if len(snap.Nodes) == 1 {
-		return api.ingestNodeOperationsForFields(ctx, qcx, index, knownFields, sharded)
-	}
-	// Created new ShardedRequest objects for every node, giving each of them
-	// all the shards that apply to them.
-	byNode := make(map[string]*ingest.ShardedRequest)
-	for shard, ops := range sharded.Ops {
-		nodes := snap.ShardNodes(indexName, shard)
-		for _, node := range nodes {
-			forThisShard := byNode[node.ID]
-			if forThisShard == nil {
-				// Create new ShardedRequest for the target node, with its op map
-				// mapping this shard to the ops for this shard.
-				byNode[node.ID] = &ingest.ShardedRequest{Ops: map[uint64][]*ingest.Operation{shard: ops}}
-				continue
-			}
-			// Add this shard to the existing ShardedRequest's Ops map. Note that
-			// we don't have to worry about overwrites; we can't have seen this
-			// shard before, because we're in a range loop on a map where the shard
-			// is the key.
-			forThisShard.Ops[shard] = ops
-		}
-	}
-	eg, ctx := errgroup.WithContext(ctx)
-	for _, node := range snap.Nodes {
-		node := node
-		sharded := byNode[node.ID]
-		// Sometimes, there's nothing for a specific node.
-		if sharded == nil {
-			continue
-		}
-		if node.ID == api.NodeID() {
-			eg.Go(func() error {
-				return api.ingestNodeOperationsForFields(ctx, qcx, index, knownFields, sharded)
-			})
-		} else {
-			eg.Go(func() error {
-				return api.server.defaultClient.IngestNodeOperations(ctx, &node.URI, indexName, sharded)
-			})
-		}
-	}
-	return eg.Wait()
-}
-
-// applyOperations applies a set of operations to one specific shard.
-func (api *API) applyOperations(ctx context.Context, qcx *Qcx, index *Index, shard uint64, fields map[string]*Field, ops []*ingest.Operation) error {
-	// For each operation, we may have a set of records/fields to clear, and then
-	// also a set of fields to set/remove specific bits in.
-	opts := &ImportOptions{Presorted: true, IgnoreKeyCheck: true, fullySorted: true}
-	for _, op := range ops {
-		// ClearRecordIDs should exist only for delete, clear, and write. For clear and write,
-		// we'll have a list of fields, for delete, it should be all the fields.
-		if len(op.ClearRecordIDs) > 0 {
-			// anonymous func lets us defer a finisher from any of the inner error returns
-			err := func() (e0 error) {
-				// WARNING: Depends on GetTx being per-shard/index, not per-field.
-				tx, finisher, err := qcx.GetTx(Txo{Write: true, Index: index, Shard: shard})
-				if err != nil {
-					return fmt.Errorf("getting Tx: %w", err)
-				}
-				defer finisher(&e0)
-				// For a delete, we don't look at the fields the codec was defined with,
-				// We delete from the existence field unconditionally and other fields
-				// if we know they exist.
-				if op.OpType == ingest.OpDelete {
-					err = clearExistenceColumns(tx, index, op.ClearRecordIDs, shard)
-					if err != nil {
-						return fmt.Errorf("clearing existence columns: %w", err)
-					}
-					for name, field := range fields {
-						if err = field.ClearBits(tx, shard, op.ClearRecordIDs...); err != nil {
-							return fmt.Errorf("clearing field %q: %w", name, err)
-						}
-					}
-					return nil
-				}
-				// clear things that we need to wipe out, whether it's because
-				// this is a Clear op, or because it's a write op that
-				// specifies clears for the fields it's going to write to.
-				if len(op.ClearFields) > 0 {
-					for _, fieldName := range op.ClearFields {
-						field, ok := fields[fieldName]
-						if !ok {
-							return fmt.Errorf("can't find a field named %q", fieldName)
-						}
-						if err = field.ClearBits(tx, shard, op.ClearRecordIDs...); err != nil {
-							return fmt.Errorf("clearing record IDs: %w", err)
-						}
-					}
-				}
-				return nil
-			}()
-			if err != nil {
-				return err
-			}
-		}
-		opts.Clear = (op.OpType == ingest.OpRemove)
-		// for "set" and "write" ops, we'll be setting bits, for
-		// "remove" ops we'll be clearing them, and for "clear" ops
-		// there shouldn't be anything here.
-		for fieldName, fieldOp := range op.FieldOps {
-			field, ok := fields[fieldName]
-			if !ok {
-				return fmt.Errorf("can't find a field named %q", fieldName)
-			}
-			var err error
-			err = importExistenceColumns(qcx, index, fieldOp.RecordIDs, shard)
-			if err != nil {
-				return errors.Wrap(err, "importing existence columns")
-			}
-			switch field.Type() {
-			case "set", "time", "mutex", "bool":
-				err = field.Import(qcx, fieldOp.Values, fieldOp.RecordIDs, fieldOp.Signed, shard, opts)
-			case "int", "timestamp", "decimal":
-				err = field.importValue(qcx, fieldOp.RecordIDs, fieldOp.Signed, shard, opts)
-			default:
-				err = fmt.Errorf("unhandled field type %q", field.Type())
-			}
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func importExistenceColumns(qcx *Qcx, index *Index, columnIDs []uint64, shard uint64) error {
+func importExistenceColumns(qcx *Qcx, index *Index, columnIDs []uint64, shard uint64) (err0 error) {
 	ef := index.existenceField()
 	if ef == nil {
 		return nil
 	}
-
-	existenceRowIDs := make([]uint64, len(columnIDs))
-	// If we don't gratuitously hand-duplicate things in field.Import,
-	// the fact that fragment.bulkImport rewrites its row and column
-	// lists can burn us if we don't make a copy before doing the
-	// existence field write.
-	columnCopy := make([]uint64, len(columnIDs))
-	copy(columnCopy, columnIDs)
-	options := ImportOptions{}
-	return ef.Import(qcx, existenceRowIDs, columnCopy, nil, shard, &options)
-}
-
-func clearExistenceColumns(tx Tx, index *Index, columnIDs []uint64, shard uint64) error {
-	ef := index.existenceField()
-	if ef == nil {
-		return nil
+	tx, finisher, err := qcx.GetTx(Txo{Write: true, Index: index, Shard: shard})
+	if err != nil {
+		return err
 	}
-	v := ef.view("standard")
-	if v == nil {
-		return nil
-	}
-	f := v.Fragment(shard)
-	if f == nil {
-		return nil
-	}
-	_, err := f.ClearRecords(tx, columnIDs)
-	return err
+	defer finisher(&err0)
+	// markExistingInView is simpler/faster than Import, but unusually, we use the
+	// standard view of the existence field, instead of the existence view of
+	// a specific field, when doing the index-wide update.
+	return ef.markExistingInView(tx, columnIDs, viewStandard, shard)
 }
 
 // ShardDistribution returns an object representing the distribution of shards
@@ -2233,15 +2084,6 @@ func (api *API) AvailableShards(ctx context.Context, indexName string) (*roaring
 	return index.AvailableShards(false), nil
 }
 
-// StatsWithTags returns an instance of whatever implementation of StatsClient
-// pilosa is using with the given tags.
-func (api *API) StatsWithTags(tags []string) stats.StatsClient {
-	if api.holder == nil || api.cluster == nil {
-		return nil
-	}
-	return api.holder.Stats.WithTags(tags...)
-}
-
 // LongQueryTime returns the configured threshold for logging/statting
 // long running queries.
 func (api *API) LongQueryTime() time.Duration {
@@ -2260,8 +2102,6 @@ func (api *API) validateShardOwnership(indexName string, shard uint64) error {
 }
 
 func (api *API) indexField(indexName string, fieldName string, shard uint64) (*Index, *Field, error) {
-	api.server.logger.Debugf("importing: %v %v %v", indexName, fieldName, shard)
-
 	// Find the Index.
 	index := api.holder.Index(indexName)
 	if index == nil {
@@ -2398,7 +2238,7 @@ func (api *API) TranslateIndexIDs(ctx context.Context, indexName string, ids []u
 // ErrTranslatingKeyNotFound error will be swallowed here, so the empty response will be returned.
 func (api *API) TranslateKeys(ctx context.Context, r io.Reader) (_ []byte, err error) {
 	var req TranslateKeysRequest
-	buf, err := ioutil.ReadAll(r)
+	buf, err := io.ReadAll(r)
 	if err != nil {
 		return nil, NewBadRequestError(errors.Wrap(err, "read translate keys request error"))
 	} else if err := api.Serializer.Unmarshal(buf, &req); err != nil {
@@ -2435,7 +2275,7 @@ func (api *API) TranslateKeys(ctx context.Context, r io.Reader) (_ []byte, err e
 // TranslateIDs handles a TranslateIDRequest.
 func (api *API) TranslateIDs(ctx context.Context, r io.Reader) (_ []byte, err error) {
 	var req TranslateIDsRequest
-	if buf, err := ioutil.ReadAll(r); err != nil {
+	if buf, err := io.ReadAll(r); err != nil {
 		return nil, NewBadRequestError(errors.Wrap(err, "read translate ids request error"))
 	} else if err := api.Serializer.Unmarshal(buf, &req); err != nil {
 		return nil, NewBadRequestError(errors.Wrap(err, "unmarshal translate ids request error"))
@@ -2530,19 +2370,19 @@ func (api *API) StartTransaction(ctx context.Context, id string, timeout time.Du
 	switch err {
 	case nil:
 		if exclusive {
-			api.holder.Stats.Count(MetricExclusiveTransactionRequest, 1, 1.0)
+			CounterExclusiveTransactionRequest.Inc()
 		} else {
-			api.holder.Stats.Count(MetricTransactionStart, 1, 1.0)
+			CounterTransactionStart.Inc()
 		}
 	case ErrTransactionExclusive:
 		if exclusive {
-			api.holder.Stats.Count(MetricExclusiveTransactionBlocked, 1, 1.0)
+			CounterExclusiveTransactionBlocked.Inc()
 		} else {
-			api.holder.Stats.Count(MetricTransactionBlocked, 1, 1.0)
+			CounterTransactionBlocked.Inc()
 		}
 	}
 	if exclusive && t != nil && t.Active {
-		api.holder.Stats.Count(MetricExclusiveTransactionActive, 1, 1.0)
+		CounterExclusiveTransactionActive.Inc()
 	}
 	return t, err
 }
@@ -2554,9 +2394,9 @@ func (api *API) FinishTransaction(ctx context.Context, id string, remote bool) (
 	t, err := api.server.FinishTransaction(ctx, id, remote)
 	if err == nil {
 		if t.Exclusive {
-			api.holder.Stats.Count(MetricExclusiveTransactionEnd, 1, 1.0)
+			CounterExclusiveTransactionEnd.Inc()
 		} else {
-			api.holder.Stats.Count(MetricTransactionEnd, 1, 1.0)
+			CounterTransactionEnd.Inc()
 		}
 	}
 	return t, err
@@ -2576,7 +2416,7 @@ func (api *API) GetTransaction(ctx context.Context, id string, remote bool) (*Tr
 	t, err := api.server.GetTransaction(ctx, id, remote)
 	if err == nil {
 		if t.Exclusive && t.Active {
-			api.holder.Stats.Count(MetricExclusiveTransactionActive, 1, 1.0)
+			CounterExclusiveTransactionActive.Inc()
 		}
 	}
 	return t, err
@@ -2666,6 +2506,7 @@ func (api *API) WriteIDAllocDataTo(w io.Writer) error {
 	_, err := api.holder.ida.WriteTo(w)
 	return err
 }
+
 func (api *API) RestoreIDAlloc(r io.Reader) error {
 	return api.holder.ida.Replace(r)
 }
@@ -2709,7 +2550,7 @@ func (api *API) TranslateFieldDB(ctx context.Context, indexName, fieldName strin
 	return err
 }
 
-// RestoreShard
+// RestoreShard is used by the restore tool to restore previously backed up data. This call is specific to RBF data for a shard.
 func (api *API) RestoreShard(ctx context.Context, indexName string, shard uint64, rd io.Reader) error {
 	snap := api.cluster.NewSnapshot()
 	if !snap.OwnsShard(api.server.nodeID, indexName, shard) {
@@ -2717,15 +2558,15 @@ func (api *API) RestoreShard(ctx context.Context, indexName string, shard uint64
 	}
 
 	idx := api.holder.Index(indexName)
-	//need to get a dbShard
-	dbs, err := idx.Txf().dbPerShard.GetDBShard(indexName, shard, idx)
+	// need to get a dbShard
+	dbs, err := api.holder.Txf().dbPerShard.GetDBShard(indexName, shard, idx)
 	if err != nil {
 		return err
 	}
 	db := dbs.W
 	finalPath := db.Path() + "/data"
 	tempPath := finalPath + ".tmp"
-	o, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	o, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -2764,8 +2605,8 @@ func (api *API) RestoreShard(ctx context.Context, indexName string, shard uint64
 		return err
 	}
 	defer tx.Rollback()
-	//arguments idx,shard do not matter for rbf they
-	//are ignored
+	// arguments idx,shard do not matter for rbf they
+	// are ignored
 	flvs, err := tx.GetSortedFieldViewList(idx, shard)
 	if err != nil {
 		return nil
@@ -2884,14 +2725,15 @@ func (api *API) MutexCheckNode(ctx context.Context, qcx *Qcx, indexName string, 
 // MutexCheck checks a named field for mutex violations, returning a
 // map of record IDs to values for records that have multiple values in the
 // field. The return will be one of:
-//     details true:
-//     map[uint64][]uint64 // unkeyed index, unkeyed field
-//     map[uint64][]string // unkeyed index, keyed field
-//     map[string][]uint64 // keyed index, unkeyed field
-//     map[string][]string // keyed index, keyed field
-//     details false:
-//     []uint64            // unkeyed index
-//     []string            // keyed index
+//
+//	details true:
+//	map[uint64][]uint64 // unkeyed index, unkeyed field
+//	map[uint64][]string // unkeyed index, keyed field
+//	map[string][]uint64 // keyed index, unkeyed field
+//	map[string][]string // keyed index, keyed field
+//	details false:
+//	[]uint64            // unkeyed index
+//	[]string            // keyed index
 func (api *API) MutexCheck(ctx context.Context, qcx *Qcx, indexName string, fieldName string, details bool, limit int) (result interface{}, err error) {
 	if err = api.validate(apiMutexCheck); err != nil {
 		return nil, errors.Wrap(err, "validating api method")
@@ -2943,8 +2785,8 @@ func (api *API) MutexCheck(ctx context.Context, qcx *Qcx, indexName string, fiel
 	useIndexKeys := index.Keys()
 	// If we're not doing details, we won't translate field keys even if we could.
 	useFieldKeys := field.Keys() && details
-	var indexKeys = map[uint64]string{}
-	var fieldKeys = map[uint64]string{}
+	indexKeys := map[uint64]string{}
+	fieldKeys := map[uint64]string{}
 	var indexIDs []uint64
 	var fieldIDs []uint64
 	// We'll use the string "untranslated" as our default value and overwrite
@@ -3172,8 +3014,19 @@ processing:
 	}
 	return result, ctx.Err()
 }
-func (api *API) Plan(ctx context.Context, q string) (*Stmt, error) {
-	return api.server.PlanSQL(ctx, q)
+
+// CompilePlan takes a sql string and returns a PlanOperator. Note that this is
+// different from the internal CompilePlan() method on the CompilePlanner
+// interface, which takes a parser statement and returns a PlanOperator. In
+// other words, this CompilePlan() both parses and plans the provided sql
+// string; it's the equivalent of the CompileExecutionPlan() method on Server.
+// TODO: consider renaming this to something with less conflict.
+func (api *API) CompilePlan(ctx context.Context, q string) (planner_types.PlanOperator, error) {
+	return api.server.CompileExecutionPlan(ctx, q)
+}
+
+func (api *API) RehydratePlanOperator(ctx context.Context, reader io.Reader) (planner_types.PlanOperator, error) {
+	return api.server.RehydratePlanOperator(ctx, reader)
 }
 
 func (api *API) RBFDebugInfo() map[string]*rbf.DebugInfo {
@@ -3189,6 +3042,124 @@ func (api *API) RBFDebugInfo() map[string]*rbf.DebugInfo {
 		infos[skey] = wrapper.db.DebugInfo()
 	}
 	return infos
+}
+
+// Directive applies the provided Directive to the local computer.
+func (api *API) Directive(ctx context.Context, d *dax.Directive) error {
+	return api.ApplyDirective(ctx, d)
+}
+
+// DirectiveApplied returns true if the computer's current Directive has been
+// applied and is ready to be queried. This is temporary (primarily for tests)
+// and needs to be refactored as we improve the logic around
+// controller-to-computer communication.
+func (api *API) DirectiveApplied(ctx context.Context) (bool, error) {
+	return api.holder.DirectiveApplied(), nil
+}
+
+// SnapshotShardData triggers the node to perform a shard snapshot based on the
+// provided SnapshotShardDataRequest.
+func (api *API) SnapshotShardData(ctx context.Context, req *dax.SnapshotShardDataRequest) error {
+	if !api.holder.DirectiveApplied() {
+		return errors.New("don't have directive yet, can't snapshot shard")
+	}
+	// TODO(jaffee) confirm this node is actually responsible for the given
+	// shard? Not sure we need to given that this request comes from
+	// the Controller, but might be a belt&suspenders situation.
+
+	qtid := req.TableKey.QualifiedTableID()
+
+	partition := disco.ShardToShardPartition(string(req.TableKey), uint64(req.ShardNum), disco.DefaultPartitionN)
+	partitionNum := dax.PartitionNum(partition)
+
+	// Open a write Tx snapshotting current version.
+	rc, err := api.IndexShardSnapshot(ctx, string(req.TableKey), uint64(req.ShardNum), true)
+	if err != nil {
+		return errors.Wrap(err, "getting index/shard readcloser")
+	}
+	defer rc.Close()
+
+	resource := api.serverlessStorage.GetShardResource(qtid, partitionNum, req.ShardNum)
+	// Bump writelog version while write Tx is held.
+	if ok, err := resource.IncrementWLVersion(); err != nil {
+		return errors.Wrap(err, "incrementing write log version")
+	} else if !ok {
+		return nil
+	}
+	// TODO(jaffee) look into downgrading Tx on RBF to read lock here now that WL version is incremented.
+	err = resource.Snapshot(rc)
+	return errors.Wrap(err, "snapshotting shard data")
+}
+
+// SnapshotTableKeys triggers the node to perform a table keys snapshot based on
+// the provided SnapshotTableKeysRequest.
+func (api *API) SnapshotTableKeys(ctx context.Context, req *dax.SnapshotTableKeysRequest) error {
+	if !api.holder.DirectiveApplied() {
+		return errors.New("don't have directive yet, can't snapshot table keys")
+	}
+	// If the index is not keyed, no-op on snapshotting its keys.
+	if idx, err := api.Index(ctx, string(req.TableKey)); err != nil {
+		return newNotFoundError(ErrIndexNotFound, string(req.TableKey))
+	} else if !idx.Keys() {
+		return nil
+	}
+
+	qtid := req.TableKey.QualifiedTableID()
+
+	// Create the snapshot for the current version.
+	trans, err := api.TranslateData(ctx, string(req.TableKey), int(req.PartitionNum))
+	if err != nil {
+		return errors.Wrapf(err, "getting index/partition translate store: %s/%d", req.TableKey, req.PartitionNum)
+	}
+	// get a write tx to ensure no other writes while incrementing WL version.
+	wrTo, err := trans.Begin(true)
+	if err != nil {
+		return errors.Wrap(err, "beginning table translate write tx")
+	}
+	defer wrTo.Rollback()
+
+	resource := api.serverlessStorage.GetTableKeyResource(qtid, req.PartitionNum)
+	if ok, err := resource.IncrementWLVersion(); err != nil {
+		return errors.Wrap(err, "incrementing write log version")
+	} else if !ok {
+		// no need to snapshot, no writes
+		return nil
+	}
+	// TODO(jaffee) downgrade write tx to read-only
+	err = resource.SnapshotTo(wrTo)
+	return errors.Wrap(err, "snapshotting table keys")
+}
+
+// SnapshotFieldKeys triggers the node to perform a field keys snapshot based on
+// the provided SnapshotFieldKeysRequest.
+func (api *API) SnapshotFieldKeys(ctx context.Context, req *dax.SnapshotFieldKeysRequest) error {
+	if !api.holder.DirectiveApplied() {
+		return errors.New("don't have directive yet, can't snapshot field keys")
+	}
+	qtid := req.TableKey.QualifiedTableID()
+
+	// Create the snapshot for the current version.
+	trans, err := api.FieldTranslateData(ctx, string(req.TableKey), string(req.Field))
+	if err != nil {
+		return errors.Wrap(err, "getting index/field translator")
+	}
+	// get a write tx to ensure no other writes while incrementing WL version.
+	wrTo, err := trans.Begin(true)
+	if err != nil {
+		return errors.Wrap(err, "beginning field translate write tx")
+	}
+	defer wrTo.Rollback()
+
+	resource := api.serverlessStorage.GetFieldKeyResource(qtid, req.Field)
+	if ok, err := resource.IncrementWLVersion(); err != nil {
+		return errors.Wrap(err, "incrementing writelog version")
+	} else if !ok {
+		// no need to snapshot, no writes
+		return nil
+	}
+	// TODO(jaffee) downgrade to read tx
+	err = resource.SnapshotTo(wrTo)
+	return errors.Wrap(err, "snapshotTo in FieldKeys")
 }
 
 type serverInfo struct {
@@ -3222,20 +3193,20 @@ const (
 	apiTranslateData
 	apiFieldTranslateData
 	apiField
-	//apiHosts // not implemented
+	// apiHosts // not implemented
 	apiImport
 	apiImportValue
 	apiIndex
-	//apiLocalID // not implemented
-	//apiLongQueryTime // not implemented
-	//apiMaxShards // not implemented
+	// apiLocalID // not implemented
+	// apiLongQueryTime // not implemented
+	// apiMaxShards // not implemented
 	apiQuery
 	apiRecalculateCaches
 	apiSchema
 	apiShardNodes
 	apiState
-	//apiStatsWithTags // not implemented
-	//apiVersion // not implemented
+	// apiStatsWithTags // not implemented
+	// apiVersion // not implemented
 	apiViews
 	apiApplySchema
 	apiStartTransaction
@@ -3248,9 +3219,9 @@ const (
 	apiIDCommit
 	apiIDReset
 	apiPartitionNodes
-	apiIngestOperations
-	apiIngestNodeOperations
 	apiMutexCheck
+	apiApplyChangeset
+	apiDeleteDataframe
 )
 
 var methodsCommon = map[apiMethod]struct{}{
@@ -3258,24 +3229,25 @@ var methodsCommon = map[apiMethod]struct{}{
 	apiState:          {},
 }
 
-// var methodsDegraded = map[apiMethod]struct{}{
-// 	apiExportCSV:         {},
-// 	apiFragmentBlockData: {},
-// 	apiFragmentBlocks:    {},
-// 	apiField:             {},
-// 	apiIndex:             {},
-// 	apiQuery:             {},
-// 	apiRecalculateCaches: {},
-// 	apiRemoveNode:        {},
-// 	apiShardNodes:        {},
-// 	apiSchema:            {},
-// 	apiViews:             {},
-// 	apiStartTransaction:  {},
-// 	apiFinishTransaction: {},
-// 	apiTransactions:      {},
-// 	apiGetTransaction:    {},
-// 	apiActiveQueries:     {},
-// }
+var methodsDegraded = map[apiMethod]struct{}{
+	apiExportCSV:         {},
+	apiFragmentBlockData: {},
+	apiFragmentBlocks:    {},
+	apiField:             {},
+	apiIndex:             {},
+	apiQuery:             {},
+	apiRecalculateCaches: {},
+	apiShardNodes:        {},
+	apiSchema:            {},
+	apiViews:             {},
+	apiStartTransaction:  {},
+	apiFinishTransaction: {},
+	apiTransactions:      {},
+	apiGetTransaction:    {},
+	apiActiveQueries:     {},
+	apiPastQueries:       {},
+	apiPartitionNodes:    {},
+}
 
 var methodsNormal = map[apiMethod]struct{}{
 	apiCreateField:          {},
@@ -3309,7 +3281,245 @@ var methodsNormal = map[apiMethod]struct{}{
 	apiIDCommit:             {},
 	apiIDReset:              {},
 	apiPartitionNodes:       {},
-	apiIngestOperations:     {},
-	apiIngestNodeOperations: {},
 	apiMutexCheck:           {},
+	apiApplyChangeset:       {},
+	apiDeleteDataframe:      {},
+}
+
+func shardInShards(i dax.ShardNum, s dax.ShardNums) bool {
+	for _, o := range s {
+		if i == o {
+			return true
+		}
+	}
+	return false
+}
+
+type SchemaAPI interface {
+	CreateDatabase(context.Context, *dax.Database) error
+	DropDatabase(context.Context, dax.DatabaseID) error
+
+	DatabaseByName(ctx context.Context, dbname dax.DatabaseName) (*dax.Database, error)
+	DatabaseByID(ctx context.Context, dbid dax.DatabaseID) (*dax.Database, error)
+	SetDatabaseOption(ctx context.Context, dbid dax.DatabaseID, option string, value string) error
+	Databases(context.Context, ...dax.DatabaseID) ([]*dax.Database, error)
+
+	TableByName(ctx context.Context, tname dax.TableName) (*dax.Table, error)
+	TableByID(ctx context.Context, tid dax.TableID) (*dax.Table, error)
+	Tables(ctx context.Context) ([]*dax.Table, error)
+
+	CreateTable(ctx context.Context, tbl *dax.Table) error
+	CreateField(ctx context.Context, tname dax.TableName, fld *dax.Field) error
+
+	DeleteTable(ctx context.Context, tname dax.TableName) error
+	DeleteField(ctx context.Context, tname dax.TableName, fname dax.FieldName) error
+}
+
+// Ensure type implements interface.
+var _ SchemaAPI = (*NopSchemaAPI)(nil)
+
+// NopSchemaAPI is a no-op implementation of the SchemaAPI.
+type NopSchemaAPI struct{}
+
+func (n *NopSchemaAPI) ClusterName() string {
+	return ""
+}
+func (n *NopSchemaAPI) CreateDatabase(context.Context, *dax.Database) error { return nil }
+func (n *NopSchemaAPI) DropDatabase(context.Context, dax.DatabaseID) error  { return nil }
+func (n *NopSchemaAPI) DatabaseByName(ctx context.Context, dbname dax.DatabaseName) (*dax.Database, error) {
+	return nil, nil
+}
+func (n *NopSchemaAPI) DatabaseByID(ctx context.Context, dbid dax.DatabaseID) (*dax.Database, error) {
+	return nil, nil
+}
+func (n *NopSchemaAPI) SetDatabaseOption(ctx context.Context, dbid dax.DatabaseID, option string, value string) error {
+	return nil
+}
+func (n *NopSchemaAPI) Databases(context.Context, ...dax.DatabaseID) ([]*dax.Database, error) {
+	return nil, nil
+}
+func (n *NopSchemaAPI) TableByName(ctx context.Context, tname dax.TableName) (*dax.Table, error) {
+	return nil, nil
+}
+func (n *NopSchemaAPI) TableByID(ctx context.Context, tid dax.TableID) (*dax.Table, error) {
+	return nil, nil
+}
+func (n *NopSchemaAPI) Tables(ctx context.Context) ([]*dax.Table, error) { return nil, nil }
+
+func (n *NopSchemaAPI) CreateTable(ctx context.Context, tbl *dax.Table) error { return nil }
+func (n *NopSchemaAPI) CreateField(ctx context.Context, tname dax.TableName, fld *dax.Field) error {
+	return nil
+}
+func (n *NopSchemaAPI) DeleteTable(ctx context.Context, tname dax.TableName) error { return nil }
+func (n *NopSchemaAPI) DeleteField(ctx context.Context, tname dax.TableName, fname dax.FieldName) error {
+	return nil
+}
+
+type ClusterNode struct {
+	ID        string
+	Type      string
+	State     string
+	URI       string
+	GRPCURI   string
+	IsPrimary bool
+}
+
+type SystemAPI interface {
+	ClusterName() string
+	Version() string
+	PlatformDescription() string
+	PlatformVersion() string
+	ClusterNodeCount() int
+	ClusterReplicaCount() int
+	ShardWidth() int
+	ClusterState() string
+	DataDir() string
+
+	NodeID() string
+	ClusterNodes() []ClusterNode
+}
+
+// CreateFieldObj is used to encapsulate the information required for creating a
+// field in the SchemaAPI.CreateIndexAndFields interface method.
+type CreateFieldObj struct {
+	Name    string
+	Options []FieldOption
+}
+
+// QueryAPI is a subset of the API methods which have to do with query.
+type QueryAPI interface {
+	Query(ctx context.Context, req *QueryRequest) (QueryResponse, error)
+}
+
+// Ensure type implements interface.
+var _ SystemAPI = (*FeatureBaseSystemAPI)(nil)
+
+// FeatureBaseSystemAPI is a wrapper around pilosa.API. It implements the
+// SystemAPI interface
+type FeatureBaseSystemAPI struct {
+	*API
+}
+
+func (fsapi *FeatureBaseSystemAPI) ClusterName() string {
+	return fsapi.API.ClusterName()
+}
+
+func (fsapi *FeatureBaseSystemAPI) Version() string {
+	return fsapi.API.Version()
+}
+
+func (fsapi *FeatureBaseSystemAPI) PlatformDescription() string {
+	si := fsapi.server.systemInfo
+	platform, err := si.Platform()
+	if err != nil {
+		return "unknown"
+	}
+	return platform
+}
+
+func (fsapi *FeatureBaseSystemAPI) PlatformVersion() string {
+	si := fsapi.server.systemInfo
+	platformVersion, err := si.OSVersion()
+	if err != nil {
+		return "unknown"
+	}
+	return platformVersion
+}
+
+func (fsapi *FeatureBaseSystemAPI) ClusterNodeCount() int {
+	return len(fsapi.cluster.noder.Nodes())
+}
+
+func (fsapi *FeatureBaseSystemAPI) ClusterReplicaCount() int {
+	return fsapi.cluster.ReplicaN
+}
+
+func (fsapi *FeatureBaseSystemAPI) ShardWidth() int {
+	return ShardWidth
+}
+
+func (fsapi *FeatureBaseSystemAPI) ClusterState() string {
+	state, err := fsapi.State()
+	if err != nil {
+		return "UNKNOWN"
+	}
+	return string(state)
+}
+
+func (fsapi *FeatureBaseSystemAPI) DataDir() string {
+	return fsapi.server.dataDir
+}
+
+func (fsapi *FeatureBaseSystemAPI) NodeID() string {
+	return fsapi.cluster.Node.ID
+}
+
+func (fsapi *FeatureBaseSystemAPI) ClusterNodes() []ClusterNode {
+	result := make([]ClusterNode, 0)
+
+	nodes := fsapi.Hosts(context.Background())
+
+	for _, n := range nodes {
+		scn := ClusterNode{
+			ID:        n.ID,
+			State:     string(n.State),
+			URI:       n.URI.String(),
+			GRPCURI:   n.GRPCURI.String(),
+			IsPrimary: n.IsPrimary,
+		}
+		result = append(result, scn)
+	}
+
+	return result
+}
+
+// Ensure type implements interface.
+var _ SystemAPI = (*NopSystemAPI)(nil)
+
+// NopSystemAPI is a no-op implementation of the SystemAPI.
+type NopSystemAPI struct{}
+
+func (napi *NopSystemAPI) ClusterName() string {
+	return ""
+}
+
+func (napi *NopSystemAPI) Version() string {
+	return ""
+}
+
+func (napi *NopSystemAPI) PlatformDescription() string {
+	return ""
+}
+
+func (napi *NopSystemAPI) PlatformVersion() string {
+	return ""
+}
+
+func (napi *NopSystemAPI) ClusterNodeCount() int {
+	return 0
+}
+
+func (napi *NopSystemAPI) ClusterReplicaCount() int {
+	return 0
+}
+
+func (napi *NopSystemAPI) ShardWidth() int {
+	return 0
+}
+
+func (napi *NopSystemAPI) ClusterState() string {
+	return ""
+}
+
+func (napi *NopSystemAPI) DataDir() string {
+	return ""
+}
+
+func (napi *NopSystemAPI) NodeID() string {
+	return ""
+}
+
+func (napi *NopSystemAPI) ClusterNodes() []ClusterNode {
+	result := make([]ClusterNode, 0)
+	return result
 }

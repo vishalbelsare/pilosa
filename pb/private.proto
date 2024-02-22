@@ -7,6 +7,7 @@ import "public.proto";
 message IndexMeta {
 	bool Keys = 3;
 	bool TrackExistence = 4;
+	string Description = 5;
 }
 
 message FieldOptions {
@@ -26,6 +27,7 @@ message FieldOptions {
 	Decimal Max = 18;
 	string TimeUnit = 19;
 	string TTL = 20;
+	bool TrackExistence = 21;
 }
 
 message ImportResponse {
@@ -67,6 +69,7 @@ message CreateIndexMessage {
 	string Index = 1;
 	IndexMeta Meta = 2;
 	int64 CreatedAt  = 3;
+	string Owner = 5;
 }
 
 message CreateFieldMessage {
@@ -74,6 +77,7 @@ message CreateFieldMessage {
 	string Field = 2;
 	FieldOptions Meta = 3;
 	int64 CreatedAt  = 4;
+	string Owner = 5;
 }
 
 message UpdateFieldMessage {
@@ -266,4 +270,8 @@ message ShardIngestOperations {
 
 message ShardedIngestRequest {
     map <uint64, ShardIngestOperations> Ops = 1;
+}
+
+message DeleteDataframeMessage {
+	string Index = 1;
 }

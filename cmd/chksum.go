@@ -3,15 +3,15 @@
 package cmd
 
 import (
-	"context"
-	"io"
+	"os"
 
 	"github.com/featurebasedb/featurebase/v3/ctl"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/spf13/cobra"
 )
 
-func newChkSumCommand(stdin io.Reader, stdout io.Writer, stderr io.Writer) *cobra.Command {
-	cmd := ctl.NewChkSumCommand(stdin, stdout, stderr)
+func newChkSumCommand(logdest logger.Logger) *cobra.Command {
+	cmd := ctl.NewChkSumCommand(logdest, os.Stdout)
 	ccmd := &cobra.Command{
 		Use:   "chksum",
 		Short: "Digital signature of FeatureBase data",
@@ -19,9 +19,7 @@ func newChkSumCommand(stdin io.Reader, stdout io.Writer, stderr io.Writer) *cobr
 			Generates a digital signature of all the data associated with a provided FeatureBase server
 			WARNING: could be slow if high cardinality fields exist
 `,
-		RunE: func(c *cobra.Command, args []string) error {
-			return cmd.Run(context.Background())
-		},
+		RunE: UsageErrorWrapper(cmd),
 	}
 
 	flags := ccmd.Flags()

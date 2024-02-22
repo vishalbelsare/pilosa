@@ -14,6 +14,7 @@ import (
 
 	pilosa "github.com/featurebasedb/featurebase/v3"
 	"github.com/featurebasedb/featurebase/v3/authn"
+	"github.com/featurebasedb/featurebase/v3/logger"
 	"github.com/featurebasedb/featurebase/v3/pql"
 	"github.com/featurebasedb/featurebase/v3/server"
 	"github.com/pkg/errors"
@@ -58,17 +59,22 @@ type ImportCommand struct { // nolint: maligned
 	client *pilosa.InternalClient
 
 	// Standard input/output
-	*pilosa.CmdIO
+	logDest logger.Logger
 
 	TLS server.TLSConfig
 
 	AuthToken string
 }
 
+// Logger returns the command's associated Logger to maintain CommandWithTLSSupport interface compatibility
+func (cmd *ImportCommand) Logger() logger.Logger {
+	return cmd.logDest
+}
+
 // NewImportCommand returns a new instance of ImportCommand.
-func NewImportCommand(stdin io.Reader, stdout, stderr io.Writer) *ImportCommand {
+func NewImportCommand(logdest logger.Logger) *ImportCommand {
 	return &ImportCommand{
-		CmdIO:      pilosa.NewCmdIO(stdin, stdout, stderr),
+		logDest:    logdest,
 		BufferSize: 10000000,
 	}
 }
@@ -80,11 +86,11 @@ func (cmd *ImportCommand) Run(ctx context.Context) error {
 	// Validate arguments.
 	// Index and field are validated early before the files are parsed.
 	if cmd.Index == "" {
-		return pilosa.ErrIndexRequired
+		return fmt.Errorf("%w: %v", ErrUsage, pilosa.ErrIndexRequired)
 	} else if cmd.Field == "" {
-		return pilosa.ErrFieldRequired
+		return fmt.Errorf("%w: %v", ErrUsage, pilosa.ErrFieldRequired)
 	} else if len(cmd.Paths) == 0 {
-		return errors.New("path required")
+		return fmt.Errorf("%w: path required", ErrUsage)
 	}
 	// Create a client to the server.
 	client, err := commandClient(cmd)
@@ -94,11 +100,7 @@ func (cmd *ImportCommand) Run(ctx context.Context) error {
 	cmd.client = client
 
 	if cmd.AuthToken != "" {
-		ctx = context.WithValue(
-			ctx,
-			authn.ContextValueAccessToken,
-			"Bearer "+cmd.AuthToken,
-		)
+		ctx = authn.WithAccessToken(ctx, "Bearer "+cmd.AuthToken)
 	}
 
 	if cmd.CreateSchema {
@@ -189,7 +191,7 @@ func (cmd *ImportCommand) bufferBits(ctx context.Context, useColumnKeys, useRowK
 		// Read rows as bits.
 		r = csv.NewReader(f)
 	} else {
-		r = csv.NewReader(cmd.Stdin)
+		r = csv.NewReader(os.Stdin)
 	}
 
 	r.FieldsPerRecord = -1
@@ -311,7 +313,7 @@ func (cmd *ImportCommand) bufferValues(ctx context.Context, useColumnKeys, parse
 		// Read rows as bits.
 		r = csv.NewReader(f)
 	} else {
-		r = csv.NewReader(cmd.Stdin)
+		r = csv.NewReader(os.Stdin)
 	}
 
 	r.FieldsPerRecord = -1

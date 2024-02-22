@@ -6,10 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
-	gohttp "net/http"
 	"os"
 	"path"
 	"reflect"
@@ -22,6 +21,7 @@ import (
 	"github.com/featurebasedb/featurebase/v3/encoding/proto"
 	"github.com/featurebasedb/featurebase/v3/server"
 	"github.com/featurebasedb/featurebase/v3/test"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestHandlerOptions(t *testing.T) {
@@ -172,17 +172,18 @@ func TestUpdateFieldTTL(t *testing.T) {
 		},
 	}
 
+	indexName := c.Idx("s")
 	for i, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			c.CreateField(t, "ttltest", pilosa.IndexOptions{}, test.name, pilosa.OptFieldTypeTime(pilosa.TimeQuantum("YMD"), test.ttl))
-			nodeURL := c.Nodes[0].URL() + "/index/ttltest/field/" + test.field
-			req, err := gohttp.NewRequest("PATCH", nodeURL, strings.NewReader(test.ttlOption))
+			c.CreateField(t, indexName, pilosa.IndexOptions{}, test.name, pilosa.OptFieldTypeTime(pilosa.TimeQuantum("YMD"), test.ttl))
+			nodeURL := fmt.Sprintf("%s/index/%s/field/%s", c.Nodes[0].URL(), c, test.field)
+			req, err := http.NewRequest("PATCH", nodeURL, strings.NewReader(test.ttlOption))
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			req.Header.Set("Content-Type", "application/json")
-			resp, err := gohttp.DefaultClient.Do(req)
+			resp, err := http.DefaultClient.Do(req)
 
 			if err != nil {
 				t.Fatalf("doing option request: %v", err)
@@ -195,7 +196,8 @@ func TestUpdateFieldTTL(t *testing.T) {
 			if resp.StatusCode == 400 || resp.StatusCode == 404 {
 				// unmarshal error message to check against expErr
 				var respBody map[string]interface{}
-				json.NewDecoder(resp.Body).Decode(&respBody)
+				err := json.NewDecoder(resp.Body).Decode(&respBody)
+				assert.NoError(t, err)
 				errMsg := respBody["error"].(map[string]interface{})["message"].(string)
 
 				if !strings.Contains(errMsg, test.expErr) {
@@ -213,12 +215,21 @@ func TestUpdateFieldTTL(t *testing.T) {
 				if err != nil {
 					t.Fatalf("getting schema: %v", err)
 				}
-				if ii[0].Fields[i].Name == test.name {
-					if ii[0].Fields[i].Options.TTL != test.expTTL {
-						t.Errorf("expected TTL: '%s', got: '%s'", test.expTTL, ii[0].Fields[i].Options.TTL)
+				for _, idx := range ii {
+					if idx.Name == indexName {
+						if len(idx.Fields) <= i {
+							t.Fatalf("expected %d fields, last %s, got %d fields",
+								i, test.name, len(idx.Fields))
+						}
+						if idx.Fields[i].Name == test.name {
+							if idx.Fields[i].Options.TTL != test.expTTL {
+								t.Errorf("expected noStandardView value: '%s', got: '%s'", test.expTTL, idx.Fields[i].Options.TTL)
+							}
+						} else {
+							t.Errorf("unexpected field: '%s', got: '%s'", test.name, idx.Fields[i].Name)
+						}
+						break
 					}
-				} else {
-					t.Errorf("unexpected field: '%s', got: '%s'", test.name, ii[0].Fields[i].Name)
 				}
 			}
 
@@ -276,18 +287,20 @@ func TestUpdateFieldNoStandardView(t *testing.T) {
 			expNoStandardView: false,
 		},
 	}
+	// "s" to make it match %s behavior of a cluster
+	indexName := c.Idx("s")
 
 	for i, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			c.CreateField(t, "ttltest", pilosa.IndexOptions{}, test.name, pilosa.OptFieldTypeTime(pilosa.TimeQuantum("YMD"), "0"))
-			nodeURL := c.Nodes[0].URL() + "/index/ttltest/field/" + test.field
-			req, err := gohttp.NewRequest("PATCH", nodeURL, strings.NewReader(test.fieldOption))
+			c.CreateField(t, indexName, pilosa.IndexOptions{}, test.name, pilosa.OptFieldTypeTime(pilosa.TimeQuantum("YMD"), "0"))
+			nodeURL := fmt.Sprintf("%s/index/%s/field/%s", c.Nodes[0].URL(), c, test.field)
+			req, err := http.NewRequest("PATCH", nodeURL, strings.NewReader(test.fieldOption))
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			req.Header.Set("Content-Type", "application/json")
-			resp, err := gohttp.DefaultClient.Do(req)
+			resp, err := http.DefaultClient.Do(req)
 
 			if err != nil {
 				t.Fatalf("doing option request: %v", err)
@@ -300,7 +313,8 @@ func TestUpdateFieldNoStandardView(t *testing.T) {
 			if resp.StatusCode == 400 {
 				// unmarshal error message to check against expErr
 				var respBody map[string]interface{}
-				json.NewDecoder(resp.Body).Decode(&respBody)
+				err := json.NewDecoder(resp.Body).Decode(&respBody)
+				assert.NoError(t, err)
 				errMsg := respBody["error"].(map[string]interface{})["message"].(string)
 
 				if !strings.Contains(errMsg, test.expErr) {
@@ -314,129 +328,36 @@ func TestUpdateFieldNoStandardView(t *testing.T) {
 				if err != nil {
 					t.Fatalf("getting schema: %v", err)
 				}
-				if ii[0].Fields[i].Name == test.name {
-					if ii[0].Fields[i].Options.NoStandardView != test.expNoStandardView {
-						t.Errorf("expected noStandardView value: '%t', got: '%t'", test.expNoStandardView, ii[0].Fields[i].Options.NoStandardView)
+				for _, idx := range ii {
+					if idx.Name == indexName {
+						if len(idx.Fields) <= i {
+							t.Fatalf("expected %d fields, last %s, got %d fields",
+								i, test.name, len(idx.Fields))
+						}
+						if idx.Fields[i].Name == test.name {
+							if idx.Fields[i].Options.NoStandardView != test.expNoStandardView {
+								t.Errorf("expected noStandardView value: '%t', got: '%t'", test.expNoStandardView, idx.Fields[i].Options.NoStandardView)
+							}
+						} else {
+							t.Errorf("unexpected field: '%s', got: '%s'", test.name, idx.Fields[i].Name)
+						}
+						break
 					}
-				} else {
-					t.Errorf("unexpected field: '%s', got: '%s'", test.name, ii[0].Fields[i].Name)
 				}
 			}
-
 		})
-	}
-}
-
-func TestIngestSchemaHandler(t *testing.T) {
-	c := test.MustRunCluster(t, 3,
-		[]server.CommandOption{
-			server.OptCommandServerOptions(pilosa.OptServerNodeID("node0"), pilosa.OptServerClusterHasher(&test.ModHasher{}))},
-		[]server.CommandOption{
-			server.OptCommandServerOptions(pilosa.OptServerNodeID("node1"), pilosa.OptServerClusterHasher(&test.ModHasher{}))},
-		[]server.CommandOption{
-			server.OptCommandServerOptions(pilosa.OptServerNodeID("node2"), pilosa.OptServerClusterHasher(&test.ModHasher{}))},
-	)
-	defer c.Close()
-
-	schema := `
-{
-   "index-name": "example",
-   "primary-key-type": "string",
-   "index-action": "create",
-   "fields": [
-       {
-           "field-name": "idset",
-           "field-type": "id",
-           "field-options": {
-				"cache-type": "none"
-           }
-       },
-       {
-           "field-name": "id",
-           "field-type": "id",
-           "field-options": {
-               "enforce-mutual-exclusion": true
-           }
-       },
-       {
-           "field-name": "bool",
-           "field-type": "bool"
-       },
-       {
-           "field-name": "stringset",
-           "field-type": "string",
-           "field-options": {
-				"cache-type": "ranked",
-           		"cache-size": 100000
-           }
-       },
-       {
-           "field-name": "string",
-           "field-type": "string",
-           "field-options": {
-               "enforce-mutual-exclusion": true
-           }
-       },
-       {
-           "field-name": "int",
-           "field-type": "int"
-       },
-       {
-           "field-name": "decimal",
-           "field-type": "decimal",
-           "field-options": {
-               "scale": 2
-           }
-       },
-       {
-           "field-name": "timestamp",
-           "field-type": "timestamp",
-           "field-options": {
-               "epoch": "1996-12-19T16:39:57-08:00",
-               "unit": "µs"
-           }
-       },
-       {
-           "field-name": "quantum",
-           "field-type": "string",
-           "field-options": {
-               "time-quantum": "YMDH"
-           }
-       }
-   ]
-}
-`
-	m := c.GetPrimary()
-	schemaURL := fmt.Sprintf("%s/internal/schema", m.URL())
-	resp := test.Do(t, "POST", schemaURL, string(schema))
-	if resp.StatusCode != gohttp.StatusOK {
-		t.Errorf("invalid status: %d, body=%s", resp.StatusCode, resp.Body)
-	}
-	// now, try again, expecting a failure:
-	resp = test.Do(t, "POST", schemaURL, string(schema))
-	if resp.StatusCode != gohttp.StatusConflict {
-		t.Errorf("invalid status: expected 409, got %d, body=%s", resp.StatusCode, resp.Body)
 	}
 }
 
 func TestPostFieldWithTTL(t *testing.T) {
 	c := test.MustRunCluster(t, 1)
 	defer c.Close()
-
-	schema := `
-	{
-		"index-name": "ttl_test",
-		"primary-key-type": "string",
-		"index-action": "create",
-		"fields":[]
-	 }
-	`
-	m := c.GetPrimary()
-	schemaURL := fmt.Sprintf("%s/internal/schema", m.URL())
-	resp := test.Do(t, "POST", schemaURL, string(schema))
-	if resp.StatusCode != gohttp.StatusOK {
-		t.Errorf("invalid status: %d, body=%s", resp.StatusCode, resp.Body)
+	indexName := c.Idx("s")
+	_, err := c.GetNode(0).API.CreateIndex(context.Background(), indexName, pilosa.IndexOptions{Keys: true})
+	if err != nil {
+		t.Fatalf("creating index: %v", err)
 	}
+	m := c.GetPrimary()
 
 	tests := []struct {
 		name      string
@@ -448,7 +369,7 @@ func TestPostFieldWithTTL(t *testing.T) {
 	}{
 		{
 			name:      "t1_48h",
-			url:       fmt.Sprintf("%s/index/ttl_test/field/t1_48h", m.URL()),
+			url:       fmt.Sprintf("%s/index/%s/field/t1_48h", m.URL(), c),
 			option:    `{ "options": {"timeQuantum":"YMDH","type":"time","ttl":"48h" }}`,
 			expStatus: 200,
 			expErr:    `"success":true`,
@@ -456,28 +377,28 @@ func TestPostFieldWithTTL(t *testing.T) {
 		},
 		{
 			name:      "t2_unknown_unit",
-			url:       fmt.Sprintf("%s/index/ttl_test/field/t2_unknown_unit", m.URL()),
+			url:       fmt.Sprintf("%s/index/%s/field/t2_unknown_unit", m.URL(), c),
 			option:    `{ "options": {"timeQuantum":"YMDH","type":"time","ttl":"24abc" }}`,
 			expStatus: 400,
 			expErr:    "cannot parse ttl",
 		},
 		{
 			name:      "t3_invalid",
-			url:       fmt.Sprintf("%s/index/ttl_test/field/t3_invalid", m.URL()),
+			url:       fmt.Sprintf("%s/index/%s/field/t3_invalid", m.URL(), c),
 			option:    `{ "options": {"timeQuantum":"YMDH","type":"time","ttl":"abcdef" }}`,
 			expStatus: 400,
 			expErr:    "cannot parse ttl",
 		},
 		{
 			name:      "t4_invalid_empty",
-			url:       fmt.Sprintf("%s/index/ttl_test/field/t4_invalid_empty", m.URL()),
+			url:       fmt.Sprintf("%s/index/%s/field/t4_invalid_empty", m.URL(), c),
 			option:    `{ "options": {"timeQuantum":"YMDH","type":"time","ttl":"" }}`,
 			expStatus: 400,
 			expErr:    "cannot parse ttl",
 		},
 		{
 			name:      "t5_negative",
-			url:       fmt.Sprintf("%s/index/ttl_test/field/t5_negative", m.URL()),
+			url:       fmt.Sprintf("%s/index/%s/field/t5_negative", m.URL(), c),
 			option:    `{ "options": {"timeQuantum":"YMDH","type":"time","ttl":"-24h" }}`,
 			expStatus: 400,
 			expErr:    "ttl can't be negative",
@@ -505,12 +426,21 @@ func TestPostFieldWithTTL(t *testing.T) {
 						t.Fatalf("getting schema: %v", err)
 					}
 
-					if ii[0].Fields[i].Name == test_i.name {
-						if ii[0].Fields[i].Options.TTL != test_i.expTTL {
-							t.Errorf("expected TTL: '%s', got: '%s'", test_i.expTTL, ii[0].Fields[i].Options.TTL)
+					for _, idx := range ii {
+						if idx.Name == indexName {
+							if len(idx.Fields) <= i {
+								t.Fatalf("expected %d fields, last %s, got %d fields",
+									i, test_i.name, len(idx.Fields))
+							}
+							if idx.Fields[i].Name == test_i.name {
+								if idx.Fields[i].Options.TTL != test_i.expTTL {
+									t.Errorf("expected TTL: '%s', got: '%s'", test_i.expTTL, idx.Fields[i].Options.TTL)
+								}
+							} else {
+								t.Errorf("unexpected field: '%s', got: '%s'", test_i.name, idx.Fields[i].Name)
+							}
+							break
 						}
-					} else {
-						t.Errorf("unexpected field: '%s', got: '%s'", test_i.name, ii[0].Fields[i].Name)
 					}
 				}
 			}
@@ -522,41 +452,30 @@ func TestGetViewAndDelete(t *testing.T) {
 	c := test.MustRunCluster(t, 1)
 	defer c.Close()
 
-	schema := `
-	{
-		"index-name": "example",
-		"primary-key-type": "string",
-		"index-action": "create",
-		"fields": [
-			{
-				"field-name": "test_view",
-				"field-type": "time",
-				"field-options": {
-					"time-quantum": "YMDH"
-				}
-			}
-		]
-	 }
-	 `
 	m := c.GetPrimary()
-	schemaURL := fmt.Sprintf("%s/internal/schema", m.URL())
-	resp := test.Do(t, "POST", schemaURL, string(schema))
-	if resp.StatusCode != gohttp.StatusOK {
-		t.Errorf("invalid status: %d, body=%s", resp.StatusCode, resp.Body)
+
+	_, err := m.API.CreateIndex(context.Background(), c.Idx("s"), pilosa.IndexOptions{})
+	if err != nil {
+		t.Fatalf("creating index: %v", err)
+	}
+	_, err = m.API.CreateField(context.Background(), c.Idx("s"), "test_view", pilosa.OptFieldTypeTime(pilosa.TimeQuantum("YMDH"), "0"))
+	if err != nil {
+		t.Fatalf("creating field: %v", err)
 	}
 
 	// Send sample data
-	postQueryUrl := fmt.Sprintf("%s/index/example/query", m.URL())
+	postQueryUrl := fmt.Sprintf("%s/index/%s/query", m.URL(), c)
 	queryOption := `
 	Set(1,test_view=1,2001-02-03T04:05)
 	`
 	respQuery := test.Do(t, "POST", postQueryUrl, string(queryOption))
-	if respQuery.StatusCode != gohttp.StatusOK {
+	if respQuery.StatusCode != http.StatusOK {
 		t.Errorf("posting query, status: %d, body=%s", respQuery.StatusCode, respQuery.Body)
 	}
 
 	// The above sample data should create these views:
 	expectedViewNames := []string{
+		"existence",
 		"standard",
 		"standard_2001",
 		"standard_200102",
@@ -565,9 +484,9 @@ func TestGetViewAndDelete(t *testing.T) {
 	}
 
 	// Call view to get data
-	viewUrl := fmt.Sprintf("%s/index/example/field/test_view/view", m.URL())
+	viewUrl := fmt.Sprintf("%s/index/%s/field/test_view/view", m.URL(), c)
 	respView := test.Do(t, "GET", viewUrl, "")
-	if respView.StatusCode != gohttp.StatusOK {
+	if respView.StatusCode != http.StatusOK {
 		t.Errorf("view handler, status: %d, body=%s", respView.StatusCode, respView.Body)
 	}
 
@@ -595,9 +514,9 @@ func TestGetViewAndDelete(t *testing.T) {
 	}
 
 	// call delete on view standard_2001020304
-	deleteViewUrl := fmt.Sprintf("%s/index/example/field/test_view/view/standard_2001020304", m.URL())
+	deleteViewUrl := fmt.Sprintf("%s/index/%s/field/test_view/view/standard_2001020304", m.URL(), c)
 	respDelete := test.Do(t, "DELETE", deleteViewUrl, "")
-	if respDelete.StatusCode != gohttp.StatusOK {
+	if respDelete.StatusCode != http.StatusOK {
 		t.Errorf("delete handler, status: %d, body=%s", respDelete.StatusCode, respDelete.Body)
 	}
 
@@ -605,9 +524,9 @@ func TestGetViewAndDelete(t *testing.T) {
 	expectedViewNames = expectedViewNames[:len(expectedViewNames)-1]
 
 	// call view again
-	viewUrl = fmt.Sprintf("%s/index/example/field/test_view/view", m.URL())
+	viewUrl = fmt.Sprintf("%s/index/%s/field/test_view/view", m.URL(), c)
 	respView = test.Do(t, "GET", viewUrl, "")
-	if respView.StatusCode != gohttp.StatusOK {
+	if respView.StatusCode != http.StatusOK {
 		t.Errorf("view handler after delete, status: %d, body=%s", respView.StatusCode, respView.Body)
 	}
 
@@ -627,6 +546,63 @@ func TestGetViewAndDelete(t *testing.T) {
 	}
 }
 
+// TestHandlerSQL tests that the json coming back from a POST /sql request has
+// the expected json tags.
+func TestHandlerSQL(t *testing.T) {
+	cfg := server.NewConfig()
+	c := test.MustRunCluster(t, 1, []server.CommandOption{
+		server.OptCommandConfig(cfg),
+	})
+	defer c.Close()
+
+	m := c.GetPrimary()
+
+	tests := []struct {
+		name    string
+		url     string
+		sql     string
+		expKeys []string
+	}{
+		{
+			name:    "sql",
+			url:     "/sql",
+			sql:     "show tables",
+			expKeys: []string{"schema", "data", "execution-time"},
+		},
+		{
+			name:    "sql-with-plan",
+			url:     "/sql?plan=1",
+			sql:     "show tables",
+			expKeys: []string{"schema", "data", "query-plan", "execution-time"},
+		},
+		{
+			name:    "invalid-sql",
+			url:     "/sql",
+			sql:     "invalid sql",
+			expKeys: []string{"error", "execution-time"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sqlURL := fmt.Sprintf("%s%s", m.URL(), tt.url)
+			resp := test.Do(t, "POST", sqlURL, tt.sql)
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("post sql, status: %d, body=%s", resp.StatusCode, resp.Body)
+			}
+
+			out := make(map[string]interface{})
+			assert.NoError(t, json.Unmarshal([]byte(resp.Body), &out))
+
+			keys := make([]string, 0, len(out))
+			for k := range out {
+				keys = append(keys, k)
+			}
+
+			assert.ElementsMatch(t, tt.expKeys, keys)
+		})
+	}
+}
+
 func TestTranslationHandlers(t *testing.T) {
 	// reusable data for the tests
 	nameBytes, err := json.Marshal([]string{"a", "b", "c"})
@@ -637,34 +613,20 @@ func TestTranslationHandlers(t *testing.T) {
 
 	c := test.MustRunCluster(t, 1)
 	defer c.Close()
-
-	schema := `
-{
-   "index-name": "example",
-   "primary-key-type": "string",
-   "index-action": "create",
-   "fields": [
-       {
-           "field-name": "stringset",
-           "field-type": "string",
-           "field-options": {
-				"cache-type": "ranked",
-           		"cache-size": 100000
-           }
-       }
-   ]
-}
-`
 	m := c.GetPrimary()
-	schemaURL := fmt.Sprintf("%s/internal/schema", m.URL())
-	resp := test.Do(t, "POST", schemaURL, string(schema))
-	if resp.StatusCode != gohttp.StatusOK {
-		t.Errorf("invalid status: %d, body=%s", resp.StatusCode, resp.Body)
+	_, err = m.API.CreateIndex(context.Background(), c.Idx("s"), pilosa.IndexOptions{Keys: true})
+	if err != nil {
+		t.Fatalf("creating index: %v", err)
 	}
+	_, err = m.API.CreateField(context.Background(), c.Idx("s"), "stringset", pilosa.OptFieldTypeSet("ranked", 100000), pilosa.OptFieldKeys())
+	if err != nil {
+		t.Fatalf("creating field: %v", err)
+	}
+
 	baseURLs := []string{
-		fmt.Sprintf("%s/internal/translate/index/example/", m.URL()),
-		fmt.Sprintf("%s/internal/translate/field/example/stringset/", m.URL()),
-		fmt.Sprintf("%s/internal/translate/field/example/nonexistent/", m.URL()),
+		fmt.Sprintf("%s/internal/translate/index/%s/", m.URL(), c),
+		fmt.Sprintf("%s/internal/translate/field/%s/stringset/", m.URL(), c),
+		fmt.Sprintf("%s/internal/translate/field/%s/nonexistent/", m.URL(), c),
 	}
 	for _, url := range baseURLs {
 		expectFailure := strings.HasSuffix(url, "/nonexistent/")
@@ -674,11 +636,11 @@ func TestTranslationHandlers(t *testing.T) {
 
 		if expectFailure {
 			resp := test.Do(t, "POST", findURL, names)
-			if resp.StatusCode != gohttp.StatusInternalServerError {
+			if resp.StatusCode != http.StatusInternalServerError {
 				t.Fatalf("invalid status: %d, body=%s", resp.StatusCode, resp.Body)
 			}
 			resp = test.Do(t, "POST", createURL, names)
-			if resp.StatusCode != gohttp.StatusInternalServerError {
+			if resp.StatusCode != http.StatusInternalServerError {
 				t.Fatalf("invalid status: %d, body=%s", resp.StatusCode, resp.Body)
 			}
 			continue
@@ -686,7 +648,7 @@ func TestTranslationHandlers(t *testing.T) {
 
 		// try to find them when they don't exist
 		resp := test.Do(t, "POST", findURL, names)
-		if resp.StatusCode != gohttp.StatusOK {
+		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("invalid status: %d, body=%s", resp.StatusCode, resp.Body)
 		}
 		err := json.Unmarshal([]byte(resp.Body), &results)
@@ -699,13 +661,13 @@ func TestTranslationHandlers(t *testing.T) {
 
 		// try to create them, but malformed, so we expect an error
 		resp = test.Do(t, "POST", createURL, names[:6])
-		if resp.StatusCode != gohttp.StatusBadRequest {
+		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("invalid status: expected 400, got %d, body=%s", resp.StatusCode, resp.Body)
 		}
 
 		// try to create them
 		resp = test.Do(t, "POST", createURL, names)
-		if resp.StatusCode != gohttp.StatusOK {
+		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("invalid status: %d, body=%s", resp.StatusCode, resp.Body)
 		}
 		err = json.Unmarshal([]byte(resp.Body), &results)
@@ -718,7 +680,7 @@ func TestTranslationHandlers(t *testing.T) {
 
 		// try to find them now that they exist
 		resp = test.Do(t, "POST", findURL, names)
-		if resp.StatusCode != gohttp.StatusOK {
+		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("invalid status: %d, body=%s", resp.StatusCode, resp.Body)
 		}
 		err = json.Unmarshal([]byte(resp.Body), &results)
@@ -740,7 +702,7 @@ admin: "ac97c9e2-346b-42a2-b6da-18bcb61a32fe"`
 
 	tmpDir := t.TempDir()
 	permissionsPath := path.Join(tmpDir, "test-permissions.yaml")
-	err := ioutil.WriteFile(permissionsPath, []byte(permissions1), 0600)
+	err := os.WriteFile(permissionsPath, []byte(permissions1), 0600)
 	if err != nil {
 		t.Fatalf("failed to write permissions file: %v", err)
 	}
@@ -781,9 +743,17 @@ admin: "ac97c9e2-346b-42a2-b6da-18bcb61a32fe"`
 	defer c.Close()
 
 	m := c.GetPrimary()
-	index := "allowed-networks-index"
-	keyedIndex := "allowed-networks-index-keyed"
+	index := c.Idx("s")
+	keyedIndex := c.Idx("k")
 	field := "field1"
+
+	// This keyed index used to be created by the Post-Schema subtest, but that doesn't
+	// exist anymore, so we create it up here. We don't create the other one because it's
+	// supposed to get created by Post-Index.
+	_, err = m.API.CreateIndex(context.Background(), c.Idx("k"), pilosa.IndexOptions{Keys: true})
+	if err != nil {
+		t.Fatalf("creating index: %v", err)
+	}
 
 	// needed for key translation
 	nameBytes, err := json.Marshal([]string{"a", "b", "c"})
@@ -791,24 +761,6 @@ admin: "ac97c9e2-346b-42a2-b6da-18bcb61a32fe"`
 		t.Fatalf("marshalling json: %v", err)
 	}
 	names := string(nameBytes)
-
-	schema := `
-	{
-	   "index-name": "allowed-networks-index-keyed",
-	   "primary-key-type": "string",
-	   "index-action": "create",
-	   "fields": [
-		   {
-			   "field-name": "stringset",
-			   "field-type": "string",
-			   "field-options": {
-					"cache-type": "ranked",
-					   "cache-size": 100000
-			   }
-		   }
-	   ]
-	}
-	`
 
 	IPTests := []struct {
 		TestName   string
@@ -844,12 +796,6 @@ admin: "ac97c9e2-346b-42a2-b6da-18bcb61a32fe"`
 			body:     "",
 		},
 		{
-			testName: "Post-Schema",
-			method:   "POST",
-			url:      fmt.Sprintf("%s/internal/schema", m.URL()),
-			body:     schema,
-		},
-		{
 			testName: "Get-Shards",
 			method:   "GET",
 			url:      fmt.Sprintf("%s/internal/index/%s/shards", m.URL(), keyedIndex),
@@ -878,14 +824,14 @@ admin: "ac97c9e2-346b-42a2-b6da-18bcb61a32fe"`
 	for _, ipTest := range IPTests {
 		for _, test := range tests {
 			t.Run(ipTest.TestName+"-"+test.testName, func(t *testing.T) {
-				var req *gohttp.Request
+				var req *http.Request
 				if test.body != "" {
-					req, err = gohttp.NewRequest(test.method, test.url, strings.NewReader(test.body))
+					req, err = http.NewRequest(test.method, test.url, strings.NewReader(test.body))
 					if err != nil {
 						t.Fatal(err)
 					}
 				} else {
-					req, err = gohttp.NewRequest(test.method, test.url, nil)
+					req, err = http.NewRequest(test.method, test.url, nil)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -893,7 +839,7 @@ admin: "ac97c9e2-346b-42a2-b6da-18bcb61a32fe"`
 
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("X-Forwarded-For", ipTest.ClientIP)
-				resp, err := gohttp.DefaultClient.Do(req)
+				resp, err := http.DefaultClient.Do(req)
 				if err != nil {
 					t.Fatalf("failed to send request: %v", err)
 				}
@@ -902,7 +848,7 @@ admin: "ac97c9e2-346b-42a2-b6da-18bcb61a32fe"`
 				}
 
 				if ipTest.StatusCode == 200 {
-					body, err := ioutil.ReadAll(resp.Body)
+					body, err := io.ReadAll(resp.Body)
 					if err != nil {
 						t.Fatalf("reading resp body :%v", err)
 					}

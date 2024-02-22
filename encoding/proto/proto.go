@@ -3,18 +3,27 @@
 package proto
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"fmt"
 	"math/big"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
+	"github.com/apache/arrow/go/v10/arrow"
+	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v10/parquet"
+	"github.com/apache/arrow/go/v10/parquet/file"
+	"github.com/apache/arrow/go/v10/parquet/pqarrow"
 	pilosa "github.com/featurebasedb/featurebase/v3"
 	"github.com/featurebasedb/featurebase/v3/disco"
-	"github.com/featurebasedb/featurebase/v3/ingest"
 	pnet "github.com/featurebasedb/featurebase/v3/net"
 	"github.com/featurebasedb/featurebase/v3/pb"
 	"github.com/featurebasedb/featurebase/v3/pql"
 	"github.com/featurebasedb/featurebase/v3/roaring"
+	"github.com/featurebasedb/featurebase/v3/vprint"
+	"github.com/gogo/protobuf/proto"
+	"github.com/gomem/gomem/pkg/dataframe"
 	"github.com/pkg/errors"
 )
 
@@ -23,8 +32,10 @@ type Serializer struct {
 	RoaringRows bool
 }
 
-var DefaultSerializer = Serializer{}
-var RoaringSerializer = Serializer{RoaringRows: true}
+var (
+	DefaultSerializer = Serializer{}
+	RoaringSerializer = Serializer{RoaringRows: true}
+)
 
 // Marshal turns pilosa messages into protobuf serialized bytes.
 func (s Serializer) Marshal(m pilosa.Message) ([]byte, error) {
@@ -295,19 +306,6 @@ func (s Serializer) Unmarshal(buf []byte, m pilosa.Message) error {
 		}
 		*mt = s.decodeRowMatrix(msg)
 		return nil
-
-	case *ingest.ShardedRequest:
-		msg := &pb.ShardedIngestRequest{}
-		err := proto.Unmarshal(buf, msg)
-		if err != nil {
-			return errors.Wrap(err, "unmarshalling ShardedRequest")
-		}
-		req, err := s.decodeShardedIngestRequest(msg)
-		if err != nil {
-			return err
-		}
-		*mt = *req
-		return nil
 	default:
 		panic(fmt.Sprintf("unhandled pilosa.Message of type %T: %#v", mt, m))
 	}
@@ -377,8 +375,8 @@ func (s Serializer) encodeToProto(m pilosa.Message) proto.Message {
 		return s.encodeTransactionMessage(mt)
 	case *pilosa.AtomicRecord:
 		return s.encodeAtomicRecord(mt)
-	case *ingest.ShardedRequest:
-		return s.encodeShardedIngestRequest(mt)
+	case *pilosa.DeleteDataframeMessage:
+		return s.encodeDeleteDataframeMessage(mt)
 	}
 	return nil
 }
@@ -392,6 +390,7 @@ func (s Serializer) encodeBlockDataRequest(m *pilosa.BlockDataRequest) *pb.Block
 		Block: m.Block,
 	}
 }
+
 func (s Serializer) encodeBlockDataResponse(m *pilosa.BlockDataResponse) *pb.BlockDataResponse {
 	return &pb.BlockDataResponse{
 		RowIDs:    m.RowIDs,
@@ -553,6 +552,15 @@ func (s Serializer) encodeQueryResponse(m *pilosa.QueryResponse) *pb.QueryRespon
 			resp.Results[i].DistinctTimestamp = s.encodeDistinctTimestamp(result)
 		case nil:
 			resp.Results[i].Type = queryResultTypeNil
+		case *dataframe.DataFrame:
+			resp.Results[i].Type = queryResultTypeDataFrame
+			resp.Results[i].DataFrame = s.encodeDataFrame(result)
+		case arrow.Table:
+			resp.Results[i].Type = queryResultTypeArrowTable
+			resp.Results[i].ArrowTable = s.encodeArrowTable(result)
+		case pilosa.ExtractedIDMatrixSorted:
+			resp.Results[i].Type = queryResultTypeExtractedIDMatrixSorted
+			resp.Results[i].ExtractedIDMatrixSorted = s.endcodeExtractedIDMatrixSorted(result)
 		default:
 			panic(fmt.Errorf("unknown type: %T", m.Results[i]))
 		}
@@ -629,6 +637,7 @@ func (s Serializer) encodeFieldOptions(o *pilosa.FieldOptions) *pb.FieldOptions 
 		Keys:           o.Keys,
 		ForeignIndex:   o.ForeignIndex,
 		NoStandardView: o.NoStandardView,
+		TrackExistence: o.TrackExistence,
 	}
 }
 
@@ -681,12 +690,14 @@ func (s Serializer) encodeCreateIndexMessage(m *pilosa.CreateIndexMessage) *pb.C
 	return &pb.CreateIndexMessage{
 		Index:     m.Index,
 		CreatedAt: m.CreatedAt,
+		Owner:     m.Owner,
 		Meta:      s.encodeIndexMeta(&m.Meta),
 	}
 }
 
 func (s Serializer) encodeIndexMeta(m *pilosa.IndexOptions) *pb.IndexMeta {
 	return &pb.IndexMeta{
+		Description:    m.Description,
 		Keys:           m.Keys,
 		TrackExistence: m.TrackExistence,
 	}
@@ -703,6 +714,7 @@ func (s Serializer) encodeCreateFieldMessage(m *pilosa.CreateFieldMessage) *pb.C
 		Index:     m.Index,
 		Field:     m.Field,
 		CreatedAt: m.CreatedAt,
+		Owner:     m.Owner,
 		Meta:      s.encodeFieldOptions(m.Meta),
 	}
 }
@@ -898,46 +910,10 @@ func (s Serializer) encodeTransactionStats(stats pilosa.TransactionStats) *pb.Tr
 	return &pb.TransactionStats{}
 }
 
-func (s Serializer) encodeShardedIngestRequest(req *ingest.ShardedRequest) *pb.ShardedIngestRequest {
-	if req == nil || len(req.Ops) == 0 {
-		return &pb.ShardedIngestRequest{}
+func (s Serializer) encodeDeleteDataframeMessage(m *pilosa.DeleteDataframeMessage) *pb.DeleteDataframeMessage {
+	return &pb.DeleteDataframeMessage{
+		Index: m.Index,
 	}
-	out := &pb.ShardedIngestRequest{Ops: make(map[uint64]*pb.ShardIngestOperations, len(req.Ops))}
-	for shard, ops := range req.Ops {
-		out.Ops[shard] = s.encodeShardIngestOperations(ops)
-	}
-	return out
-}
-
-func (s Serializer) encodeShardIngestOperations(ops []*ingest.Operation) *pb.ShardIngestOperations {
-	out := &pb.ShardIngestOperations{}
-	for _, op := range ops {
-		if op == nil {
-			continue
-		}
-		out.Ops = append(out.Ops, s.encodeShardIngestOperation(op))
-	}
-	return out
-}
-
-func (s Serializer) encodeShardIngestOperation(op *ingest.Operation) *pb.ShardIngestOperation {
-	out := &pb.ShardIngestOperation{
-		OpType:         op.OpType.String(),
-		ClearRecordIDs: op.ClearRecordIDs,
-		ClearFields:    op.ClearFields,
-		FieldOps:       make(map[string]*pb.FieldOperation, len(op.FieldOps)),
-	}
-	for k, v := range op.FieldOps {
-		if v == nil {
-			continue
-		}
-		out.FieldOps[k] = &pb.FieldOperation{
-			RecordIDs: v.RecordIDs,
-			Values:    v.Values,
-			Signed:    v.Signed,
-		}
-	}
-	return out
 }
 
 func (s Serializer) decodeSchema(sc *pb.Schema, m *pilosa.Schema) {
@@ -998,6 +974,7 @@ func (s Serializer) decodeFieldOptions(options *pb.FieldOptions, m *pilosa.Field
 	m.Keys = options.Keys
 	m.ForeignIndex = options.ForeignIndex
 	m.NoStandardView = options.NoStandardView
+	m.TrackExistence = options.TrackExistence
 }
 
 func (s Serializer) decodeDecimal(d *pb.Decimal, m *pql.Decimal) {
@@ -1057,12 +1034,14 @@ func (s Serializer) decodeCreateShardMessage(pb *pb.CreateShardMessage, m *pilos
 func (s Serializer) decodeCreateIndexMessage(pb *pb.CreateIndexMessage, m *pilosa.CreateIndexMessage) {
 	m.Index = pb.Index
 	m.CreatedAt = pb.CreatedAt
+	m.Owner = pb.Owner
 	m.Meta = pilosa.IndexOptions{}
 	s.decodeIndexMeta(pb.Meta, &m.Meta)
 }
 
 func (s Serializer) decodeIndexMeta(pb *pb.IndexMeta, m *pilosa.IndexOptions) {
 	if pb != nil {
+		m.Description = pb.Description
 		m.Keys = pb.Keys
 		m.TrackExistence = pb.TrackExistence
 	}
@@ -1076,6 +1055,7 @@ func (s Serializer) decodeCreateFieldMessage(pb *pb.CreateFieldMessage, m *pilos
 	m.Index = pb.Index
 	m.Field = pb.Field
 	m.CreatedAt = pb.CreatedAt
+	m.Owner = pb.Owner
 	m.Meta = &pilosa.FieldOptions{}
 	s.decodeFieldOptions(pb.Meta, m.Meta)
 }
@@ -1362,6 +1342,9 @@ const (
 	queryResultTypeExtractedIDMatrix
 	queryResultTypeExtractedTable
 	queryResultTypeDistinctTimestamp
+	queryResultTypeDataFrame
+	queryResultTypeArrowTable
+	queryResultTypeExtractedIDMatrixSorted
 )
 
 func (s Serializer) decodeQueryResult(pb *pb.QueryResult) interface{} {
@@ -1400,6 +1383,12 @@ func (s Serializer) decodeQueryResult(pb *pb.QueryResult) interface{} {
 		return s.decodeRowMatrix(pb.RowMatrix)
 	case queryResultTypeDistinctTimestamp:
 		return s.decodeDistinctTimestamp(pb.DistinctTimestamp)
+	case queryResultTypeDataFrame:
+		return s.decodeDataFrame(pb.DataFrame)
+	case queryResultTypeArrowTable:
+		return s.decodeArrowTable(pb.ArrowTable)
+	case queryResultTypeExtractedIDMatrixSorted:
+		return s.decodeExtractedIDMatrixSorted(pb.ExtractedIDMatrixSorted)
 	}
 	panic(fmt.Sprintf("unknown type: %d", pb.Type))
 }
@@ -1482,24 +1471,8 @@ func (s Serializer) decodeExtractedTable(t *pb.ExtractedTable) pilosa.ExtractedT
 		}
 
 		rows := make([]interface{}, len(c.Values))
-		for j, v := range rows {
-			var val interface{}
-			switch v := v.(type) {
-			case *pb.ExtractedTableValue_IDs:
-				val = v.IDs.IDs
-			case *pb.ExtractedTableValue_Keys:
-				val = v.Keys.Keys
-			case *pb.ExtractedTableValue_BSIValue:
-				val = v.BSIValue
-			case *pb.ExtractedTableValue_MutexID:
-				val = v.MutexID
-			case *pb.ExtractedTableValue_MutexKey:
-				val = v.MutexKey
-			case *pb.ExtractedTableValue_Bool:
-				val = v.Bool
-			}
-
-			rows[j] = val
+		for j, v := range c.Values {
+			rows[j] = castExtractedTableValue(v)
 		}
 
 		columns[i] = pilosa.ExtractedTableColumn{
@@ -1533,7 +1506,8 @@ func (s Serializer) decodeGroupCounts(a *pb.GroupCounts, b []*pb.GroupCount) *pi
 			Count: gc.Count,
 			// note: not renaming the `pb. structure members now
 			// to avoid breaking protobuf interactions.
-			Agg: gc.Agg,
+			Agg:        gc.Agg,
+			DecimalAgg: s.decodeDecimalStruct(gc.DecimalAgg),
 		}
 	}
 	return pilosa.NewGroupCounts(a.Aggregate, other...)
@@ -1617,6 +1591,63 @@ func (s Serializer) decodeDecimalStruct(pb *pb.Decimal) *pql.Decimal {
 	return d
 }
 
+func (s Serializer) decodeDataFrame(pdf *pb.DataFrame) *dataframe.DataFrame {
+	pool := memory.NewGoAllocator() // TODO(twg) this should probably be asingletoon somwhere
+
+	df, _ := dataframe.NewFrameFromArrowBytes(pdf.Data, pool)
+	return df
+}
+
+func (s Serializer) decodeDeleteDataframeMessage(pb *pb.DeleteDataframeMessage, m *pilosa.DeleteDataframeMessage) {
+	m.Index = pb.Index
+}
+
+func (s Serializer) encodeDataFrame(df *dataframe.DataFrame) *pb.DataFrame {
+	if df == nil {
+		return &pb.DataFrame{} // Generated proto code doesn't like a nil Row.
+	}
+	buff, err := df.ToBytes()
+	if err != nil {
+		panic(err)
+	}
+	// ugh hate having to swallow error here
+	return &pb.DataFrame{
+		Data: buff,
+	}
+}
+
+func (s Serializer) encodeArrowTable(table arrow.Table) *pb.ArrowTable {
+	props := parquet.NewWriterProperties(parquet.WithDictionaryDefault(false))
+	arrProps := pqarrow.DefaultWriterProps()
+	var b bytes.Buffer
+	w := bufio.NewWriter(&b)
+	chunkSize := int64(65536) // TODO(twg) 2022/11/09 default 64k?
+	pqarrow.WriteTable(table, w, chunkSize, props, arrProps)
+	w.Flush()
+	return &pb.ArrowTable{
+		Data: b.Bytes(),
+	}
+}
+
+func (s Serializer) decodeArrowTable(table *pb.ArrowTable) arrow.Table {
+	mem := memory.NewGoAllocator()   // TODO(twg) this should probably be asingletoon somwhere
+	r := bytes.NewReader(table.Data) // TODO(twg) 2022/11/09 I hate snarfing errors
+	pf, err := file.NewParquetReader(r)
+	if err != nil {
+		vprint.VV("e1 %v", err)
+	}
+	reader, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{}, mem)
+	if err != nil {
+		vprint.VV("e2 %v", err)
+	}
+	tbl, err := reader.ReadTable(context.Background())
+	if err != nil {
+		vprint.VV("e3 %v", err)
+	}
+	vprint.VV("decodeArrowTable %d", tbl.NumRows())
+	return tbl
+}
+
 func (s Serializer) encodeSignedRow(r pilosa.SignedRow) *pb.SignedRow {
 	ir := &pb.SignedRow{
 		Pos: s.encodeRow(r.Pos),
@@ -1665,9 +1696,10 @@ func (s Serializer) encodeGroupCounts(counts *pilosa.GroupCounts) *pb.GroupCount
 	}
 	for i, gc := range groups {
 		result.Groups[i] = &pb.GroupCount{
-			Group: s.encodeFieldRows(gc.Group),
-			Count: gc.Count,
-			Agg:   gc.Agg,
+			Group:      s.encodeFieldRows(gc.Group),
+			Count:      gc.Count,
+			Agg:        gc.Agg,
+			DecimalAgg: s.encodeDecimal(gc.DecimalAgg),
 		}
 	}
 	return result
@@ -1840,56 +1872,116 @@ func (s Serializer) encodeDecimal(p *pql.Decimal) *pb.Decimal {
 	return retval
 }
 
-func (s Serializer) decodeShardedIngestRequest(req *pb.ShardedIngestRequest) (*ingest.ShardedRequest, error) {
-	if req == nil || len(req.Ops) == 0 {
-		return &ingest.ShardedRequest{}, nil
-	}
-	out := &ingest.ShardedRequest{Ops: make(map[uint64][]*ingest.Operation, len(req.Ops))}
-	for shard, ops := range req.Ops {
-		var err error
-		out.Ops[shard], err = s.decodeShardIngestOperations(ops)
-		if err != nil {
-			return nil, err
+func (s Serializer) endcodeExtractedIDMatrixSorted(m pilosa.ExtractedIDMatrixSorted) *pb.ExtractedIDMatrixSorted {
+	cols := make([]*pb.ExtractedIDColumn, len(m.ExtractedIDMatrix.Columns))
+	for i, v := range m.ExtractedIDMatrix.Columns {
+		vals := make([]*pb.IDList, len(v.Rows))
+		for j, f := range v.Rows {
+			vals[j] = &pb.IDList{IDs: f}
+		}
+		cols[i] = &pb.ExtractedIDColumn{
+			ID:   v.ColumnID,
+			Vals: vals,
 		}
 	}
-	return out, nil
+	rowKeyV := s.encodeRowKVs(m.RowKVs)
+	return &pb.ExtractedIDMatrixSorted{
+		ExtractedIDMatrix: &pb.ExtractedIDMatrix{
+			Fields:  m.ExtractedIDMatrix.Fields,
+			Columns: cols,
+		},
+		RowKVs: rowKeyV,
+	}
 }
 
-func (s Serializer) decodeShardIngestOperations(ops *pb.ShardIngestOperations) ([]*ingest.Operation, error) {
-	out := []*ingest.Operation{}
-	if len(ops.Ops) == 0 {
-		return out, nil
-	}
-	for _, op := range ops.Ops {
-		if op == nil {
-			continue
+func (s Serializer) encodeRowKVs(kvs []pilosa.RowKV) []*pb.RowKV {
+	result := make([]*pb.RowKV, len(kvs))
+	for i, v := range kvs {
+		kv := &pb.RowKV{}
+		kv.RowID = v.RowID
+		switch val := v.Value.(type) {
+		case []uint64:
+			kv.Value = &pb.ExtractedTableValue{
+				Value: &pb.ExtractedTableValue_IDs{
+					IDs: &pb.IDList{
+						IDs: val,
+					},
+				},
+			}
+		case []string:
+			kv.Value = &pb.ExtractedTableValue{
+				Value: &pb.ExtractedTableValue_Keys{
+					Keys: &pb.KeyList{
+						Keys: val,
+					},
+				},
+			}
+		case int64:
+			kv.Value = &pb.ExtractedTableValue{
+				Value: &pb.ExtractedTableValue_BSIValue{
+					BSIValue: val,
+				},
+			}
+		case uint64:
+			kv.Value = &pb.ExtractedTableValue{
+				Value: &pb.ExtractedTableValue_MutexID{
+					MutexID: val,
+				},
+			}
+		case string:
+			kv.Value = &pb.ExtractedTableValue{
+				Value: &pb.ExtractedTableValue_MutexKey{
+					MutexKey: val,
+				},
+			}
+		case bool:
+			kv.Value = &pb.ExtractedTableValue{
+				Value: &pb.ExtractedTableValue_Bool{
+					Bool: val,
+				},
+			}
 		}
-		decoded, err := s.decodeShardIngestOperation(op)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, decoded)
+		result[i] = kv
+
 	}
-	return out, nil
+	return result
 }
 
-func (s Serializer) decodeShardIngestOperation(op *pb.ShardIngestOperation) (*ingest.Operation, error) {
-	opType, err := ingest.ParseOpType(op.OpType)
-	if err != nil {
-		return nil, err
+func (s Serializer) decodeExtractedIDMatrixSorted(m *pb.ExtractedIDMatrixSorted) pilosa.ExtractedIDMatrixSorted {
+	mat := s.decodeExtractedIDMatrix(m.ExtractedIDMatrix)
+	kvs := s.decodeRowKVs(m.RowKVs)
+	return pilosa.ExtractedIDMatrixSorted{
+		ExtractedIDMatrix: &mat,
+		RowKVs:            kvs,
 	}
-	out := &ingest.Operation{
-		OpType:         opType,
-		ClearRecordIDs: op.ClearRecordIDs,
-		ClearFields:    op.ClearFields,
-		FieldOps:       make(map[string]*ingest.FieldOperation, len(op.FieldOps)),
+}
+
+func castExtractedTableValue(v *pb.ExtractedTableValue) interface{} {
+	switch val := v.Value.(type) {
+	case *pb.ExtractedTableValue_IDs:
+		return val.IDs.IDs
+	case *pb.ExtractedTableValue_Keys:
+		return val.Keys.Keys
+	case *pb.ExtractedTableValue_BSIValue:
+		return val.BSIValue
+	case *pb.ExtractedTableValue_MutexID:
+		return val.MutexID
+	case *pb.ExtractedTableValue_MutexKey:
+		return val.MutexKey
+	case *pb.ExtractedTableValue_Bool:
+		return val.Bool
 	}
-	for k, v := range op.FieldOps {
-		out.FieldOps[k] = &ingest.FieldOperation{
-			RecordIDs: v.RecordIDs,
-			Values:    v.Values,
-			Signed:    v.Signed,
-		}
+	// Shouldn't happen, but i don't think we should panic
+	return v
+}
+
+func (s Serializer) decodeRowKVs(m []*pb.RowKV) []pilosa.RowKV {
+	rows := make([]pilosa.RowKV, len(m))
+	for i, v := range m {
+		kv := pilosa.RowKV{}
+		kv.RowID = v.RowID
+		kv.Value = castExtractedTableValue(v.Value)
+		rows[i] = kv
 	}
-	return out, nil
+	return rows
 }
